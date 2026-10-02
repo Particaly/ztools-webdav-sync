@@ -1,0 +1,302 @@
+/* 设计令牌：取自 Ardot 设计稿（WebDAV Sync） */
+:root {
+  /* 主色 */
+  --blue: #1a73e8;
+  --blue-disabled: #5b93e8;
+  --blue-shadow: rgba(26, 115, 232, 0.25);
+
+  /* 文字 */
+  --text-1: #202124;
+  --text-2: #5f6368;
+  --text-3: #7c8287;
+  --text-muted: #9aa0a6;
+  --icon-dark: #4a5056;
+  --btn-text: #3a3f44;
+
+  /* 成功 / 警告 / 危险 */
+  --green: #159a46;
+  --green-deep: #12703a;
+  --green-dot: #1e9e4a;
+  --green-bg: #e7f5ec;
+  --green-strip-bg: #f4fbf6;
+  --green-strip-br: #cfebd9;
+  --green-dot-br: #9bcbaf;
+  --green-solid: #34a853;
+  --amber: #b45309;
+  --amber-deep: #8a5a0b;
+  --amber-icon: #d97706;
+  --amber-bg: #fffbf3;
+  --red: #ea4335;
+
+  /* 边框与背景 */
+  --br-window: #e1e5ea;
+  --br-card: #e6eaee;
+  --br-card-alt: #e5ebed;
+  --br-input: #dce1e6;
+  --br-divider: #e6eaf0;
+  --br-bar: #edf0f3;
+  --bg-bar: #fafbfc;
+  --bg-folder: #f1f5fb;
+  --bg-seg: #f1f3f6;
+  --bg-badge: #eaf1fe;
+  --bg-track: #edf0f3;
+  --overlay: rgba(33, 41, 51, 0.5);
+
+  /* 字体 */
+  --font-ui: 'Inter', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New', monospace;
+
+  /* 阴影 */
+  --shadow-card: 0 1px 2px rgba(33, 41, 51, 0.04);
+  --shadow-btn: 0 1px 3px var(--blue-shadow);
+  --shadow-pop: 0 6px 20px rgba(33, 41, 51, 0.12);
+}
+
+/* 基础样式（轻量 reset，保持与原版一致） */
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  color: var(--text-1);
+  background: #fff;
+  font-size: 12px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button {
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+input {
+  font-family: inherit;
+}
+
+input:focus,
+button:focus {
+  outline: none;
+}
+
+input::placeholder {
+  color: var(--text-muted);
+}
+
+/* 全局细滚动条：透明轨道 + 圆角悬浮条，替代系统默认样式（弹窗正文 / 主视图 / 列表等所有滚动区） */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d3d9df;
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+
+  &:hover {
+    background-color: #bfc7cf;
+  }
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 旋转动画：同步中图标 */
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ============================================================
+   动效体系
+   统一缓动：--ease-swift 用于入场（快出缓停，有弹性感），
+   --ease-quick 用于离场（干脆利落，不拖泥带水）。
+   ============================================================ */
+:root {
+  --ease-swift: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-quick: cubic-bezier(0.4, 0, 1, 1);
+}
+
+/* 路由切换（主页 ↔ 设置）：方向感知的滑动过渡，
+   进设置时新页自右滑入，返回时自左滑入 */
+.route-next-enter-active,
+.route-prev-enter-active {
+  transition: opacity 0.18s ease, transform 0.26s var(--ease-swift);
+}
+
+.route-next-leave-active,
+.route-prev-leave-active {
+  transition: opacity 0.14s ease, transform 0.18s var(--ease-quick);
+}
+
+.route-next-enter-from {
+  opacity: 0;
+  transform: translateX(28px);
+}
+
+.route-next-leave-to {
+  opacity: 0;
+  transform: translateX(-18px);
+}
+
+.route-prev-enter-from {
+  opacity: 0;
+  transform: translateX(-28px);
+}
+
+.route-prev-leave-to {
+  opacity: 0;
+  transform: translateX(18px);
+}
+
+/* 弹窗：遮罩淡入淡出 + 面板上浮缩放。
+   过渡类挂在使用方的 v-if 根节点（.overlay）上，
+   面板为其 .modal 子节点，故需全局样式而非组件内 scoped */
+.modal-pop-enter-active {
+  transition: opacity 0.2s ease;
+}
+
+.modal-pop-leave-active {
+  transition: opacity 0.16s ease;
+}
+
+.modal-pop-enter-from,
+.modal-pop-leave-to {
+  opacity: 0;
+}
+
+.modal-pop-enter-active .modal {
+  transition: transform 0.32s var(--ease-swift), opacity 0.2s ease;
+}
+
+.modal-pop-enter-from .modal {
+  transform: translateY(14px) scale(0.96);
+  opacity: 0;
+}
+
+.modal-pop-leave-active .modal {
+  transition: transform 0.16s var(--ease-quick), opacity 0.14s ease;
+}
+
+.modal-pop-leave-to .modal {
+  transform: translateY(10px) scale(0.98);
+  opacity: 0;
+}
+
+/* 下拉浮层菜单（AppDropdown 的面板） */
+.pop-enter-active {
+  transition: opacity 0.16s ease, transform 0.22s var(--ease-swift);
+}
+
+.pop-leave-active {
+  transition: opacity 0.12s ease, transform 0.14s var(--ease-quick);
+}
+
+.pop-enter-from {
+  opacity: 0;
+  transform: translateY(-5px) scale(0.98);
+}
+
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(-3px);
+}
+
+/* 列表增删（TransitionGroup）：新行滑入、移除行淡出下沉，
+   其余行通过 move 平滑补位；离场行绝对定位脱离文档流是补位动画的前提 */
+.list-enter-active {
+  transition: opacity 0.24s ease, transform 0.3s var(--ease-swift);
+}
+
+.list-leave-active {
+  transition: opacity 0.16s ease, transform 0.2s var(--ease-quick);
+  position: absolute;
+  width: 100%;
+}
+
+.list-enter-from {
+  opacity: 0;
+  transform: translateY(-9px);
+}
+
+.list-leave-to {
+  opacity: 0;
+  transform: translateY(7px);
+}
+
+.list-move {
+  transition: transform 0.3s var(--ease-swift);
+}
+
+/* 轻量入场：块级内容自下方浮起（空状态、行内提示条） */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise-in {
+  animation: rise-in 0.5s var(--ease-swift) both;
+}
+
+@keyframes rise-in-sm {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise-in-sm {
+  animation: rise-in-sm 0.3s var(--ease-swift) both;
+}
+
+/* toast 倒计时线（AppToasts 内按条内联 animation-duration） */
+@keyframes toast-countdown {
+  from {
+    transform: scaleX(1);
+  }
+
+  to {
+    transform: scaleX(0);
+  }
+}
+
+/* 尊重系统「减弱动态效果」设置：动画与过渡降为瞬时 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

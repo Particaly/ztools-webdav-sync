@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": ["src-ztools/preload/**/*.mts", "src-ztools/preload/**/*.ts", "src-ztools/preload/**/*.d.ts"]
+}

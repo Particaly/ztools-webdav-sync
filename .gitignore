@@ -1,0 +1,16 @@
+node_modules/
+
+# 运行期产物（dav-server 测试根目录，每次运行重建；含 .dav-root、.dav-root-smoke
+# 与一次性 profiling 用的 .dav-root-* 变体）
+test/.dav-root*/
+
+# 构建产物（npm run build / build:preload 重建）
+src-ztools/dist/
+src-ztools/preload/dist/
+
+# 一次性压测 / profiling 在仓库根留下的点前缀工作目录（如 .throttle-bench）：
+# 运行工件而非源码，host-load-check 的 asar 内容检查会拒绝它们进入打包产物
+.throttle-bench*/
+
+# macOS Finder 元数据
+.DS_Store

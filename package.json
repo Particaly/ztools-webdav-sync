@@ -1,0 +1,34 @@
+{
+  "name": "webdav-sync",
+  "version": "1.0.0",
+  "description": "基于 WebDAV 的多设备目录同步插件",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.preload.json && vue-tsc && vite build && npm run build:preload",
+    "build:preload": "esbuild src-ztools/preload/services.mts --bundle --platform=node --format=cjs --target=node20 --sourcemap=linked --outfile=src-ztools/preload/dist/services.js",
+    "test:unit": "tsc -p tsconfig.preload.json && node test/store-unit.mjs",
+    "test:e2e": "node test/sync-e2e.mjs",
+    "test:e2e:fast": "node test/sync-e2e.mjs --fast",
+    "test:e2e:built": "npm run build:preload && node test/sync-e2e.mjs --built",
+    "test": "node test/store-unit.mjs && node test/sync-e2e.mjs && npm run test:e2e:built"
+  },
+  "dependencies": {
+    "saxes": "^6.0.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@ztools-center/ztools-api-types": "^1.0.1",
+    "esbuild": "^0.28.2",
+    "sass": "^1.105.0",
+    "typescript": "^5.3.0",
+    "unocss": "^66.10.5",
+    "vite": "^6.0.11",
+    "vue-tsc": "^2.0.0"
+  }
+}
