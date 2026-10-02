@@ -24,7 +24,7 @@ const props = withDefaults(
     /** 弹窗标题 */
     title?: string
   }>(),
-  { initialPath: '', title: '选择 WebDAV 目录' }
+  { initialPath: '', title: '选择云端文件夹' }
 )
 
 const emit = defineEmits<{ pick: [path: string]; close: [] }>()
@@ -126,7 +126,7 @@ onMounted(() => {
 <template>
   <AppModal
     :title="title"
-    subtitle="浏览服务器目录，选中一级目录作为目标"
+    subtitle="选择云端的一个文件夹作为同步位置"
     :width="380"
     @close="emit('close')"
   >
@@ -155,7 +155,7 @@ onMounted(() => {
           </span>
           <AppButton size="sm" @click="load">重试</AppButton>
         </div>
-        <div v-else-if="!subDirs.length" class="dir-state text-ink-4">该目录下没有子目录</div>
+        <div v-else-if="!subDirs.length" class="dir-state text-ink-4">这里面没有文件夹了</div>
         <template v-else>
           <button v-for="d in shownDirs" :key="d.path" type="button" class="dir-row" @click="enter(d)">
             <AppIcon name="folder" :size="14" class="text-icon-dark shrink-0" />
@@ -164,7 +164,7 @@ onMounted(() => {
           </button>
           <!-- 限长提示 + 展开：全部条目仍可达，只是不一次性渲染 -->
           <div v-if="subDirs.length > shownDirs.length" class="dir-more">
-            <span class="text-[11px] text-ink-4">已显示 {{ shownDirs.length }} / {{ subDirs.length }} 个子目录</span>
+            <span class="text-[11px] text-ink-4">已显示 {{ shownDirs.length }} / {{ subDirs.length }} 个文件夹</span>
             <button type="button" class="more-btn" @click="shownCount += MAX_SHOWN">显示更多</button>
           </div>
         </template>

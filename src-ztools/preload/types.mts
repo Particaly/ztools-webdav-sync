@@ -288,7 +288,11 @@ export type SchedulerEvent =
   | { type: 'conflict'; conflictId: string; dirId: string; info: ConflictInfo }
   | { type: 'pending-conflicts'; dirId: string; items: Array<{ rel: string; createdAt: number; choice?: string; kind?: string; [k: string]: unknown }>; newlyNotified: boolean }
   | { type: 'config-applied'; dirsCount: number }
-  | { type: 'scheduler-error'; message: string; phase?: string }
+  /**
+   * 调度器自身异常。默认面向日志（渲染层只 console 记录，不弹提示）；
+   * visible=true 才允许打扰用户（当前无此类事件 —— 内部机制类信息一律只写日志）。
+   */
+  | { type: 'scheduler-error'; message: string; phase?: string; visible?: boolean }
   | { type: 'plugin-out'; isKill: boolean }
   | { type: 'plugin-enter'; code?: string }
 

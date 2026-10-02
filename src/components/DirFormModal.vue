@@ -68,24 +68,24 @@ watch(open, (v) => v && initForm(), { immediate: true })
 
 // ---------- 标题与文案 ----------
 
-const title = computed(() => (isEdit.value ? '修改同步目录' : '添加同步目录'))
-const subtitle = computed(() => (isEdit.value ? props.dir!.name : '将本地目录与 WebDAV 云端目录建立同步关系'))
-const submitText = computed(() => (isEdit.value ? '保存修改' : '添加目录'))
+const title = computed(() => (isEdit.value ? '修改同步文件夹' : '添加同步文件夹'))
+const subtitle = computed(() => (isEdit.value ? props.dir!.name : '让电脑上的文件夹和云端文件夹保持一致'))
+const submitText = computed(() => (isEdit.value ? '保存修改' : '添加文件夹'))
 
 const modeOptions = [
   { value: 'two-way', label: '双向同步', icon: 'swap' },
-  { value: 'upload', label: '仅上传', icon: 'upload' },
-  { value: 'download', label: '仅下载', icon: 'download' },
+  { value: 'upload', label: '只上传', icon: 'upload' },
+  { value: 'download', label: '只下载', icon: 'download' },
 ] satisfies { value: SyncMode; label: string; icon?: string }[]
 
 const remoteHint = computed(() => {
   switch (mode.value) {
     case 'two-way':
-      return '双向同步：本地与云端任意一侧变更都会同步到另一侧'
+      return '双向同步：电脑和云端任何一侧的改动都会同步到另一侧'
     case 'upload':
-      return '仅上传：本地文件的变更将上传到云端，云端变更不会下载'
+      return '只上传（备份到云端）：电脑上的改动会传到云端，云端的改动不会下载到电脑'
     case 'download':
-      return '仅下载：云端文件的变更将下载到本地，本地变更不会上传'
+      return '只下载：云端的改动会下载到电脑，电脑上的改动不会上传'
   }
   return ''
 })
@@ -133,7 +133,7 @@ function close() {
 function submit() {
   const local = localPath.value.trim()
   if (!local) {
-    localError.value = '请选择要同步的本地目录'
+    localError.value = '请选择要同步的电脑文件夹'
     return
   }
   const remote = remotePath.value.trim() || suggestRemote(local)
@@ -147,8 +147,10 @@ function submit() {
       props.dir?.id
     )
     if (overlap) {
-      if (overlap.side === 'local') localError.value = overlap.message + '：同步目录之间不能嵌套或重叠'
-      else remoteError.value = overlap.message + '：同步目录之间不能嵌套或重叠'
+      // 服务侧 message 已是人话（含既有同步名）；补一句规则说明与例子
+      const rule = '同步文件夹之间不能互相包含（例如不能同时同步 D:\\A 和 D:\\A\\B）'
+      if (overlap.side === 'local') localError.value = `${overlap.message}。${rule}`
+      else remoteError.value = `${overlap.message}。${rule}`
       return
     }
   }
@@ -166,7 +168,7 @@ function submit() {
 // ---------- 浏览入口 ----------
 
 function browse() {
-  const picked = window.services?.fsx.pickDirectory('选择要同步的本地目录')
+  const picked = window.services?.fsx.pickDirectory('选择要同步的文件夹')
   if (picked) {
     localPath.value = picked
     // 远端路径为空或仍是另一目录的派生值时，按「默认 WebDAV 目录 > 本地目录名」补初值
@@ -178,7 +180,7 @@ function browse() {
 /** 打开远端目录选择器：未配置服务器时直接提示，避免必然失败的请求 */
 function browseRemote() {
   if (!store.state.server.serverUrl.trim()) {
-    toast.warning('请先填写服务器地址', '在设置中填写 WebDAV 地址后再浏览云端目录')
+    toast.warning('请先填写服务器地址', '填写服务器地址后才能浏览云端文件夹')
     return
   }
   showRemotePicker.value = true
@@ -194,10 +196,10 @@ function browseRemote() {
         </template>
 
         <div class="flex flex-col gap-[14px]">
-          <!-- 本地目录 -->
+          <!-- 电脑上的文件夹 -->
           <div class="flex flex-col gap-[6px]">
             <div class="flex items-center gap-[6px]">
-              <span class="text-[12px] font-medium text-btn-text">本地目录</span>
+              <span class="text-[12px] font-medium text-btn-text">电脑上的文件夹</span>
               <span class="text-danger font-medium">*</span>
             </div>
             <div class="flex gap-2">
@@ -207,19 +209,19 @@ function browseRemote() {
                 mono
                 class="flex-1 min-w-0"
                 :invalid="!!localError"
-                placeholder="选择或输入本地目录路径"
+                placeholder="选择或输入电脑上的文件夹路径"
                 @update:model-value="localError = ''"
               />
               <AppButton @click="browse">浏览…</AppButton>
             </div>
             <div class="text-[11px]" :class="localError ? 'text-danger' : 'text-ink-4'">
-              {{ localError || '该目录下的文件变更会同步到云端' }}
+              {{ localError || '这个文件夹里的文件改动会同步到云端' }}
             </div>
           </div>
 
-          <!-- WebDAV 目录 -->
+          <!-- 云端文件夹 -->
           <div class="flex flex-col gap-[6px]">
-            <span class="text-[12px] font-medium text-btn-text">WebDAV 目录</span>
+            <span class="text-[12px] font-medium text-btn-text">云端文件夹</span>
             <div class="flex gap-2">
               <AppInput v-model="remotePath" icon="cloud" mono class="flex-1 min-w-0" :invalid="!!remoteError" placeholder="/Projects" @update:model-value="remoteError = ''" />
               <AppButton @click="browseRemote">浏览…</AppButton>
@@ -254,35 +256,34 @@ function browseRemote() {
               @after-leave="onAdvAfterLeave"
             >
               <div v-show="advancedOpen" class="flex flex-col gap-[6px]">
-                <!-- 覆盖全局设置开关：位于冲突处理上方，说明同时涵盖开 / 关两种状态 -->
+                <!-- 「单独设置这个文件夹」开关：位于冲突处理上方，说明同时涵盖开 / 关两种状态 -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex flex-col gap-[2px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">覆盖全局设置</span>
-                    <span class="text-[11px] text-ink-4">开启后以下设置按此目录单独保存，关闭则跟随全局</span>
+                    <span class="text-[12px] font-medium text-ink-1">单独设置这个文件夹</span>
+                    <span class="text-[11px] text-ink-4">开启后，下面的选项只对这个文件夹生效；关闭则使用「设置」里的通用选项</span>
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="overrideOn" />
                 </div>
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex flex-col gap-[2px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">冲突处理</span>
-                    <span class="text-[11px] text-ink-4">两侧同时修改时的处理方式</span>
+                    <span class="text-[12px] font-medium text-ink-1">两边都改了怎么办</span>
+                    <span class="text-[11px] text-ink-4">同一个文件在电脑和云端都被修改时，怎么处理</span>
                   </div>
                   <span class="flex-spacer" />
                   <AppSelect v-model="conflictStrategy" :options="strategyOptions" :width="104" :disabled="!overrideOn" />
                 </div>
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex flex-col gap-[2px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">忽略隐藏文件</span>
-                    <span class="text-[11px] text-ink-4">跳过以 . 开头的文件和系统文件</span>
+                    <span class="text-[12px] font-medium text-ink-1">不同步隐藏文件和系统文件</span>
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="ignoreHidden" :disabled="!overrideOn" />
                 </div>
                 <div class="flex items-center gap-3 pt-[4px] mb-[2px]">
                   <div class="flex flex-col gap-[2px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">同步间隔</span>
-                    <span class="text-[11px] text-ink-4">此目录自动同步的轮询周期</span>
+                    <span class="text-[12px] font-medium text-ink-1">检查频率</span>
+                    <span class="text-[11px] text-ink-4">这个文件夹每隔多久检查一次云端有没有更新</span>
                   </div>
                   <span class="flex-spacer" />
                   <AppSelect v-model="intervalMin" :options="intervalOptions" :width="104" :disabled="!overrideOn" />

@@ -2,7 +2,7 @@
   "$schema": "node_modules/@ztools-center/ztools-api-types/resource/ztools.schema.json",
   "name": "webdav-sync",
   "title": "WebDAV 同步",
-  "description": "基于 WebDAV 的多设备目录同步插件",
+  "description": "基于 WebDAV 的多设备文件夹同步插件",
   "author": "98014",
   "version": "0.0.1",
   "main": "dist/index.html",
@@ -17,9 +17,13 @@
   "features": [
     {
       "code": "sync",
-      "explain": "将本地目录与 WebDAV 云端目录建立双向同步",
+      "explain": "让电脑上的文件夹和云端文件夹保持双向同步",
       "icon": "logo.png",
-      "cmds": ["WebDAV 同步", "同步", "webdav"]
+      "cmds": [
+        "WebDAV 同步",
+        "同步",
+        "webdav"
+      ]
     }
   ]
 }

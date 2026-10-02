@@ -1,7 +1,7 @@
 {
   "name": "webdav-sync",
   "version": "1.0.0",
-  "description": "基于 WebDAV 的多设备目录同步插件",
+  "description": "基于 WebDAV 的多设备文件夹同步插件",
   "type": "module",
   "engines": {
     "node": ">=22.18"

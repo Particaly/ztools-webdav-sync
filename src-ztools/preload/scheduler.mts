@@ -312,8 +312,8 @@ function jitterRange(minMs: number, maxMs: number): number {
 
 /**
  * 折叠完全相同的消息（轮末展示用，纯函数）：按首次出现顺序保留，重复的消息
- * 合并为一条「msg（共 N 次）」——「无法列举远端目录（CIRCUIT_OPEN）」类同文噪声
- * 不再逐条刷屏。只折叠展示，不改 summary.errors 原始数据（既有断言依赖原样）。
+ * 合并为一条「msg（重复 N 次）」——同文噪声不再逐条刷屏。
+ * 只折叠展示，不改 summary.errors 原始数据（既有断言依赖原样）。
  */
 function foldRepeated(messages: string[] | null | undefined): string[] {
   const counts = new Map<any, any>()
@@ -327,7 +327,7 @@ function foldRepeated(messages: string[] | null | undefined): string[] {
       counts.set(k, counts.get(k) + 1)
     }
   }
-  return order.map((k) => (counts.get(k) > 1 ? `${k}（共 ${counts.get(k)} 次）` : k))
+  return order.map((k) => (counts.get(k) > 1 ? `${k}（重复 ${counts.get(k)} 次）` : k))
 }
 
 /**
@@ -344,13 +344,14 @@ function summarizeRound(summary: SyncSummary | null | undefined, error: Error | 
   const deferred = sum ? Number(sum.deferredConflicts) || 0 : 0
   const deleteHeld = sum ? Number(sum.deleteHeld) || 0 : 0
   if (cancelled) return { tone: 'cancelled', title: '已取消同步', errors: [] }
-  if (br) return { tone: 'breaker', title: '服务器连续无响应', detail: String(br.reason || ''), consecutive: br.consecutive, errors }
+  // 熔断轮：一句人话归因，最后失败原因（技术细节）放 detail
+  if (br) return { tone: 'breaker', title: '服务器一直没有响应，本次同步已暂停，稍后自动重试', detail: String(br.reason || ''), consecutive: br.consecutive, errors }
   if (error) return { tone: 'error', title: errors[0] || String(error), errors }
   if (deferred > 0 || deleteHeld > 0) {
     const parts: any[] = []
-    if (deferred > 0) parts.push(`${deferred} 个待处理冲突`)
-    if (deleteHeld > 0) parts.push(`${deleteHeld} 项删除待确认`)
-    return { tone: 'partial', title: `部分完成，有 ${parts.join('、')}`, errors }
+    if (deferred > 0) parts.push(`${deferred} 个文件等你选择`)
+    if (deleteHeld > 0) parts.push(`${deleteHeld} 项删除等你确认`)
+    return { tone: 'partial', title: `部分完成：${parts.join('、')}`, errors }
   }
   if (errors.length) return { tone: 'error', title: errors[0], errors }
   return { tone: 'ok', title: '同步完成', errors: [] }
@@ -553,9 +554,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     }
   }
 
-  /** 调度器自身异常上报（永不中断调度循环） */
-  function emitError(message: unknown, phase?: string): void {
-    emit({ type: 'scheduler-error', message: String(message), phase: phase || 'runtime' })
+  /** 调度器自身异常上报（永不中断调度循环；默认仅写日志，visible=true 才外发为用户可见提示） */
+  function emitError(message: unknown, phase?: string, visible = false): void {
+    emit({ type: 'scheduler-error', message: String(message), phase: phase || 'runtime', visible })
   }
 
   /** slot 的对外视图（快照与 slot 事件共用同一形状） */
@@ -1070,7 +1071,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     for (let i = roundWaiters.length - 1; i >= 0; i--) {
       const w = roundWaiters.splice(i, 1)[0]
       try {
-        w.resolve({ error: new Error('同步已中止：leader 丢失') })
+        w.resolve({ error: new Error('已取消同步') })
       } catch (_) {
         /* 忽略 */
       }
@@ -1278,7 +1279,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       const slot = rec.req.dirId ? slots.get(rec.req.dirId) : undefined
       const dirCfg = slot ? slot.dir : rec.req.dir
       if (!dirCfg || !dirCfg.localPath) {
-        await appendManualLine({ kind: 'receipt', id, by: instanceId, at: now(), ok: false, error: '目录配置不存在' })
+        await appendManualLine({ kind: 'receipt', id, by: instanceId, at: now(), ok: false, error: '这个同步文件夹已被移除' })
         continue
       }
       // 委托轮走全局队列（kind='manual-delegated'：冲突一律 defer，不转发本机渲染层）
@@ -1541,7 +1542,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
           // 配置已移除该目录：丢弃 job（被移除目录的 rerun 等待者也一并收尾）
           queue.splice(idx, 1)
           job.slot.state = 'idle'
-          if (job.resolve) job.resolve({ error: '目录已从配置移除' })
+          if (job.resolve) job.resolve({ error: '这个同步文件夹已被移除' })
           continue
         }
         if (job.slot.state !== 'queued') {
@@ -1724,10 +1725,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
               newlyNotified = true
               const nConflict = openItems.filter((it) => it.kind !== 'delete').length
               const nDelete = openItems.length - nConflict
-              const parts: any[] = []
-              if (nConflict > 0) parts.push(`${nConflict} 个待处理冲突`)
-              if (nDelete > 0) parts.push(`${nDelete} 项删除待确认`)
-              notifyBestEffort(`WebDAV 同步：发现 ${parts.join('、')}，请打开插件处理`)
+      const parts: any[] = []
+      if (nConflict > 0) parts.push(`${nConflict} 个文件需要你选择保留哪一个`)
+      if (nDelete > 0) parts.push(`${nDelete} 项删除等你确认`)
+      notifyBestEffort(`WebDAV 同步：${parts.join('、')}，点击打开插件处理`)
             } else if (!openRels.length) {
               slot.lastNotifyFp = null
             }
@@ -1828,9 +1829,12 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         return { skipped: true }
       }
       if (acq.reason === '已取消' || acq.reason === 'leader 丢失') {
-        return { error: new Error('同步已中止：用户取消'), cancelled: true }
+        return { error: new Error('已取消同步'), cancelled: true }
       }
-      return { error: new Error(`目录锁等待超时：${acq.reason}`) }
+      // 手动轮锁等待超时：一句人话 + 技术原因放 detail
+      const lockTimeout: any = new Error('另一台设备正在同步这个文件夹，等待超时，稍后会重试')
+      lockTimeout.detail = acq.reason
+      return { error: lockTimeout }
     }
     const progressAt = makeProgressEmitter(slot)
     try {
@@ -1909,7 +1913,11 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       cancelOn: () => slot.cancelRequested,
       cancelOnReason: '已取消',
     })
-    if (!acq.ok) return { ok: false, error: `目录锁获取失败：${acq.reason}` }
+    if (!acq.ok) {
+      const lockFail: any = new Error('暂时无法开始同步，稍后会重试')
+      lockFail.detail = acq.reason
+      return { ok: false, error: lockFail }
+    }
     slot.state = 'running'
     emitSlot(slot, true)
     const progressAt = makeProgressEmitter(slot)
@@ -2039,15 +2047,19 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
      * @param dirId 省略 = 同步全部启用目录
      */
     async syncNow(dirId) {
-      if (!ready) throw new Error(`调度器未就绪：${notReadyReason || '配置未加载'}`)
-      if (!config || !config.server || !config.server.serverUrl) throw new Error('未配置 WebDAV 服务器')
+      if (!ready) {
+        const notReady: any = new Error('自动同步还没准备好，请稍候')
+        notReady.detail = notReadyReason || '配置未加载'
+        throw notReady
+      }
+      if (!config || !config.server || !config.server.serverUrl) throw new Error('还没有设置服务器，请先到「设置」里填写')
       const targets: DirSlot[] = dirId
         ? slots.has(dirId)
           ? [slots.get(dirId) as DirSlot]
           : []
         : Array.from(slots.values()).filter((s) => s.dir.enabled !== false)
-      if (dirId && !targets[0]) throw new Error(`未找到同步目录：${dirId}`)
-      if (!targets.length) throw new Error(dirId ? `未找到同步目录：${dirId}` : '没有启用的同步目录')
+      if (dirId && !targets[0]) throw new Error('找不到这个同步文件夹')
+      if (!targets.length) throw new Error(dirId ? '找不到这个同步文件夹' : '没有正在开启的同步文件夹')
       const results: RoundResolveValue[] = []
       for (const slot of targets) {
         const mineNow = leaderState === 'leader' && ownerRef.valid && (await leaderLockIsMine())

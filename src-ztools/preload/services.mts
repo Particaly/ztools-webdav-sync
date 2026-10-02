@@ -416,8 +416,10 @@ function createMultistatusStream(): any {
     close() {
       parser.close()
       if (firstError) {
-        const err: any = new Error(`multistatus 解析失败：${firstError.message}`)
+        // 面向用户一句话；原始解析错误放 detail（反馈问题时可见）
+        const err: any = new Error('服务器返回的内容无法识别，请确认地址是 WebDAV 地址')
         err.code = 'XML_PARSE'
+        err.detail = firstError.message
         throw err
       }
     },
@@ -591,12 +593,13 @@ function createRoundBreaker(threshold = ROUND_BREAKER_THRESHOLD) {
         st.reason = String(msg || '')
       }
     },
-    /** 熔断后网络层快速失败用的错误（permanent=true：不再进入重试） */
+    /** 熔断后网络层快速失败用的错误（permanent=true：不再进入重试）；一句人话 + 技术原因放 detail */
     error() {
-      const err: any = new Error(`连续失败 ${st.consecutive} 次（${st.reason}）：本轮同步已熔断，剩余文件将在下一轮重试`)
+      const err: any = new Error('服务器连续多次出错，本次同步已暂停，剩余文件会在下次同步时继续')
       err.status = 0
       err.code = 'CIRCUIT_OPEN'
       err.permanent = true
+      err.detail = `连续失败 ${st.consecutive} 次（${st.reason}）`
       return err
     },
     get open() {
@@ -747,10 +750,11 @@ function classifyStatus(status: number, headers: Record<string, any>): { code: s
 /** 网络层错误统一包装：已分类的错误原样透传，其余包装为 status=0 / code='NETWORK' / permanent=false */
 function normalizeNetError(e: any, url: any): any {
   if (e && (e.code === 'NETWORK' || e.code === 'LOCAL_IO' || e.code === 'REDIRECT' || e.code === 'ABORTED')) return e
-  const err: any = new Error(`网络请求失败（${(e && e.code) || (e && e.message) || e}）：${url ? url.href : ''}`)
+  const err: any = new Error('网络连接失败，请检查网络和服务器地址')
   err.status = 0
   err.code = 'NETWORK'
   err.permanent = false
+  err.detail = `${(e && e.code) || (e && e.message) || e} ${url ? url.href : ''}`
   return err
 }
 
@@ -763,10 +767,11 @@ function normalizeNetError(e: any, url: any): any {
  * 不产生用户可见错误（轮次整体按既有「同步已中止」语义收场）。
  */
 function makeAbortError(url: any): any {
-  const err: any = new Error(`同步已中止：用户取消（${url ? url.href : ''}）`)
+  const err: any = new Error('已取消同步')
   err.status = 0
   err.code = 'ABORTED'
   err.permanent = false
+  err.detail = url ? url.href : ''
   return err
 }
 
@@ -787,17 +792,17 @@ function hashTransform(h: { update(c: unknown): void }): Transform {
   })
 }
 
-/** 下载落盘错误映射：ENOSPC / EACCES / EPERM 等转可读中文（含路径与系统码） */
+/** 下载落盘错误映射：ENOSPC / EACCES / EPERM 等转可读中文（技术细节放 detail） */
 function mapLocalWriteError(e: any, sinkFile: any): any {
   const code = (e && e.code) || ''
   const known = code === 'ENOSPC' || code === 'EDQUOT' || code === 'EACCES' || code === 'EPERM'
-  const why = code === 'ENOSPC' || code === 'EDQUOT' ? '磁盘空间不足' : known ? '没有写入权限' : ''
   const err: any = known
-    ? new Error(`写入本地文件失败（${why}，系统码 ${code}，路径 ${sinkFile}）`)
-    : new Error(`写入本地文件失败 ${path.basename(sinkFile || '')}：${code || (e && e.message) || e}`)
+    ? new Error(code === 'ENOSPC' || code === 'EDQUOT' ? '电脑磁盘空间不足，写入文件失败。请清理空间后重新同步' : '没有写入权限，无法保存文件。请检查文件夹权限后重新同步')
+    : new Error(`保存文件「${path.basename(sinkFile || '')}」失败`)
   err.status = 0
   err.code = 'LOCAL_IO'
   err.permanent = true
+  err.detail = `${code || (e && e.message) || e} ${sinkFile || ''}`
   return err
 }
 
@@ -822,10 +827,11 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
       try {
         st = fs.statSync(opts.bodyFile)
       } catch (e: any) {
-        const err: any = new Error(`本地文件不存在：${opts.bodyFile}`)
+        const err: any = new Error(`「${path.basename(opts.bodyFile)}」未上传：文件已经不在电脑上了`)
         err.status = 0
         err.code = 'LOCAL_IO'
         err.permanent = true
+        err.detail = opts.bodyFile
         reject(err)
         return
       }
@@ -855,10 +861,11 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
     const armStall = () => {
       if (stallTimer) nodeTimers.clearTimeout(stallTimer)
       stallTimer = nodeTimers.setTimeout(() => {
-        const err: any = new Error(`传输无进展：${Math.round(netOpts.stallMs / 1000)} 秒未收到任何数据（${url.href}）`)
+        const err: any = new Error(`传输卡住了：${Math.round(netOpts.stallMs / 1000)} 秒没有收到数据，请检查网络`)
         err.status = 0
         err.code = 'NETWORK'
         err.permanent = false
+        err.detail = url ? url.href : ''
         req.destroy(err)
       }, netOpts.stallMs)
     }
@@ -932,10 +939,11 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
     req.on('socket', (sock) => {
       if (!sock || !sock.connecting) return
       connectTimer = nodeTimers.setTimeout(() => {
-        const err: any = new Error(`连接服务器超时（${netOpts.connectTimeoutMs} 毫秒）：${url.origin}`)
+        const err: any = new Error('连接服务器超时，请检查网络或服务器地址')
         err.status = 0
         err.code = 'NETWORK'
         err.permanent = false
+        err.detail = `${netOpts.connectTimeoutMs}ms ${url.origin}`
         req.destroy(err)
       }, netOpts.connectTimeoutMs)
       sock.once(url.protocol === 'https:' ? 'secureConnect' : 'connect', () => {
@@ -944,10 +952,11 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
       })
     })
     req.on('timeout', () => {
-      const err: any = new Error(`请求超时（${Math.round(netOpts.idleTimeoutMs / 1000)} 秒无数据活动）：${url.host}`)
+      const err: any = new Error('服务器长时间没有响应，请稍后重试')
       err.status = 0
       err.code = 'NETWORK'
       err.permanent = false
+      err.detail = `${Math.round(netOpts.idleTimeoutMs / 1000)}s ${url.host}`
       req.destroy(err)
     })
     req.on('error', (e) => finish(reject, abortErr || normalizeNetError(e, url)))
@@ -986,11 +995,12 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
           return
         }
         if (readFailed) {
-          const e2: any = new Error(`读取本地文件失败 ${opts.bodyFile}：${(err && err.code) || (err && err.message) || err}`)
+          const e2: any = new Error(`「${path.basename(opts.bodyFile || '')}」未上传：文件暂时读不出来`)
           e2.status = 0
           e2.code = 'LOCAL_IO'
           e2.permanent = true
           e2.source = 'body-read' // 上传读流失败 —— 已发出的字节服务器可能已收，意图须保持开放
+          e2.detail = `${(err && err.code) || (err && err.message) || err} ${opts.bodyFile || ''}`
           req.destroy(e2)
           finish(reject, e2)
           return
@@ -1076,7 +1086,9 @@ async function davRequest(cfg: EngineCfg, method: string, remotePath: string, op
   try {
     startUrl = new URL(remoteUrl(cfg, remotePath))
   } catch (e: any) {
-    throw new Error(`无效的服务器地址：${cfg && cfg.serverUrl}`)
+    const invalid: any = new Error('服务器地址格式不对，应以 http:// 或 https:// 开头')
+    invalid.detail = cfg && cfg.serverUrl
+    throw invalid
   }
   // 集合类 URL 统一带尾斜杠：部分服务器对无尾斜杠的集合 PROPFIND 返回 301，
   // 与其每次跟随重定向，不如一开始就按规范形态发起
@@ -1091,19 +1103,24 @@ async function davRequest(cfg: EngineCfg, method: string, remotePath: string, op
       return res
     }
     if (redirects >= MAX_REDIRECTS) {
-      throw new Error(`重定向次数过多（超过 ${MAX_REDIRECTS} 次）：${startUrl.href}`)
+      const loop: any = new Error('服务器地址一直在跳转，无法连接，请检查地址是否正确')
+      loop.detail = `重定向超过 ${MAX_REDIRECTS} 次：${startUrl.href}`
+      throw loop
     }
     let next
     try {
       next = new URL(String(res.headers.location), current)
     } catch (e: any) {
-      throw new Error(`重定向地址无效（${res.headers.location}）：${current.href}`)
+      const badLoc: any = new Error('服务器地址一直在跳转，无法连接，请检查地址是否正确')
+      badLoc.detail = `重定向地址无效（${res.headers.location}）：${current.href}`
+      throw badLoc
     }
     if (next.origin !== current.origin) {
-      const err: any = new Error(`拒绝跟随跨源重定向：${current.href} → ${next.href}`)
+      const err: any = new Error(`服务器想把请求转到另一个网站（${next.origin}），出于安全已拒绝。如果新地址可信，请直接填写新地址`)
       err.status = res.status
       err.code = 'REDIRECT'
       err.permanent = true
+      err.detail = `${current.href} → ${next.href}`
       throw err
     }
     current = next
@@ -1121,8 +1138,9 @@ async function mkdirDeep(cfg: EngineCfg, remotePath: string): Promise<void> {
     cur += '/' + seg
     const r = await davRequest(cfg, 'MKCOL', cur)
     if (r.status !== 201 && r.status !== 405 && r.status !== 301) {
-      const err: any = new Error(`创建远端目录失败（${cur}）：HTTP ${r.status}`)
+      const err: any = new Error(`无法在云端创建文件夹「${cur}」，请检查账号是否有写入权限`)
       err.status = r.status
+      err.detail = `MKCOL HTTP ${r.status}`
       throw err
     }
   }
@@ -1269,7 +1287,7 @@ async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreHidden: 
     } else {
       // 404：与逐目录模式的首请求同语义（根缺失 → incomplete，绝不解读为「远端已删除」）
       complete = false
-      errors.push({ rel: '.', message: 'HTTP 404（目录不存在或不可访问）' })
+      errors.push({ rel: '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
       return { files, complete, errors, probeResidue, depth: 'infinity', collections, skippedDirs }
     }
   }
@@ -1293,12 +1311,12 @@ async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreHidden: 
     }
     if (r.status === 404) {
       complete = false
-      errors.push({ rel: prefix || '.', message: 'HTTP 404（目录不存在或不可访问）' })
+      errors.push({ rel: prefix || '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
       continue
     }
     if (r.status !== 207) {
       complete = false
-      errors.push({ rel: prefix || '.', message: `HTTP ${r.status}` })
+      errors.push({ rel: prefix || '.', message: `云端文件夹暂时读不出来（HTTP ${r.status}）` })
       continue
     }
     let items
@@ -1337,8 +1355,9 @@ async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreHidden: 
 async function listRemote(cfg: EngineCfg, remotePath: string, ignoreHidden: boolean): Promise<Map<string, any>> {
   const scan = await listRemoteSafe(cfg, remotePath, ignoreHidden)
   if (!scan.complete) {
-    const e: any = new Error(`列举远端目录失败（${scan.errors[0].rel}）：${scan.errors[0].message}`)
+    const e: any = new Error('无法读取云端文件夹的内容，本次同步已停止，没有改动任何文件')
     e.scanErrors = scan.errors
+    e.detail = `${scan.errors[0].rel}: ${scan.errors[0].message}`
     throw e
   }
   return scan.files
@@ -1360,11 +1379,13 @@ async function listDirs(cfg: EngineCfg, remotePath: string): Promise<Array<{ nam
     headers: { Depth: '1', 'Content-Type': 'application/xml' },
     body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
   })
-  if (r.status === 404) throw new Error('远端目录不存在')
+  if (r.status === 404) throw new Error('云端找不到这个文件夹，或没有访问权限')
   const body = r.body ? r.body.toString('utf-8') : ''
   // 个别服务器对成功的 PROPFIND 返回 200 + multistatus 而非 207，一并接受
   if (r.status !== 207 && !(r.status === 200 && /multistatus/i.test(body))) {
-    throw new Error(`列举远端目录失败：HTTP ${r.status}`)
+    const err: any = new Error('无法读取云端文件夹的内容')
+    err.detail = `HTTP ${r.status}`
+    throw err
   }
   const dirs: any[] = []
   for (const item of parseMultistatus(body)) {
@@ -1484,7 +1505,7 @@ function strongEtagOf(e: string | null | undefined): string | null {
 }
 
 /** 降级能力结果：探测无法完成时按 B 档（可写假设 + 无条件请求）保守执行，不落缓存 */
-function degradedCaps(note: string): DavCapabilities {
+function degradedCaps(note: string, tech?: string): DavCapabilities {
   return {
     probedAt: 0,
     tier: 'B',
@@ -1498,18 +1519,18 @@ function degradedCaps(note: string): DavCapabilities {
     etagPropagation: false,
     mtimePrecision: 'ms',
     collectionRedirect: false,
-    notes: [note],
+    notes: tech ? [note, tech] : [note],
   }
 }
 
-/** 权限性拒绝的写结论（C 档，可缓存 7 天） */
-function deniedWrite(reason: string): any {
-  return { writable: false, reason, probedAt: Date.now() }
+/** 权限性拒绝的写结论（C 档，可缓存 7 天）：reason 为面向用户一句话，tech 为技术明细（进 notes） */
+function deniedWrite(reason: string, tech?: string): any {
+  return { writable: false, reason, tech, probedAt: Date.now() }
 }
 
 /** 非权限性失败的写结论（409 / 5xx / 网络错误）：当轮按 B 档保守处理，不落缓存，下轮重探 */
-function retryWrite(note: string): any {
-  return { retry: true, note, probedAt: Date.now() }
+function retryWrite(note: string, tech?: string): any {
+  return { retry: true, note, tech, probedAt: Date.now() }
 }
 
 /**
@@ -1543,10 +1564,12 @@ function effectiveCaps(common: any, write: any): any {
     if (write.writable === false && write.reason) {
       eff.writeReason = write.reason
       notes.push(write.reason)
+      if (write.tech) notes.push(write.tech)
     } else if (write.retry && write.note) {
       eff.writeReason = write.note
       eff.writeRetrySoon = true
       notes.push(write.note)
+      if (write.tech) notes.push(write.tech)
     }
   }
   return eff
@@ -1610,7 +1633,7 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
     baseNoSlash = String((cfg && cfg.serverUrl) || '').replace(/\/+$/, '')
     new URL(baseNoSlash) // 仅验证可解析
   } catch (_) {
-    return fail(retryWrite(`服务器地址无效：${(cfg && cfg.serverUrl) || ''}`))
+    return fail(retryWrite('服务器地址不正确', `服务器地址无效：${(cfg && cfg.serverUrl) || ''}`))
   }
 
   // 1. 确保目标根目录存在。mkdirDeep 失败按状态码分类：
@@ -1627,18 +1650,18 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
           await mkdirDeep(cfg, pathRel)
         } catch (e: any) {
           if (e && MKCOL_DENIED_STATUS.has(Number(e.status))) {
-            return fail(deniedWrite(`服务器拒绝创建目录（HTTP ${e.status}）`))
+            return fail(deniedWrite('服务器不允许创建文件夹，请检查账号权限', `创建目录被拒（HTTP ${e.status}）`))
           }
-          return fail(retryWrite(`根目录不存在且创建失败：${(e && e.message) || e}`))
+          return fail(retryWrite('云端文件夹暂时不可用，稍后会自动重试', `根目录不存在且创建失败：${(e && e.message) || e}`))
         }
       } else if (r0.status === 401 || r0.status === 403) {
-        return fail(deniedWrite(`目录不可访问（HTTP ${r0.status}）`))
+        return fail(deniedWrite('没有访问云端文件夹的权限，请检查账号权限', `目录不可访问（HTTP ${r0.status}）`))
       } else {
-        return fail(retryWrite(`根目录 PROPFIND：HTTP ${r0.status}`))
+        return fail(retryWrite('云端文件夹暂时不可用，稍后会自动重试', `根目录 PROPFIND：HTTP ${r0.status}`))
       }
     }
   } catch (e: any) {
-    return { fatal: `根目录探测失败：${(e && e.message) || e}` }
+    return { fatal: '暂时无法检测服务器能力，稍后会自动重试', fatalTech: `根目录探测失败：${(e && e.message) || e}` }
   }
 
   // 2. 残留清理 +（仅基址）尾斜杠重定向观测。只在需要补公共字段时做：
@@ -1672,7 +1695,7 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
         else notes.push(`目录 PROPFIND：HTTP ${r1.status}`)
       }
     } catch (e: any) {
-      return { fatal: `根目录探测失败：${(e && e.message) || e}` }
+      return { fatal: '暂时无法检测服务器能力，稍后会自动重试', fatalTech: `根目录探测失败：${(e && e.message) || e}` }
     }
     // 崩溃残留清理（通道之二；通道之一为 syncDirectory 扫描后清理，见 PROBE_RESIDUE_MIN_AGE_MS
     // 注释）：同前缀且时龄超阈值的目录 / 文件。前缀匹配不区分设备 —— 清理所有设备的
@@ -1703,20 +1726,20 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
   try {
     const mk = await req('MKCOL', dirRel)
     if (mk.status === 201 || mk.status === 405) dirReady = true
-    else if (MKCOL_DENIED_STATUS.has(mk.status)) return fail(deniedWrite(`服务器拒绝创建目录（HTTP ${mk.status}）`))
-    else return fail(retryWrite(`创建探测目录：HTTP ${mk.status}`))
+    else if (MKCOL_DENIED_STATUS.has(mk.status)) return fail(deniedWrite('服务器不允许创建文件夹，请检查账号权限', `创建目录被拒（HTTP ${mk.status}）`))
+    else return fail(retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', `创建探测目录：HTTP ${mk.status}`))
   } catch (e: any) {
-    return fail(retryWrite(`创建探测目录失败：${(e && e.message) || e}`))
+    return fail(retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', `创建探测目录失败：${(e && e.message) || e}`))
   }
   if (dirReady) {
     try {
       const mk2 = await req('MKCOL', nestedRel)
       if (mk2.status !== 201 && mk2.status !== 405) {
-        if (MKCOL_DENIED_STATUS.has(mk2.status)) return fail(deniedWrite(`服务器拒绝创建目录（HTTP ${mk2.status}）`))
-        return fail(retryWrite(`创建探测子目录：HTTP ${mk2.status}`))
+        if (MKCOL_DENIED_STATUS.has(mk2.status)) return fail(deniedWrite('服务器不允许创建文件夹，请检查账号权限', `创建目录被拒（HTTP ${mk2.status}）`))
+        return fail(retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', `创建探测子目录：HTTP ${mk2.status}`))
       }
     } catch (e: any) {
-      return fail(retryWrite(`创建探测子目录失败：${(e && e.message) || e}`))
+      return fail(retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', `创建探测子目录失败：${(e && e.message) || e}`))
     }
   }
 
@@ -1728,13 +1751,13 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
     try {
       const p = await req('PUT', fileRel, { body: PROBE_BODY })
       if (p.status >= 200 && p.status < 300) write = { writable: true, probedAt: Date.now() }
-      else if (PUT_DENIED_STATUS.has(p.status)) write = deniedWrite(`服务器拒绝写入（HTTP ${p.status}）`)
-      else write = retryWrite(`写入探测文件失败：HTTP ${p.status}`)
+      else if (PUT_DENIED_STATUS.has(p.status)) write = deniedWrite('服务器不允许上传文件，请检查账号权限', `写入被拒（HTTP ${p.status}）`)
+      else write = retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', `写入探测文件失败：HTTP ${p.status}`)
     } catch (e: any) {
-      write = retryWrite(`写入探测文件失败：${(e && e.message) || e}`)
+      write = retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', `写入探测文件失败：${(e && e.message) || e}`)
     }
   } else {
-    write = retryWrite('探测目录不可用')
+    write = retryWrite('暂时无法确认服务器是否允许上传，稍后会自动重新检测', '探测目录不可用')
   }
   const wrote = !!write && write.writable === true
 
@@ -1897,7 +1920,7 @@ async function probeCapabilities(cfg: EngineCfg, force?: boolean, remotePath?: s
   try {
     state = await storage.openServerState(originOf(cfg), (cfg && cfg.username) || '')
   } catch (e: any) {
-    return degradedCaps(`能力缓存存储不可用：${(e && e.message) || e}`)
+    return degradedCaps('暂时无法检测服务器能力，稍后会自动重试', `能力缓存存储不可用：${(e && e.message) || e}`)
   }
   const cached = (!force && state.getCachedCapabilities(PROBE_TTL_MS)) || null
   const writePaths = { ...((cached && cached.writePaths) || {}) }
@@ -1910,7 +1933,7 @@ async function probeCapabilities(cfg: EngineCfg, force?: boolean, remotePath?: s
   if (!common || !write) {
     probed = true
     const r = await runCapabilityProbe(cfg, pathKey, common)
-    if (r.fatal) return degradedCaps(`探测中途失败：${r.fatal}`)
+    if (r.fatal) return degradedCaps(r.fatal, r.fatalTech)
     common = r.common
     write = r.write
   }
@@ -1934,7 +1957,7 @@ async function getSyncCapabilities(cfg: EngineCfg, remotePath?: string): Promise
   try {
     return await probeCapabilities(cfg, false, remotePath)
   } catch (e: any) {
-    return degradedCaps(`能力探测异常：${(e && e.message) || e}`)
+    return degradedCaps('暂时无法检测服务器能力，稍后会自动重试', `能力探测异常：${(e && e.message) || e}`)
   }
 }
 
@@ -2258,7 +2281,8 @@ async function scanDirtyFast(
 async function scanDir(localPath: string, ignoreHidden: boolean): Promise<Map<string, LocalStat>> {
   const scan = await scanDirSafe(localPath, ignoreHidden)
   if (!scan.complete) {
-    const e: any = new Error(`本地目录扫描未完成（${scan.errors[0].rel}）：${scan.errors[0].message}`)
+    const e: any = new Error(`读取电脑文件夹「${scan.errors[0].rel}」时出错，为避免误删文件，本次同步已停止`)
+    e.detail = scan.errors[0].message
     e.scanErrors = scan.errors
     throw e
   }
@@ -2285,13 +2309,14 @@ async function checkLocalRootHealth(localPath: string, baselineCount: number): P
   try {
     st = await fsp.stat(root)
   } catch (e: any) {
-    const err: any = new Error(`本地同步根目录不可访问（${(e && e.code) || (e && e.message) || e}）：本轮已中止，未做任何改动`)
+    const err: any = new Error('无法访问电脑上的同步文件夹，本次同步已停止，没有改动任何文件')
+    err.detail = `${(e && e.code) || (e && e.message) || e}`
     err.phase = 'scan'
     err.failureClass = 'other'
     throw err
   }
   if (!st.isDirectory()) {
-    const err: any = new Error('本地同步根路径不是目录：本轮已中止，未做任何改动')
+    const err: any = new Error('同步位置不是文件夹，请重新选择')
     err.phase = 'scan'
     err.failureClass = 'other'
     throw err
@@ -2300,14 +2325,15 @@ async function checkLocalRootHealth(localPath: string, baselineCount: number): P
   try {
     entries = await fsp.readdir(root)
   } catch (e: any) {
-    const err: any = new Error(`本地同步根目录不可读（${(e && e.code) || (e && e.message) || e}）：本轮已中止，未做任何改动`)
+    const err: any = new Error('无法访问电脑上的同步文件夹，本次同步已停止，没有改动任何文件')
+    err.detail = `${(e && e.code) || (e && e.message) || e}`
     err.phase = 'scan'
     err.failureClass = 'other'
     throw err
   }
   if (entries.length === 0 && baselineCount > 0) {
     const err: any = new Error(
-      `本地同步根目录为空但基线记录了 ${baselineCount} 个文件：疑似目录未挂载（外置盘/网络盘掉线）或已被清空，本轮已中止；如目录确属正常，请检查同步目录配置`
+      `电脑上的同步文件夹现在是空的，但之前已同步过 ${baselineCount} 个文件。可能是移动硬盘或网络盘没连接，也可能文件夹被清空了。为避免误删，本次已停止；如果确实应该为空，请到同步设置里检查路径`
     )
     err.phase = 'scan'
     err.failureClass = 'other'
@@ -2671,7 +2697,8 @@ async function remotePropsEx(cfg: EngineCfg, remotePath: string): Promise<any> {
  */
 async function recheckRemoteUnchanged(cfg: EngineCfg, remoteAbs: string, scan: any, rel: string): Promise<any> {
   const changed = (why: any) => {
-    const err: any = new Error(`跳过 ${rel}：复查发现远端已变化（${why}），本轮不覆盖，下一轮将重新规划`)
+    const err: any = new Error(`「${rel}」暂未上传：云端的文件刚被其他设备修改，为避免覆盖，下次同步会重新判断`)
+    err.detail = why
     err.code = 'REMOTE_CHANGED'
     err.status = 0
     err.permanent = true
@@ -2681,7 +2708,8 @@ async function recheckRemoteUnchanged(cfg: EngineCfg, remoteAbs: string, scan: a
   try {
     props = await remotePropsEx(cfg, remoteAbs)
   } catch (e: any) {
-    const err: any = new Error(`跳过 ${rel}：无法复查远端状态（${(e && e.message) || e}），本轮不覆盖`)
+    const err: any = new Error(`「${rel}」暂未处理：无法确认云端文件的最新状态，下次同步重试`)
+    err.detail = (e && e.message) || e
     err.code = 'REMOTE_CHANGED'
     err.status = 0
     err.permanent = true
@@ -2689,7 +2717,8 @@ async function recheckRemoteUnchanged(cfg: EngineCfg, remoteAbs: string, scan: a
   }
   if (props.gone) return
   if (props.error) {
-    const err: any = new Error(`跳过 ${rel}：远端状态复查失败（${props.error}），本轮不覆盖`)
+    const err: any = new Error(`「${rel}」暂未处理：无法确认云端文件的最新状态，下次同步重试`)
+    err.detail = props.error
     err.code = 'REMOTE_CHANGED'
     err.status = 0
     err.permanent = true
@@ -2737,10 +2766,10 @@ const WIN_MAX_PATH = 260
  */
 function checkWinSegment(seg: string): string | null {
   const s = String(seg == null ? '' : seg)
-  if (WIN_ILLEGAL_RE.test(s)) return '含 Windows 不允许的字符（< > : " | ? * 或控制字符）'
-  if (s !== '' && /[. ]$/.test(s)) return '以空格或点结尾（Windows 不允许）'
+  if (WIN_ILLEGAL_RE.test(s)) return '文件名包含 Windows 不支持的符号（< > : " | ? *）'
+  if (s !== '' && /[. ]$/.test(s)) return '文件名不能以空格或句点结尾（Windows 限制）'
   const base = s.split('.')[0].toUpperCase()
-  if (WIN_RESERVED.has(base)) return `保留设备名（${base}）`
+  if (WIN_RESERVED.has(base)) return `「${base}」是 Windows 的保留名称，不能用作文件名`
   return null
 }
 
@@ -2756,17 +2785,17 @@ function checkWindowsRel(rel: string, baseAbs: string): string | null {
     const why = checkWinSegment(seg)
     if (why) return `${seg}：${why}`
   }
-  if (r.length > WIN_REL_LEN_LIMIT) return `相对路径 ${r.length} 字符，超过 ${WIN_REL_LEN_LIMIT} 字符上限（Windows MAX_PATH 限制，目标机器路径只会更长）`
+  if (r.length > WIN_REL_LEN_LIMIT) return `路径太长（${r.length} 个字符），超出 Windows 的长度限制（${WIN_REL_LEN_LIMIT}）`
   if (process.platform === 'win32') {
     const absLen = String(baseAbs || '').length + 1 + r.length
-    if (absLen > WIN_MAX_PATH - 1) return `完整路径 ${absLen} 字符，超过 Windows MAX_PATH（260）限制`
+    if (absLen > WIN_MAX_PATH - 1) return `路径太长（${absLen} 个字符），超出 Windows 的长度限制（260）`
   }
   return null
 }
 
 /** 构造 BAD_FILENAME 错误（classifyOpFailure → permanent：记退避表，重命名后自动恢复） */
 function badFilenameError(rel: string, why: string): any {
-  const err: any = new Error(`跳过 ${rel}：文件名/路径在 Windows 上不可用（${why}）。已记入持续失败表；重命名该文件后将自动恢复同步`)
+  const err: any = new Error(`已跳过「${rel}」：文件名或路径在 Windows 上无法使用（${why}）。改名后会自动恢复同步`)
   err.code = 'BAD_FILENAME'
   err.status = 0
   err.permanent = true
@@ -2855,7 +2884,7 @@ function checkDirOverlap(dir: DirCfg, existing: DirCfg[], exceptId: string | nul
     if (d.localPath) {
       const ol = foldLocal(storage.normalizeLocalKey(d.localPath))
       if (nested(l, ol)) {
-        return { side: 'local', withName: String(d.name || d.id || ''), message: `本地目录与已有同步目录「${d.name || d.id}」重叠（${d.localPath}）` }
+        return { side: 'local', withName: String(d.name || d.id || ''), message: `这个文件夹与已有的同步「${d.name || d.id}」有重叠，请换一个` }
       }
     }
     if (d.remotePath && dir && dir.remotePath) {
@@ -2865,7 +2894,7 @@ function checkDirOverlap(dir: DirCfg, existing: DirCfg[], exceptId: string | nul
       const a = sameRemoteFold ? nr.toLowerCase() : nr
       const b = sameRemoteFold ? or.toLowerCase() : or
       if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) {
-        return { side: 'remote', withName: String(d.name || d.id || ''), message: `WebDAV 目录与已有同步目录「${d.name || d.id}」重叠（${d.remotePath}）` }
+        return { side: 'remote', withName: String(d.name || d.id || ''), message: `这个云端文件夹与已有的同步「${d.name || d.id}」有重叠，请换一个` }
       }
     }
   }
@@ -2902,9 +2931,9 @@ async function uploadOne(cfg: EngineCfg, dir: DirCfg, rel: string, expected: any
   if (badName) throw badFilenameError(rel, badName)
   // PRE-UPLOAD-CHECK：扫描之后文件若已变化，绝不能按旧计划上传（基线指纹必须对应实际上传的内容）
   const st1 = await statOrNull(expected.abs)
-  if (!st1) throw new Error(`上传中止 ${rel}：本地文件已不存在（可能在扫描后被删除）`)
+  if (!st1) throw new Error(`「${rel}」未上传：文件已经不在电脑上了`)
   if (st1.size !== expected.size || Math.abs(st1.mtimeMs - expected.mtimeMs) > 1000) {
-    throw new Error(`上传中止 ${rel}：本地文件与扫描时相比已发生变化，需重新规划`)
+    throw new Error(`「${rel}」未上传：同步过程中文件被改动了，下次同步会重新处理`)
   }
   const segs = rel.split('/')
   if (segs.length > 1) {
@@ -2928,17 +2957,16 @@ async function uploadOne(cfg: EngineCfg, dir: DirCfg, rel: string, expected: any
   const res = await davRequest(cfg, 'PUT', joinRemote(dir.remotePath, rel), { bodyFile: expected.abs, hashAlg: 'sha256', headers: putHeaders })
   if (res.status === 412) {
     // 条件保护命中：对端已变 → 不覆盖、本轮跳过（信息明确，便于排查服务器行为异常）
-    const err: any = new Error(
-      `上传跳过 ${rel}：远端文件已被其他设备修改（HTTP 412，If-Match 不匹配），本轮不覆盖，下一轮将重新规划`
-    )
+    const err: any = new Error(`「${rel}」暂未上传：云端的文件刚被其他设备修改，为避免覆盖，下次同步会重新判断`)
     err.code = 'PRECONDITION'
     err.status = 412
     err.permanent = true
+    err.detail = 'HTTP 412（If-Match 不匹配）'
     throw err
   }
   if (res.status !== 200 && res.status !== 201 && res.status !== 204) {
     // 附带 status 与分类 code：classifyOpFailure 据此判定永久 / 瞬时失败
-    const err: any = new Error(`上传失败 ${rel}：HTTP ${res.status}`)
+    const err: any = new Error(`「${rel}」上传失败（HTTP ${res.status}）`)
     err.status = res.status
     err.code = (res.classification && res.classification.code) || 'HTTP'
     throw err
@@ -2946,7 +2974,7 @@ async function uploadOne(cfg: EngineCfg, dir: DirCfg, rel: string, expected: any
   // POST-CHECK：上传期间文件被修改 → 本次上传不能视为最终同步状态
   const st2 = await statOrNull(expected.abs)
   if (!st2 || st2.size !== st1.size || Math.abs(st2.mtimeMs - st1.mtimeMs) > 1000) {
-    throw new Error(`上传中止 ${rel}：文件在上传期间被修改，本轮不记录其状态，请重新同步`)
+    throw new Error(`「${rel}」上传时又被修改了，请再同步一次`)
   }
   // 远端核验（VERIFY）已移至 syncDirectory 的批量校验阶段：PUT 成功 + 本地双 stat
   // 一致即返回，远端存在性 / size 与写基线用的指纹由所在目录的一次 PROPFIND Depth 1 统一提供
@@ -2985,13 +3013,13 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
   const abs = path.join(dir.localPath, ...segs)
   const before = await statOrNull(abs)
   if (guards.expectedLocal) {
-    if (!before) throw new Error(`下载中止 ${rel}：本地目标文件已消失，为避免覆盖用户内容本轮不提交`)
+    if (!before) throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
     if (before.size !== guards.expectedLocal.size || Math.abs(before.mtimeMs - guards.expectedLocal.mtimeMs) > 1000) {
-      throw new Error(`下载中止 ${rel}：本地文件已被修改，已保留当前版本，未覆盖`)
+      throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
     }
   } else if (before) {
     // 计划时目标不存在，现在却存在：计划外出现的内容一律不覆盖
-    throw new Error(`下载中止 ${rel}：目标位置出现了计划外的文件，已保留`)
+    throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
   }
   await fsp.mkdir(path.dirname(abs), { recursive: true })
   const tmp = path.join(tmpDir, `.wdsync-dl-${Date.now()}-${Math.random().toString(36).slice(2)}`)
@@ -3002,26 +3030,34 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
     res = await davRequest(cfg, 'GET', remote, { sinkFile: tmp, hashAlg: 'sha256' })
     if (res.status !== 200) {
       // 附带 status 与分类 code：classifyOpFailure 据此判定永久 / 瞬时失败
-      const err: any = new Error(`下载失败 ${rel}：HTTP ${res.status}`)
+      const err: any = new Error(`「${rel}」下载失败（HTTP ${res.status}）`)
       err.status = res.status
       err.code = (res.classification && res.classification.code) || 'HTTP'
       throw err
     }
     // DOWNLOAD_VERIFY：临时文件与 Content-Length 一致
     const tmpSt = await statOrNull(tmp)
-    if (!tmpSt) throw new Error(`下载校验失败 ${rel}：临时文件丢失`)
+    if (!tmpSt) {
+      const e: any = new Error(`「${rel}」下载不完整，下次同步会重试`)
+      e.detail = '临时文件丢失'
+      throw e
+    }
     const cl = res.headers && res.headers['content-length'] ? Number(res.headers['content-length']) : null
     if (cl != null && tmpSt.size !== cl) {
-      throw new Error(`下载校验失败 ${rel}：收到 ${tmpSt.size} 字节，响应声明 ${cl} 字节`)
+      const e: any = new Error(`「${rel}」下载不完整，下次同步会重试`)
+      e.detail = `收到 ${tmpSt.size} 字节，响应声明 ${cl} 字节`
+      throw e
     }
     // 远端相对扫描时已变化：本轮数据不可信，下一轮重新规划
     if (guards.expectedRemoteSize != null && cl != null && cl !== guards.expectedRemoteSize) {
-      throw new Error(`下载中止 ${rel}：远端文件在同步期间发生变化（${guards.expectedRemoteSize} → ${cl} 字节）`)
+      const e: any = new Error(`「${rel}」未下载：下载期间云端文件被修改了，下次同步重试`)
+      e.detail = `${guards.expectedRemoteSize} → ${cl} 字节`
+      throw e
     }
     // LOCAL_TARGET_CHANGED?：下载期间目标被用户修改 → 不 rename、不覆盖
     const after = await statOrNull(abs)
     if ((before == null) !== (after == null) || (before && after && (before.size !== after.size || Math.abs(before.mtimeMs - after.mtimeMs) > 1000))) {
-      throw new Error(`下载中止 ${rel}：本地文件在下载期间被修改，已保留当前版本`)
+      throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
     }
     await fsp.rename(tmp, abs)
     // rename 落地后 fsync 目标目录（POSIX）——让新目录项掉电级落盘；
@@ -3148,14 +3184,18 @@ async function deleteLocalOne(dir: DirCfg, rel: string, origName?: string): Prom
   } catch (e: any) {
     const msg = (e && e.message) || e
     if (msg === HOST_TRASH_MISSING_MESSAGE) {
-      throw new Error(`删除本地文件失败 ${rel}：宿主未提供回收站接口（ztools.shellTrashItem），已跳过（文件保留，基线条目保留）`)
+      throw new Error(`无法删除电脑上的「${rel}」：当前 ZTools 版本不支持放入回收站，文件已保留`)
     }
-    throw new Error(`删除本地文件失败 ${rel}：${msg}（已跳过，文件保留，基线条目保留）`)
+    const err: any = new Error(`无法删除「${rel}」：未能放入回收站，文件已保留`)
+    err.detail = msg
+    throw err
   }
   // 防御：trashItem 成功返回但文件仍在（异常宿主实现）按失败处理，
   // 绝不出现 summary.deleted++ 但文件还在的状态
   if (await statOrNull(abs)) {
-    throw new Error(`删除本地文件失败 ${rel}：移入回收站后文件仍存在（已跳过，基线条目保留）`)
+    const err2: any = new Error(`无法删除「${rel}」：未能放入回收站，文件已保留`)
+    err2.detail = '移入回收站后文件仍存在'
+    throw err2
   }
 }
 
@@ -3263,7 +3303,7 @@ async function recoverIntents(store: any, cfg: EngineCfg, dir: DirCfg, localByNf
     const r = rEntry && !rEntry.isDir ? rEntry : null
     const settle = (adopted: any, warning: any) =>
       (adopted ? store.appendWalDone(it.id) : store.appendWalAbort(it.id)).catch(() => {}).then(() => {
-        if (warning) pushWarning(warning)
+        if (warning) logNote(warning)
       })
     // 兜底一：开放意图超龄 —— 按意图链最初写入时刻（firstAt，由新意图继承；
     // 缺失回退 at —— 注入 / download 类意图）计算，持续中断链不会因每轮「新者取代旧者」
@@ -3321,13 +3361,13 @@ async function recoverIntents(store: any, cfg: EngineCfg, dir: DirCfg, localByNf
       if (r && remoteDiffers && r.size >= 0 && r.size < lp.size && lp.size > 0) {
         if (r.size > vMax) {
           // 超上限：无法安全判定 → 保持开放 + 冲突弹窗提示（经 onConflict info.hint）
-          pushWarning(`无法自动判断 ${it.rel}：远端疑似上次中断上传的残缺文件但超过内容校验上限（${r.size} 字节），按冲突处理`)
+          pushWarning(`「${it.rel}」在云端可能是上次没传完的不完整文件，但文件太大无法自动对比，请你选择保留哪一个`)
           continue
         }
         const verdict = await remoteIsLocalPrefix(cfg, dir, rel, l.abs, r.size)
         if (verdict === 'match') {
           // 同 rel 多个开放意图（历史残留 / 崩溃窗口）只提示一次，forceUploads 天然去重
-          if (!forceUploads.has(rel)) pushWarning(`检测到 ${it.rel} 远端是上次中断上传留下的半截文件：本轮自动重新上传`)
+          if (!forceUploads.has(rel)) pushWarning(`「${it.rel}」在云端是上次没传完的不完整文件，已自动重新上传`)
           forceUploads.add(rel)
           continue // 意图保持开放：强制重传的新意图将以「新者取代旧者」了结它
         }
@@ -3377,7 +3417,7 @@ async function recoverIntents(store: any, cfg: EngineCfg, dir: DirCfg, localByNf
   //（同尺寸对端替换可能被静默采纳的窄洞与 GET 失败回退同源，见 README 已知边界）
   if (adoptBudgetSkipped.length > 0) {
     const fmtMB = (n: any) => `${(n / (1024 * 1024)).toFixed(1)}MB`
-    pushWarning(
+    logNote(
       `崩溃恢复：${adoptBudgetSkipped.length} 个文件的采纳内容确认超出本轮预算（${fmtMB(adoptBudgetBytes)}），已按大小采纳（窄洞见 README 已知边界）`
     )
   }
@@ -3509,7 +3549,7 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
       bytesDown: 0,
       totalFiles: 0,
       tier: 'B',
-      warnings: ['该目录已有同步在进行，本轮跳过'],
+      warnings: ['这个文件夹正在同步中，本次跳过'],
       errors: [],
       errorsDropped: 0,
       /** 该目录已有同进程轮次在进行：本轮立即让位（非错误） */
@@ -3653,6 +3693,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   const pushWarning = (w: any) => {
     if (summary.warnings.length < 200) summary.warnings.push(w)
   }
+  // 内部提示经模块级 logNote 写日志（见其定义处）
   /**
    * 网络类 / 非网络类错误的**增量累计计数**（与 pushError 同步维护）。
    * 旧实现按 summary.errors（展示截断到 200 条）+ 等长标记数组归纳 failureClass，
@@ -3676,7 +3717,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   // 清理上一轮崩溃残留的临时文件，再进入扫描 —— 避免清理与扫描器竞态
   await cleanupOrphanTemps(dir.localPath)
   const store = await storage.openDirStore({ localPath: dir.localPath, remotePath: dir.remotePath })
-  if (!store.loadedOk) pushWarning('基线快照损坏：本轮按无基线保护模式执行（禁用删除传播）')
+  if (!store.loadedOk) logNote('基线快照损坏：本轮按无基线保护模式执行（禁用删除传播）')
   // etag 跳过缓存：被跳过的子树要按基线合成远端条目，快照损坏
   //（loadedOk=false）时没有可信基线可合成 → 禁用跳过，强制全量列举
   const scanCache = store.loadedOk ? store.getScanCache() : null
@@ -3728,7 +3769,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   if (rootProbe.status === 404) await mkdirDeep(cfg, dir.remotePath)
   else if (rootProbe.status >= 400) {
     const st = rootProbe.status
-    throw syncFail(`访问远端目录失败：HTTP ${st}`, { phase: 'scan', failureClass: st === 429 || st === 423 || st >= 500 ? 'network' : 'other' })
+    throw syncFail(`无法访问云端文件夹（HTTP ${st}）`, { phase: 'scan', failureClass: st === 429 || st === 423 || st >= 500 ? 'network' : 'other' })
   }
   /**
    * 远端根 404 后被重建（本轮探测到 404 并 MKCOL）且本地基线非空：
@@ -3743,7 +3784,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   const rootWasRebuilt = rootProbe.status === 404 && store.entries.size > 0
   if (rootWasRebuilt) {
     if (!store.meta.rootRebuilt) store.meta.rootRebuilt = { at: Date.now() }
-    pushWarning(`远端根目录曾不存在（已重建）：本轮起禁用删除传播，本地文件将重新上传，直至远端恢复一致`)
+    pushWarning(`云端的同步文件夹之前丢失了，已重新创建。为防止误删，暂时不会同步「删除」操作，电脑上的文件会重新上传，恢复后自动正常`)
   }
 
   /**
@@ -3883,7 +3924,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //    取消销毁了扫描期的在途 PROPFIND 时按取消语义收场 ——「扫描未完成」
     //    的误导性报错只留给真实的扫描故障。
     if (!localScan.complete || !remoteScan.complete) {
-      if (shouldAbort()) throw syncFail('同步已中止：用户取消', { phase: 'scan' })
+      if (shouldAbort()) throw syncFail('已取消同步', { phase: 'scan' })
       const scanProblems = [
         ...localScan.errors.map((e: any) => `本地 ${e.rel}: ${e.message}`),
         ...remoteScan.errors.map((e: any) => `远端 ${e.rel}: ${e.message}`),
@@ -3891,7 +3932,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       // 扫描失败的 failureClass（远端扫描失败属 network —— 服务器 /
       // 网络不可用，调度层据此退避）；仅本地扫描不完整归 other；双侧都不完整归 mixed
       const scanClass = !remoteScan.complete && !localScan.complete ? 'mixed' : !remoteScan.complete ? 'network' : 'other'
-      throw syncFail(`扫描未完成，本轮已中止以避免误判删除（${scanProblems[0]}）`, { phase: 'scan', errors: scanProblems, failureClass: scanClass })
+      const scanErr = syncFail('没能完整读取文件列表，本次同步已停止，避免误删文件', { phase: 'scan', errors: scanProblems, failureClass: scanClass })
+      scanErr.detail = scanProblems[0]
+      throw scanErr
     }
 
     // 3.2 远端探测残留清理（崩溃残留双通道之二，与 runCapabilityProbe 启动清理互补）：
@@ -3910,7 +3953,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         const base = String(dir.remotePath).replace(/\/+$/, '')
         const settled = await Promise.allSettled(stale.map((e: any) => davRequest(cfg, 'DELETE', joinRemote(base, e.rel))))
         const failedCnt = settled.filter((r) => r.status === 'rejected' || !r.value || r.value.status >= 400).length
-        if (failedCnt) pushWarning(`清理远端探测残留失败 ${failedCnt}/${stale.length} 个（不影响本轮同步，下轮重试）`)
+        if (failedCnt) logNote(`清理远端探测残留失败 ${failedCnt}/${stale.length} 个（不影响本轮同步，下轮重试）`)
       }
     }
 
@@ -3963,7 +4006,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       collections: mergedCollections,
     }
     await store.saveScanCache(newScanCache).catch((e: any) =>
-      pushWarning(`etag 跳过缓存写入失败（${(e && e.message) || e}）：下一轮将全量列举`)
+      logNote(`etag 跳过缓存写入失败（${(e && e.message) || e}）：下一轮将全量列举`)
     )
     /**
      * etag 跳过的运行时异常防线（第二层防御）：被跳过子树内的文件出现「远端实际
@@ -3986,9 +4029,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     summary.tier = caps.tier
     if (caps.tier === 'B') {
       // 每轮至多一条，不随文件数刷屏
-      pushWarning('该服务器无法完全保证多设备并发安全（无条件请求能力或 etag 不可用）：覆盖/删除远端前将逐文件复查，复查与传输之间的小窗口内对端修改可能被覆盖')
+      pushWarning('这个服务器无法保证多台设备同时修改时的安全。覆盖或删除云端文件前会先确认，但仍有极小概率覆盖其他设备刚做的修改')
     } else if (caps.tier === 'C') {
-      pushWarning(`服务器拒绝写入${caps.writeReason ? `（${caps.writeReason}）` : ''}：本轮按只读模式运行，仅执行下载`)
+      pushWarning(`服务器不允许上传，本次只会下载文件${caps.writeReason ? `（${caps.writeReason}）` : ''}`)
     }
     // 指纹噪声存储（origin+username 粒度、跨目录共享），异常时降级为空实现
     const serverNoise = await openServerNoiseSafe(cfg)
@@ -4023,11 +4066,11 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     const caseCollisions = detectCaseCollisions(localByNfc.keys(), remoteFileKeys)
     const caseSkip = caseCollisions.skip
     caseCollisions.groups.slice(0, 5).forEach((g: any) => {
-      const sideText = g.side === 'local' ? '本地' : g.side === 'remote' ? '远端' : '本地与远端各有一个'
-      pushError(`大小写冲突：${sideText}同时存在 ${g.rels.join(' 与 ')}（仅大小写不同，在 Windows / macOS 与部分服务器上是同一个文件）：涉及文件本轮不同步，请重命名其中一个`, false)
+      const sideText = g.side === 'local' ? '电脑上' : g.side === 'remote' ? '云端' : '电脑和云端'
+      pushError(`${sideText}同时有 ${g.rels.join(' 和 ')} 两个文件，只有大小写不同，在 Windows 和 macOS 上会被当成同一个文件，已跳过，请改名其中一个`, false)
     })
     if (caseCollisions.groups.length > 5) {
-      pushError(`另有 ${caseCollisions.groups.length - 5} 组大小写冲突未逐条列出（涉及文件同样已跳过），请检查目录`, false)
+      pushError(`另有 ${caseCollisions.groups.length - 5} 组这样的文件未逐条列出（同样已跳过），请检查文件夹`, false)
     }
 
     const localTol = await localFpTolMs(dir.localPath)
@@ -4296,7 +4339,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       // 撞上本机自己的半截必然 412 / REMOTE_CHANGED 且丢失半截标记；下一轮恢复期的
       // 前缀校验才能安全区分「自己的半截」与「对端修改」。按普通错误上报（含说明）
       if (cls === 'transient' && e && e.__openIntent && !isRetry) {
-        pushError(`${e.message}（该文件本轮不再重试：服务器可能已收到部分内容，下一轮将自动判定）`, networkFailure(e))
+        pushError(`${e.message}（这个文件本次不再重试，下次同步会自动检查）`, networkFailure(e))
         return
       }
       if (cls === 'transient' && !isRetry && job) {
@@ -4305,7 +4348,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       }
       if (cls === 'permanent' && e && e.__rel) {
         const recorded = store.noteFailure(e.__rel, { code: e.code || (e.status ? `HTTP ${e.status}` : ''), message: e.message || '' })
-        if (!recorded) pushWarning(`失败退避记录已满：${e.__rel} 的持续失败未记录，本轮后仍会每轮重试`)
+        if (!recorded) logNote(`失败退避记录已满：${e.__rel} 的持续失败未记录，本轮后仍会每轮重试`)
       }
       pushError(e && e.message ? e.message : String(e), networkFailure(e))
     }
@@ -4332,7 +4375,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         createdAt: Date.now(),
         ...(choice ? { choice } : {}),
       })
-      if (!ok) pushWarning(`冲突挂起记录已满：${it.rel} 的冲突决策未持久化（本轮仍按该决策执行）`)
+      if (!ok) logNote(`冲突挂起记录已满：${it.rel} 的冲突决策未持久化（本轮仍按该决策执行）`)
     }
     const resolveChoiceInner = async (it: any) => {
       // etag 跳过运行时防线（见 noteEtagSkipAnomaly）：进入冲突判定本身通常意味着
@@ -4383,7 +4426,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           }
           // 无法识别的选择：按「未解决」登记挂起（无 choice），照旧抛错 —— 供后续统一处理
           registerPendingChoice(it, null)
-          throw new Error(`冲突未解决 ${it.rel}：无法识别的选择`)
+          throw new Error(`「${it.rel}」的冲突还没处理，电脑和云端的文件都保持原样`)
         }
         // 'defer' = 冲突挂起（典型：后台轮渲染层不可见，
         // 调度器不等一个看不见的弹窗）。走现有「无 choice 挂起」登记通道（与 ask 无回调
@@ -4398,12 +4441,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           return res
         }
         registerPendingChoice(it, null)
-        throw new Error(`冲突未解决 ${it.rel}：本轮不记录该文件状态，两侧保持原状`)
+        throw new Error(`「${it.rel}」的冲突还没处理，电脑和云端的文件都保持原样`)
       }
       if (choice === 'ask') {
         // ask 且无回调：同样按「未解决」登记挂起后抛错（挂起记录供 UI / setPendingChoice 后续处理）
         registerPendingChoice(it, null)
-        throw new Error(`冲突未解决 ${it.rel}：无冲突处理回调，本轮不记录该文件状态`)
+        throw new Error(`「${it.rel}」的冲突还没处理，电脑和云端的文件都保持原样`)
       }
       return choice
     }
@@ -4608,14 +4651,14 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               // 噪声按 origin+username 粒度累计：同一服务器（同账号）下跨目录共享
               if (serverNoise.noteFingerprintNoise(it.rel)) {
                 noiseDirty = true
-                pushWarning('检测到服务器指纹不稳定（指纹变化但内容相同）：后续此类变化将直接做内容比对')
+                logNote('检测到服务器指纹不稳定（指纹变化但内容相同）：后续此类变化将直接做内容比对')
               }
             } else if (serverNoise.resetFingerprintNoise(it.rel)) {
               // 远端发生真实内容变化：移出噪声集合（返回 true = 确实移除，需要落盘）
               noiseDirty = true
             }
           } else {
-            pushWarning(`无法完成远端内容校验 ${it.rel}：按「远端已变化」处理`)
+            logNote(`无法完成远端内容校验 ${it.rel}：按「远端已变化」处理`)
           }
         }
 
@@ -4650,7 +4693,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             newBoth = 'conflict'
           }
         } else {
-          pushWarning(`无基线且超过内容校验上限（${it.rel}，${l.size} 字节）：按冲突处理，需用户决策`)
+          pushWarning(`「${it.rel}」文件太大，无法自动对比两边是否一致，请你选择保留哪一个`)
           newBoth = 'conflict'
         }
         flags.newBoth = newBoth
@@ -4685,7 +4728,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
 
       // 无基线保护兜底：基线不可信的轮次绝不执行删除
       if ((act === 'delete-local' || act === 'delete-remote') && !store.loadedOk) {
-        pushWarning(`基线不可信，跳过删除动作 ${it.rel}`)
+        pushWarning(`出于安全考虑，跳过了「${it.rel}」的删除`)
         continue
       }
       // 两侧均已不存在：丢弃基线条目（旧引擎靠整表重建天然丢弃，基线方案需显式删除）；
@@ -4769,7 +4812,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             return undefined
           }
           if (choice === 'local') {
-            if (!it.l) throw new Error(`冲突解决为“保留本地”但本地文件缺失 ${it.rel}`)
+            if (!it.l) throw new Error(`你选择了保留电脑版本，但电脑上的「${it.rel}」已经不在了`)
             uploadPending = await runUploadOp(it, r && r.origName, async (uh: any) => {
               const up = await uploadOne(cfg, dir, it.rel, it.l, createdDirs, uploadGuards(r), { onBeforePut: uh.onBeforePut })
               await crashHook({ rel: it.rel, act: 'conflict-local' })
@@ -4777,7 +4820,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               return up
             }, true)
           } else if (choice === 'remote') {
-            if (!it.r || it.r.isDir) throw new Error(`冲突解决为“保留云端”但远端文件缺失 ${it.rel}`)
+            if (!it.r || it.r.isDir) throw new Error(`你选择了保留云端版本，但云端的「${it.rel}」已经不在了`)
             await runOp(it, 'download', async (commitSet: any) => {
               const dl = await downloadOne(cfg, dir, it.rel, tmpDir, null, {
                 expectedLocal: it.l || null,
@@ -4793,7 +4836,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             }, { conflict: true })
           } else {
             // 同时保留：云端版本另存为 <name>.conflict.<ext>，本地版本原样上传覆盖云端
-            if (!it.l || !it.r) throw new Error(`冲突解决为“两者保留”但缺少一侧文件 ${it.rel}`)
+            if (!it.l || !it.r) throw new Error(`你选择了两个都留，但「${it.rel}」有一侧已经不在了`)
             const segs = it.rel.split('/')
             const fileName = segs[segs.length - 1]
             const dot = fileName.lastIndexOf('.')
@@ -4850,7 +4893,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         remote: { size: it.r ? it.r.size : 0, mtimeMs: it.r ? it.r.mtimeMs : 0, etag: it.r ? it.r.etag || '' : '' },
         createdAt: Date.now(),
       })
-      if (!ok) pushWarning(`删除确认记录已满：${it.rel} 的挂起未持久化（本轮仍不删除，下一轮将重新登记）`)
+      if (!ok) logNote(`删除确认记录已满：${it.rel} 的挂起未持久化（本轮仍不删除，下一轮将重新登记）`)
     }
     const pushDeleteTransfer = (entry: any) => {
       const it = entry.it
@@ -4882,7 +4925,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               const res = await davRequest(cfg, 'DELETE', joinRemote(dir.remotePath, it.rel), dg.ifMatch ? { headers: { 'If-Match': dg.ifMatch } } : {})
               // 404 视为成功：远端目标状态（文件不存在）已达成
               if (res.status === 412) {
-                const err: any = new Error(`删除远端跳过 ${it.rel}：文件已被其他设备修改（HTTP 412，If-Match 不匹配），本轮不删除`)
+                const err: any = new Error(`「${it.rel}」未从云端删除：它刚被其他设备修改过`)
+                err.detail = 'HTTP 412（If-Match 不匹配）'
                 err.code = 'PRECONDITION'
                 err.status = 412
                 err.permanent = true
@@ -4890,7 +4934,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               }
               if (!(res.status === 200 || res.status === 204 || res.status === 404)) {
                 // 附带 status 与分类 code：classifyOpFailure 据此判定永久 / 瞬时失败
-                const err: any = new Error(`删除远端失败 ${it.rel}：HTTP ${res.status}`)
+                const err: any = new Error(`无法从云端删除「${it.rel}」（HTTP ${res.status}）`)
                 err.status = res.status
                 err.code = (res.classification && res.classification.code) || 'HTTP'
                 throw err
@@ -4942,8 +4986,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       }
       deleteThresholdTripped = true
       pushWarning(
-        `单轮待删 ${freshDeletes.length} 个文件，超过安全阈值 ${deleteThreshold}（max(50, 基线 ${store.entries.size} × 20%)）：` +
-          `本轮未删除任何文件，已全部转入待处理面板，请确认后下一轮执行`
+        `这次要删除的文件有 ${freshDeletes.length} 个，数量偏多，为防止误删，没有删除任何文件。请在「待处理」里确认，确认后下次同步才会执行`
       )
     } else {
       for (const entry of freshDeletes) pushDeleteTransfer(entry)
@@ -4981,7 +5024,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     if (hasRemoteWrite && !aborted && !shouldAbort() && prefs.leaseLock !== false) {
       const deviceId = await storage.getDeviceId()
       const acq = await acquireLeaseLock(cfg, lockPath, deviceId)
-      if (acq.warn) pushWarning(acq.warn)
+      if (acq.warn) logNote(acq.warn)
       if (acq.outcome === 'yield') {
         // 让出：本轮不做任何传输（含已规划的下载），按零计数成功返回 —— 这不是错误，
         // 调度层的下一轮自然重试；对端轮次结束后锁被释放或按 TTL 过期。totalFiles 归零
@@ -4990,7 +5033,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         summary.yielded = true
         summary.totalFiles = 0
         summary.planned = transferMeta.length
-        pushWarning('另一设备正在同步（租约锁被占用），本轮让出')
+        pushWarning('另一台设备正在同步这个文件夹，本次先等一等')
         await persistPlannedLocalState()
         finalizeSummaryMeta() // 让出轮同样补齐机器可读字段（openIntents 对 follow-up 有意义）
         return summary
@@ -5011,13 +5054,13 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             (r) => {
               if (r.status >= 400 && !renewWarned) {
                 renewWarned = true
-                pushWarning(`租约锁续租失败（HTTP ${r.status}）：锁可能提前过期，他机的让出保护将随之减弱`)
+                logNote(`租约锁续租失败（HTTP ${r.status}）：锁可能提前过期，他机的让出保护将随之减弱`)
               }
             },
             (e) => {
               if (!renewWarned) {
                 renewWarned = true
-                pushWarning(`租约锁续租失败（${(e && e.message) || e}）：锁可能提前过期，他机的让出保护将随之减弱`)
+                logNote(`租约锁续租失败（${(e && e.message) || e}）：锁可能提前过期，他机的让出保护将随之减弱`)
               }
             }
           )
@@ -5095,7 +5138,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           // 的主因是网络 / 5xx，解析失败也随列举通道归入 network（调度层退避口径）
           for (const rel of rels) {
             dropTransferByRel(rel)
-            pushError(`上传跳过 ${rel}：写前查重失败（${groupErr}），本轮不上传，下一轮重试`, true)
+            pushError(`「${rel}」暂未处理：无法确认云端文件的最新状态，下次同步重试`, true)
           }
           continue
         }
@@ -5109,7 +5152,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             // etag 跳过运行时防线（见 noteEtagSkipAnomaly）：写前查重发现远端出现了
             // 扫描期不存在的同名文件 —— 被跳过子树内即「远端实际状态 ≠ 合成（基线）状态」
             noteEtagSkipAnomaly(rel, '写前查重发现远端新文件')
-            pushError(`跳过 ${rel}：写前查重发现远端已出现同名文件，本轮不覆盖，下一轮将重新规划`, false)
+            pushError(`「${rel}」暂未上传：云端的文件刚被其他设备修改，为避免覆盖，下次同步会重新判断`, false)
           }
         }
       }
@@ -5212,7 +5255,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           // adopt）或按正常规划重传（远端确实没有该文件时）。网络类标记同写前查重口径
           for (const p of pend) {
             await store.appendWalAbort(p.intentId).catch(() => {})
-            pushError(`上传批量校验失败 ${p.rel}：无法列举远端目录（${groupErr}）`, true)
+            pushError(`「${p.rel}」上传后核对失败，下次同步会重试`, true)
           }
           continue
         }
@@ -5223,12 +5266,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           const item = childMap.get(key)
           if (!item || item.isDir) {
             await store.appendWalAbort(p.intentId).catch(() => {})
-            pushError(`上传批量校验失败 ${p.rel}：远端未见该文件`, false)
+            pushError(`「${p.rel}」上传后核对失败，下次同步会重试`, false)
             continue
           }
           if (item.size !== p.local.size) {
             await store.appendWalAbort(p.intentId).catch(() => {})
-            pushError(`上传批量校验失败 ${p.rel}：远端大小 ${item.size} 与实际上传的 ${p.local.size} 不一致`, false)
+            pushError(`「${p.rel}」上传后核对失败，下次同步会重试`, false)
             continue
           }
           // 提交点：基线（远端指纹取自本次批量 PROPFIND，etag 口径与下一轮扫描一致）→ done →
@@ -5243,7 +5286,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           } catch (e: any) {
             // 基线写入失败（setEntry 抛出语义）：按文件级失败处理，abort 后报错
             await store.appendWalAbort(p.intentId).catch(() => {})
-            pushError(`上传批量校验失败 ${p.rel}：基线写入失败（${(e && e.message) || e}）`, false)
+            pushError(`「${p.rel}」上传后核对失败，下次同步会重试`, false)
             continue
           }
           store.clearFailure(p.rel)
@@ -5269,10 +5312,10 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     if (store.meta.rootRebuilt && !rootWasRebuilt) {
       if (summary.deleteRootGuard > 0) {
         pushWarning(
-          `远端根重建保护生效中：${summary.deleteRootGuard} 个文件的删除被改判为重新上传（远端缺失源于根目录消失，不是逐文件删除；上传完成后自动恢复删除传播）`
+          `云端文件夹之前丢失过，已把 ${summary.deleteRootGuard} 个原本会被当作「已删除」的文件改为重新上传，传完后恢复正常`
         )
       } else {
-        pushWarning('远端根重建保护仍在生效：本轮存在失败或未完成的传输，删除传播继续暂缓')
+        pushWarning('云端文件夹之前丢失过，还有文件没传完，暂时不会同步「删除」操作，传完后恢复正常')
       }
     }
 
@@ -5382,7 +5425,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 网络类标记恒真：熔断只在网络类连续失败时打开（计数口径与 networkFailure 一致）
     if (roundBreaker.open) {
       pushError(
-        `连续失败达到 ${ROUND_BREAKER_THRESHOLD} 次，本轮提前终止（${roundBreaker.reason}），剩余 ${Math.max(0, transfers.length - filesDone)} 个文件将在下一轮重试`,
+        `服务器连续多次出错，本次同步已暂停，剩余文件会在下次同步时继续`,
         true
       )
     }
@@ -5407,11 +5450,11 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 的运行时防线 —— 探测是 7 天前的快照，服务器行为可能已变；异常把界内滞后
     // 收敛到一轮。放在错误抛出之前：带错轮次同样要收口（异常轮最需要下一轮核对）。
     if (etagSkipAnomaly) {
-      pushWarning(`etag 跳过的子树内出现与基线不一致的远端状态（${etagSkipAnomaly}）：下一轮将强制全量扫描核对`)
+      logNote(`etag 跳过的子树内出现与基线不一致的远端状态（${etagSkipAnomaly}）：下一轮将强制全量扫描核对`)
       await store.saveScanCache({ ...newScanCache, lastFullScanAt: 0 }).catch(() => {})
     }
     // C 档跳过汇总（每轮一条，不随文件数刷屏；信息明确到动作计数）
-    if (roSkipped > 0) pushWarning(`服务器只读（C 档）：本轮跳过 ${roSkipped} 个上传/删除/冲突动作（本地文件未删除，数据不丢）`)
+    if (roSkipped > 0) pushWarning(`服务器只能下载，本次跳过了 ${roSkipped} 个上传/删除操作，电脑上的文件都还在`)
     // 持续失败退避汇总（每轮一条）：最多列 3 个示例（文件名 + 失败原因 + 下次重试时间），
     // 其余以「等」带过 —— 不随文件数刷屏，用户能看到是哪些文件、为什么被跳过、何时自动恢复
     if (permSkipped.length > 0) {
@@ -5424,34 +5467,34 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         .slice(0, 3)
         .map(({ rel, fr }) => `${rel}：${String(fr.message || fr.code || '').slice(0, 80)}（下次重试 ${fmtRetry(fr.retryAtMs)}）`)
         .join('；')
-      pushWarning(`跳过 ${permSkipped.length} 个持续失败文件（${examples}${permSkipped.length > 3 ? ' 等' : ''}），到点将自动重试`)
+      pushWarning(`有 ${permSkipped.length} 个文件一直同步失败（${examples}${permSkipped.length > 3 ? ' 等' : ''}），已暂时跳过，稍后会自动重试`)
     }
     // 冲突挂起延续汇总（每轮一条）：本轮按上次的选择自动解决、未再次
     // 询问的冲突清单（最多列 3 个示例）—— 让用户感知决策被沿用；解决失败的仍留在
     // 挂起表里（choice 保留），下一轮继续沿用
     if (pendingResolved.length > 0) {
-      const fmtChoice = (c: any) => (c === 'local' ? '保留本地' : c === 'remote' ? '保留云端' : '两者保留')
+      const fmtChoice = (c: any) => (c === 'local' ? '保留电脑版本' : c === 'remote' ? '保留云端版本' : '两个都留')
       const pendExamples = pendingResolved.slice(0, 3).map(({ rel, choice }) => `${rel} → ${fmtChoice(choice)}`).join('；')
-      pushWarning(`沿用上次冲突处理策略解决了 ${pendingResolved.length} 个冲突（${pendExamples}${pendingResolved.length > 3 ? ' 等' : ''}），未再次询问`)
+      pushWarning(`按你上次的选择自动处理了 ${pendingResolved.length} 个冲突（${pendExamples}${pendingResolved.length > 3 ? ' 等' : ''}），没有再询问你`)
     }
     // 删除安全汇总（每轮一条）：批量删除超阈值时闸内已推送详细 warning，这里补
     // 跨轮存量挂起与「保留 / 根重建保护」的可见性 —— 待处理面板逐条 / 批量确认
     if (summary.deleteHeld > 0 && !deleteThresholdTripped) {
-      pushWarning(`本轮有 ${summary.deleteHeld} 个删除等待确认（待处理面板），确认前不会删除任何文件`)
+      pushWarning(`有 ${summary.deleteHeld} 项删除在等你确认，确认前不会删除任何文件`)
     }
     if (summary.deleteKept > 0) {
-      pushWarning(`${summary.deleteKept} 个文件的删除按用户先前的「保留」选择被跳过（文件两侧均保留）`)
+      pushWarning(`按你之前选的「不删除」，${summary.deleteKept} 个文件没有被删（两边都保留）`)
     }
     // 空目录清理汇总（有清理动作才提示）
     if (summary.dirsPrunedLocal > 0 || summary.dirsPrunedRemote > 0) {
-      pushWarning(`清理了因同步删除而变空的目录：本地 ${summary.dirsPrunedLocal} 个、远端 ${summary.dirsPrunedRemote} 个`)
+      pushWarning(`清理了因同步而变空的文件夹：电脑 ${summary.dirsPrunedLocal} 个、云端 ${summary.dirsPrunedRemote} 个`)
     }
 
     // 9. 文件级失败 / 中止 → 以错误状态上报（已成功文件的基线保留，summary 附带）。
     //    抛错 / 正常返回前统一补齐 failureClass / openIntents / breaker。
     finalizeSummaryMeta()
     if (summary.errors.length || aborted) {
-      const err: any = new Error(summary.errors[0] || '同步已中止')
+      const err: any = new Error(summary.errors[0] || (aborted ? '已取消同步' : '同步意外停止，请稍后重试'))
       err.phase = 'execute'
       err.summary = summary
       err.errors = summary.errors
@@ -5486,12 +5529,21 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           if (r.status >= 400 && r.status !== 404) throw new Error(`HTTP ${r.status}`)
         } catch (e: any) {
           // 404 = 目标状态已达成（无锁可删），其余失败记左锁标记：下一轮开头优先补删
-          pushWarning(`租约锁释放失败（${(e && e.message) || e}）：将在下一轮开头重试清理`)
+          logNote(`租约锁释放失败（${(e && e.message) || e}）：将在下一轮开头重试清理`)
           store.meta.lockLeftover = { at: Date.now() }
           await store.saveMeta().catch(() => {})
         }
       }
     }
+  }
+}
+
+/** 仅写日志的内部提示：内部机制类信息不进 summary.warnings / 不弹 toast（不打扰用户），排障时在控制台可见 */
+function logNote(m: unknown): void {
+  try {
+    console.info('[webdav-sync]', typeof m === 'string' ? m : String(m))
+  } catch (_) {
+    /* 忽略 */
   }
 }
 
@@ -5535,8 +5587,8 @@ const services = {
           }
           return { ok: true, latencyMs, tier: capabilities ? capabilities.tier : null, capabilities }
         }
-        if (r.status === 401) return { ok: false, error: '认证失败：请检查用户名或密码', latencyMs }
-        return { ok: false, error: `服务器返回 HTTP ${r.status}`, latencyMs }
+        if (r.status === 401) return { ok: false, error: '用户名或密码不正确（坚果云请使用「应用密码」）', latencyMs }
+        return { ok: false, error: `服务器返回了错误（HTTP ${r.status}）`, latencyMs }
       } catch (e: any) {
         return { ok: false, error: e && e.message ? e.message : String(e) }
       }
@@ -5588,7 +5640,7 @@ const services = {
     pickDirectory(title: any) {
       try {
         const picked = window.ztools.showOpenDialog({
-          title: title || '选择要同步的本地目录',
+          title: title || '选择要同步的文件夹',
           properties: ['openDirectory'],
         })
         return Array.isArray(picked) && picked.length > 0 ? picked[0] : null

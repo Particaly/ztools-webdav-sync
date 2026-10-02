@@ -64,21 +64,21 @@ function normalizeRemote(p: string): string {
   return t.startsWith('/') ? t : '/' + t
 }
 
-// ---------- 档位文案（A 强保证 / B 尽力 / C 只读） ----------
+// ---------- 档位文案（A 运行良好 / B 基本可用 / C 仅下载） ----------
 
-/** 档位短标签（主界面卡片 / 设置页展示） */
+/** 档位短标签（主界面卡片 / 设置页展示）：面向用户的说法，不出现内部档位字母 */
 export function tierLabel(t?: DavTier | null): string {
-  if (t === 'A') return 'A 档 · 强并发保证'
-  if (t === 'B') return 'B 档 · 尽力保护'
-  if (t === 'C') return 'C 档 · 只读'
-  return '未探测'
+  if (t === 'A') return '运行良好'
+  if (t === 'B') return '基本可用'
+  if (t === 'C') return '仅下载'
+  return '尚未检测'
 }
 
 /** 档位提示文案（B 档的并发安全边界与 C 档的只读说明） */
 export function tierHint(t?: DavTier | null): string {
-  if (t === 'A') return '条件请求与强 etag 可用，多设备并发修改可被服务端拦截'
-  if (t === 'B') return '该服务器无法完全保证多设备并发安全：覆盖 / 删除前会逐文件复查'
-  if (t === 'C') return '服务器拒绝写入，仅下载；上传与删除已跳过'
+  if (t === 'A') return '这个服务器支持多台设备安全地同时同步'
+  if (t === 'B') return '多台设备同时修改同一个文件时，可能互相覆盖。覆盖或删除前会先逐个确认，建议尽量错开使用'
+  if (t === 'C') return '服务器不允许上传或删除，目前只会下载云端文件'
   return ''
 }
 
@@ -136,11 +136,12 @@ function capList<T>(items: T[] | null | undefined, renderDropped: (n: number) =>
 function sanitizeDirForPersist(d: SyncDir): SyncDir {
   const out: SyncDir = { ...d, progress: null, pendingConflicts: null, status: (d.status === 'syncing' ? 'idle' : d.status) as DirStatus }
   out.errorMessage = d.errorMessage != null ? capStr(d.errorMessage) : null
+  out.errorDetail = d.errorDetail != null ? capStr(d.errorDetail) : null
   if (d.lastResult) {
     out.lastResult = {
       ...d.lastResult,
-      errors: capList(d.lastResult.errors, (n) => `（其余 ${n} 条错误已省略）`),
-      warnings: capList(d.lastResult.warnings, (n) => `（其余 ${n} 条提示已省略）`),
+      errors: capList(d.lastResult.errors, (n) => `（另有 ${n} 条错误未显示）`),
+      warnings: capList(d.lastResult.warnings, (n) => `（另有 ${n} 条提示未显示）`),
     }
   }
   return out
@@ -249,7 +250,7 @@ async function testConnection(opts?: { notify?: boolean }): Promise<TestResult> 
 
   // 未填地址：直接提示，不打扰后端
   if (!state.server.serverUrl.trim()) {
-    if (notify) toast.warning('请先填写服务器地址', '填写 WebDAV 地址后再测试连接')
+    if (notify) toast.warning('请先填写服务器地址', '填写服务器地址后才能测试连接')
     return { ok: false, error: '未填写服务器地址' }
   }
 
@@ -278,8 +279,8 @@ async function testConnection(opts?: { notify?: boolean }): Promise<TestResult> 
   if (result.capabilities) state.capabilities = result.capabilities
 
   if (notify) {
-    if (result.ok) toast.success('连接成功', `服务器响应 ${result.latencyMs ?? 0} ms`)
-    else toast.error('连接失败', result.error || '无法连接服务器，请检查地址与凭据')
+    if (result.ok) toast.success('连接成功', `服务器响应 ${result.latencyMs ?? 0} 毫秒`)
+    else toast.error('连接失败', result.error || '连不上服务器，请检查地址、用户名和密码')
   }
   return result
 }
@@ -291,23 +292,20 @@ async function testConnection(opts?: { notify?: boolean }): Promise<TestResult> 
  */
 async function reprobe(): Promise<void> {
   if (!state.server.serverUrl.trim()) {
-    toast.warning('请先填写服务器地址', '填写 WebDAV 地址后再探测服务器能力')
+    toast.warning('请先填写服务器地址', '填写服务器地址后才能检测服务器')
     return
   }
   if (!window.services) {
-    toast.warning('当前环境不可用', '浏览器预览模式无 preload 能力')
+    toast.warning('当前环境不可用', '浏览器预览模式没有连接服务器的能力')
     return
   }
   state.probing = true
   try {
     const caps = await window.services.dav.probeCapabilities({ ...state.server }, true)
     state.capabilities = caps
-    toast.success(
-      `探测完成：${tierLabel(caps.tier)}`,
-      caps.tier === 'A' ? tierHint('A') : `${tierHint(caps.tier)}${caps.notes && caps.notes.length ? `（${caps.notes[0]}）` : ''}`
-    )
+    toast.success(`检测完成：${tierLabel(caps.tier)}`, tierHint(caps.tier))
   } catch (e) {
-    toast.error('探测失败', e instanceof Error ? e.message : String(e))
+    toast.error('检测失败', e instanceof Error ? e.message : String(e))
   } finally {
     state.probing = false
   }
@@ -353,12 +351,12 @@ function cancelSync(id: string) {
   const sched = window.services?.scheduler
   if (sched && !state.demo) {
     sched.cancel(id)
-    toast.info('正在取消同步…', '将中断在途传输并中止本轮')
+    toast.info('正在取消同步…', '正在停止，正在传输的文件会被中断')
     return
   }
   if (cancelRequested.has(id)) return
   cancelRequested.add(id)
-  toast.info('正在取消同步…', '将中断在途传输并中止本轮')
+  toast.info('正在取消同步…', '正在停止，正在传输的文件会被中断')
 }
 
 /**
@@ -427,9 +425,11 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
     } else {
       dir.status = 'error'
       const msg = e instanceof Error ? e.message : String(e)
-      // 部分成功场景：err.summary 是引擎附带的完整计数，errorMessage 仍取首个失败原因
+      // 部分成功场景：err.summary 是引擎附带的完整计数，errorMessage 仍取首个失败原因；
+      // 技术细节（HTTP 码 / 路径 / 原始报错）进 errorDetail，界面悬浮 title 展示
       const summary = (e as { summary?: SyncSummary }).summary
       dir.errorMessage = capStr(msg)
+      dir.errorDetail = capStr((e as { detail?: unknown }).detail != null ? String((e as { detail?: unknown }).detail) : '')
       if (summary) dir.lastResult = summary
       dir.lastSyncAt = Date.now()
     }
@@ -701,28 +701,34 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
   if (ev.cancelled) {
     dir.status = 'idle'
     dir.errorMessage = null
+    dir.errorDetail = null
     if (summary) dir.lastResult = summary
     dir.lastSyncAt = Date.now()
     toast.info('已取消同步')
   } else if (disp && disp.tone === 'breaker') {
-    // 熔断归因：状态文案固定，详情折叠进 errorMessage（title 上限内）
+    // 熔断归因：状态文案固定为一句人话，最后失败原因折叠进 errorDetail（悬浮 title 可见）
     dir.status = 'error'
-    dir.errorMessage = capStr(disp.detail ? `${disp.title}：${disp.detail}` : disp.title)
+    dir.errorMessage = capStr(disp.title)
+    dir.errorDetail = capStr(disp.detail || '')
     if (summary) dir.lastResult = summary
     dir.lastSyncAt = Date.now()
   } else if (ev.error || (disp && disp.tone === 'error')) {
     dir.status = 'error'
     dir.errorMessage = capStr((disp && disp.title) || ev.error)
+    // 其余折叠后的失败条目作为详情（悬浮 title 可见），界面默认只展示首条摘要
+    const more = disp && disp.errors && disp.errors.length > 1 ? disp.errors.join('\n') : ''
+    dir.errorDetail = capStr(more)
     if (summary) dir.lastResult = summary
     dir.lastSyncAt = Date.now()
   } else {
     dir.status = 'synced'
     dir.errorMessage = null
+    dir.errorDetail = null
     dir.conflictFile = null
     if (summary) dir.lastResult = summary
     dir.lastSyncAt = Date.now()
     dir.justCompleted = true
-    if (disp && disp.tone === 'partial') toast.info(disp.title, '回窗口后在目录列表统一处理')
+    if (disp && disp.tone === 'partial') toast.info(disp.title, '回窗口后在文件夹列表统一处理')
     if (summary?.warnings?.length) {
       toast.warning(summary.warnings[0], summary.warnings.length > 1 ? `另有 ${summary.warnings.length - 1} 条提示` : undefined)
     }
@@ -777,8 +783,10 @@ function handleSchedulerEvent(ev: SchedulerEvent) {
       void refreshAllPendingConflicts()
       break
     case 'scheduler-error':
-      // 调度器自身异常（自举失败 / 心跳缓慢等）：可见但不打断界面
-      toast.warning('同步调度器异常', ev.message)
+      // 调度器自身异常（自举失败 / 心跳缓慢等）：仅 visible 的事件弹提示；
+      // 内部机制类（选举 / 心跳 / dbStorage）只写日志，不打扰用户
+      if ((ev as { visible?: boolean }).visible) toast.warning('自动同步出了点问题，稍后会重试', ev.message)
+      else console.info('[webdav-sync] scheduler:', ev.message)
       break
     default:
       // config-applied / plugin-out：事件数据已由调度器外发，无 UI 动作
@@ -840,11 +848,11 @@ async function applyPendingChoices(dir: SyncDir, rels: string[], choice: 'local'
   try {
     for (const rel of rels) await window.services.sync.setPendingChoice(dirArg, rel, choice)
   } catch (e) {
-    toast.error('应用失败', e instanceof Error ? e.message : String(e))
+    toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
   }
   await refreshPendingConflicts(dir)
   const remaining = dir.pendingConflicts?.filter((p) => !p.choice).length ?? 0
-  toast.success('已记录处理方式', remaining > 0 ? `仍有 ${remaining} 个待处理` : '即将同步落地')
+  toast.success('已记录处理方式', remaining > 0 ? `还有 ${remaining} 个待处理` : '下次同步时生效')
   void syncDir(dir)
 }
 
@@ -871,7 +879,7 @@ function bindScheduler() {
   void sched
     .init()
     .then((snap) => {
-      if (!snap.ready && snap.notReadyReason) toast.warning('自动同步未启动', snap.notReadyReason)
+      if (!snap.ready && snap.notReadyReason) toast.warning('自动同步暂时没有开启', snap.notReadyReason)
     })
     .catch(() => {
       /* 握手失败不阻断界面 */

@@ -74,7 +74,16 @@ export interface SyncDir {
    * 仅 ?demo= 演示场景（及历史持久化数据）使用，勿据此扩展真实冲突流程。
    */
   conflictFile: string | null
+  /**
+   * 面向用户的错误摘要（一句话人话：发生了什么 + 该做什么）。
+   * 技术细节（HTTP 码 / 路径 / 原始报错）放 errorDetail，界面默认不展示。
+   */
   errorMessage: string | null
+  /**
+   * 错误详情（第二层）：悬浮 title / 反馈时复制用；null = 无补充信息。
+   * 仅运行时展示与持久化，不参与同步逻辑。
+   */
+  errorDetail?: string | null
   progress: { filesDone: number; filesTotal: number; bytesDone: number; bytesTotal: number; verifyDone?: number; verifyTotal?: number } | null
   /** 是否启用同步：undefined / true 视为启用，false 时跳过自动与手动同步 */
   enabled?: boolean

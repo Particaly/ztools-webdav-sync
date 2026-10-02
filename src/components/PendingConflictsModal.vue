@@ -42,11 +42,11 @@ const shownCount = ref(PAGE_SIZE)
 const shownItems = computed(() => items.value.slice(0, shownCount.value))
 
 const choiceLabel: Record<string, string> = {
-  local: '保留本地',
-  remote: '保留云端',
-  both: '两边都留',
+  local: '保留电脑版本',
+  remote: '保留云端版本',
+  both: '两个都留',
   delete: '确认删除',
-  keep: '保留不删',
+  keep: '不删除',
 }
 
 function applyOne(rel: string, choice: 'local' | 'remote' | 'both' | 'delete' | 'keep') {
@@ -68,16 +68,16 @@ function ignore(rel: string) {
 const subtitle = computed(() => {
   if (!openItems.value.length) return '没有待处理的记录'
   const parts: string[] = []
-  if (openConflictItems.value.length) parts.push(`${openConflictItems.value.length} 个冲突等你选择处理方式`)
-  if (openDeleteItems.value.length) parts.push(`${openDeleteItems.value.length} 项删除等你确认（确认前不删除任何文件）`)
-  return `${parts.join('；')}（下一轮同步落地）`
+  if (openConflictItems.value.length) parts.push(`${openConflictItems.value.length} 个文件等你选择保留哪个`)
+  if (openDeleteItems.value.length) parts.push(`${openDeleteItems.value.length} 项删除等你确认（确认前不会删除任何文件）`)
+  return `${parts.join('；')}（下次同步时生效）`
 })
 </script>
 
 <template>
   <AppModal
     v-if="open"
-    :title="`${dir.name}：待处理记录`"
+    :title="`${dir.name}：待处理`"
     :subtitle="subtitle"
     :width="440"
     @close="open = false"
@@ -88,26 +88,26 @@ const subtitle = computed(() => {
           <span class="font-mono text-[12px] text-ink-1 truncate" :title="it.rel">{{ it.rel }}</span>
           <span class="text-[11px] text-ink-4">{{
             it.choice
-              ? `已选「${choiceLabel[it.choice] ?? it.choice}」· 待下轮生效`
+              ? `已选「${choiceLabel[it.choice] ?? it.choice}」· 下次同步时生效`
               : it.kind === 'delete'
-                ? `删除待确认 · 发现于 ${fmtRelTime(it.createdAt)}`
+                ? `等你确认删除 · 发现于 ${fmtRelTime(it.createdAt)}`
                 : `发现于 ${fmtRelTime(it.createdAt)}`
           }}</span>
         </div>
         <div v-if="!it.choice" class="flex items-center gap-[6px] shrink-0">
           <template v-if="it.kind === 'delete'">
-            <button type="button" class="act" title="下一轮同步执行删除（本地删除进回收站）" @click="applyOne(it.rel, 'delete')">确认删除</button>
-            <button type="button" class="act" @click="applyOne(it.rel, 'keep')">保留不删</button>
+            <button type="button" class="act" title="下次同步时删除（电脑上的文件会放进回收站）" @click="applyOne(it.rel, 'delete')">确认删除</button>
+            <button type="button" class="act" @click="applyOne(it.rel, 'keep')">不删除</button>
           </template>
           <template v-else>
-            <button type="button" class="act" @click="applyOne(it.rel, 'local')">保留本地</button>
-            <button type="button" class="act" @click="applyOne(it.rel, 'remote')">保留云端</button>
-            <button type="button" class="act" @click="applyOne(it.rel, 'both')">两边都留</button>
+            <button type="button" class="act" @click="applyOne(it.rel, 'local')">保留电脑版本</button>
+            <button type="button" class="act" @click="applyOne(it.rel, 'remote')">保留云端版本</button>
+            <button type="button" class="act" @click="applyOne(it.rel, 'both')">两个都留</button>
           </template>
           <button
             type="button"
             class="act muted"
-            :title="it.kind === 'delete' ? '清除该挂起（下一轮按阈值重新登记，仍不会自动删除）' : '清除该挂起，文件再冲突时才重新询问'"
+            :title="it.kind === 'delete' ? '忽略这条提醒。如果之后又出现，还会再问你，不会自动删除任何文件' : '忽略这条提醒，这个文件再次冲突时才会重新询问'"
             @click="ignore(it.rel)"
           >忽略</button>
         </div>
@@ -123,16 +123,16 @@ const subtitle = computed(() => {
     <template #footer>
       <div v-if="openItems.length > 1" class="flex flex-col gap-[8px] w-full">
         <div v-if="openConflictItems.length > 1" class="flex items-center gap-[8px] w-full">
-          <span class="text-[11px] text-ink-3 shrink-0">对剩余 {{ openConflictItems.length }} 个冲突都这样处理：</span>
+          <span class="text-[11px] text-ink-3 shrink-0">其余 {{ openConflictItems.length }} 个也都这样处理：</span>
           <span class="flex-spacer" />
-          <AppButton size="sm" @click="applyConflicts('local')">保留本地</AppButton>
-          <AppButton size="sm" @click="applyConflicts('remote')">保留云端</AppButton>
-          <AppButton size="sm" variant="primary" @click="applyConflicts('both')">两边都留</AppButton>
+          <AppButton size="sm" @click="applyConflicts('local')">保留电脑版本</AppButton>
+          <AppButton size="sm" @click="applyConflicts('remote')">保留云端版本</AppButton>
+          <AppButton size="sm" variant="primary" @click="applyConflicts('both')">两个都留</AppButton>
         </div>
         <div v-if="openDeleteItems.length > 1" class="flex items-center gap-[8px] w-full">
-          <span class="text-[11px] text-ink-3 shrink-0">对剩余 {{ openDeleteItems.length }} 项删除确认都这样处理：</span>
+          <span class="text-[11px] text-ink-3 shrink-0">其余 {{ openDeleteItems.length }} 项删除都这样处理：</span>
           <span class="flex-spacer" />
-          <AppButton size="sm" @click="applyDeletes('keep')">全部保留不删</AppButton>
+          <AppButton size="sm" @click="applyDeletes('keep')">全部不删除</AppButton>
           <AppButton size="sm" variant="primary" @click="applyDeletes('delete')">全部确认删除</AppButton>
         </div>
       </div>

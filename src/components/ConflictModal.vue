@@ -44,8 +44,8 @@ function choose(choice: 'local' | 'remote' | 'both') {
   <Transition name="modal-pop">
     <AppModal
       v-if="info"
-      title="发现文件冲突"
-      subtitle="本地版本和 WebDAV 版本都被修改"
+      title="这个文件两边都改过了"
+      subtitle="电脑上和云端的版本都有新的修改，请选择保留哪一个"
       :width="420"
       :show-close="false"
       :close-on-mask="false"
@@ -66,11 +66,11 @@ function choose(choice: 'local' | 'remote' | 'both') {
         <span class="w-[62px] shrink-0" />
         <span class="flex-1 flex items-center justify-center gap-[6px] rounded-[5px] px-[10px] py-[5px] text-[11px] font-semibold bg-fill-badge text-primary">
           <AppIcon name="monitor" :size="12" />
-          本地版本
+          电脑上的版本
         </span>
         <span class="flex-1 flex items-center justify-center gap-[6px] rounded-[5px] px-[10px] py-[5px] text-[11px] font-semibold bg-fill-seg text-btn-text">
           <AppIcon name="cloud" :size="12" />
-          WebDAV 版本
+          云端的版本
         </span>
       </div>
       <div class="flex gap-[10px]">
@@ -83,25 +83,25 @@ function choose(choice: 'local' | 'remote' | 'both') {
         <span class="flex-1 py-2 font-mono text-[11px] text-ink-1">{{ fmtSize(info.local.size) }}</span>
         <span class="flex-1 py-2 font-mono text-[11px] text-ink-1">{{ fmtSize(info.remote.size) }}</span>
       </div>
-      <div class="text-[11px] text-ink-4">选择「同时保留」将云端文件另存为 {{ conflictCopyName }}</div>
+      <div class="text-[11px] text-ink-4">选「两个都留」，云端的文件会另存为 {{ conflictCopyName }}，电脑上的文件不变</div>
       <div v-if="info.hint === 'partial-upload'" class="flex items-start gap-[6px] rounded-[5px] bg-fill-seg px-[10px] py-[6px] text-ink-2 leading-[1.4]">
         <AppIcon name="warn" :size="12" class="mt-[2px] shrink-0 text-warning-icon" />
-        <span>云端文件小于本地，且本机有一条未完成的上传记录：可能是上次中断的上传留下的残缺文件。选择「保留本地」将重新上传完整内容。</span>
+        <span>云端的文件比电脑上的小，而且这台电脑有一次没传完的上传记录，云端的可能是上次中断后留下的不完整文件。建议选「保留电脑版本」，会重新完整上传。</span>
       </div>
       <div class="text-[11px] text-ink-4 leading-[1.4]">
-        两端设备时钟不同源，修改时间可能不可靠，请以内容或大小辅助判断。
+        两台设备的系统时间可能不一致，修改时间仅供参考，请结合文件大小和内容判断。
       </div>
       <label class="flex items-center gap-[6px] text-[11px] text-ink-2 select-none cursor-pointer">
         <input v-model="applyAll" type="checkbox" class="accent-[#1a73e8] w-[13px] h-[13px] cursor-pointer" />
-        对本轮剩余冲突都这样处理
+        其余的冲突也都这样处理
       </label>
     </div>
 
     <template #footer>
-      <AppButton @click="choose('both')">同时保留</AppButton>
+      <AppButton @click="choose('both')">两个都留</AppButton>
       <span class="flex-spacer" />
-      <AppButton @click="choose('remote')">保留云端</AppButton>
-      <AppButton variant="primary" pad="0 14px" @click="choose('local')">保留本地</AppButton>
+      <AppButton @click="choose('remote')">保留云端版本</AppButton>
+      <AppButton variant="primary" pad="0 14px" @click="choose('local')">保留电脑版本</AppButton>
     </template>
     </AppModal>
   </Transition>

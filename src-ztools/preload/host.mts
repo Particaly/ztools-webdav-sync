@@ -44,10 +44,10 @@ export interface HostPorts {
 }
 
 /**
- * 默认端口在宿主未注入回收站接口时抛出的固定文案。deleteLocalOne 据此还原与
- * 端口化之前逐字一致的历史错误（接口缺失与调用失败两类文案形态不同，见该函数）。
+ * 默认端口在宿主未注入回收站接口时抛出的固定文案（面向用户一句话；
+ * deleteLocalOne 据此识别「接口缺失」与「调用失败」两类形态，见该函数）。
  */
-export const HOST_TRASH_MISSING_MESSAGE = '宿主未提供回收站接口（ztools.shellTrashItem）'
+export const HOST_TRASH_MISSING_MESSAGE = '当前 ZTools 版本不支持放入回收站'
 
 /** 当前生效的端口覆盖（null = 未覆盖，走默认端口；测试 / 无头注入点持有） */
 let portsOverride: HostPorts | null = null

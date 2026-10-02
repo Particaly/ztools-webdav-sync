@@ -38,7 +38,7 @@ const statusText = computed(() => {
     case 'syncing':
       return '正在同步…'
     case 'conflict':
-      return '有冲突'
+      return '需要处理'
     case 'error':
       return '同步失败'
     case 'synced':
@@ -78,7 +78,7 @@ function onOpenSettings(close: () => void) {
 
 function onRemove(close: () => void) {
   const d = props.dir
-  if (confirm(`删除同步配置「${d.name}」？（不会删除本地与云端文件）`)) {
+  if (confirm(`不再同步「${d.name}」？电脑和云端的文件都不会被删除`)) {
     store.removeDir(d.id)
   }
   close()
@@ -153,7 +153,7 @@ function onCancelSync() {
               <span class="err-dot" />
               <span class="st red">{{ statusText }}</span>
             </div>
-            <span class="time" :title="dir.errorMessage || ''">{{ timeText }}</span>
+            <span class="time" :title="dir.errorDetail || dir.errorMessage || ''">{{ timeText }}</span>
           </template>
           <!-- 等待同步 -->
           <template v-else>
@@ -178,7 +178,7 @@ function onCancelSync() {
               </button>
               <button type="button" class="mi" @click="onToggleEnabled(close)">
                 <AppIcon :name="enabled ? 'pause' : 'play'" :size="13" class="mi-ic" />
-                <span>{{ enabled ? '停用同步' : '启用同步' }}</span>
+                <span>{{ enabled ? '暂停同步' : '恢复同步' }}</span>
               </button>
               <button type="button" class="mi" @click="onOpenSettings(close)">
                 <AppIcon name="gear" :size="13" class="mi-ic" />
@@ -187,7 +187,7 @@ function onCancelSync() {
               <div class="mi-sep" />
               <button type="button" class="mi danger" @click="onRemove(close)">
                 <AppIcon name="trash" :size="13" class="mi-ic" />
-                <span>删除配置</span>
+                <span>移除同步</span>
               </button>
             </div>
           </template>
@@ -224,17 +224,17 @@ function onCancelSync() {
     <!-- 冲突提示条（demo/兼容：真实同步的冲突经 onConflict 即时弹窗，status 不会停在 'conflict'） -->
     <div v-if="dir.status === 'conflict' && dir.conflictFile" class="strip warn-strip rise-in-sm">
       <AppIcon name="warn" :size="14" class="text-warning-icon" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{ dir.conflictFile }} 本地版本与 WebDAV 版本都被修改，需要选择保留方式</span>
+      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{ dir.conflictFile }} 这个文件在电脑和云端都被改过，请选择保留哪一个</span>
       <button type="button" class="inline-flex items-center gap-[3px] border-0 bg-transparent text-primary text-[11px] font-semibold shrink-0 py-[2px] px-0 hover:underline" @click="handleConflict">
         处理
         <AppIcon name="chevron-right" :size="10" />
       </button>
     </div>
 
-    <!-- 失败提示条 -->
+    <!-- 失败提示条：默认只显示摘要，技术细节折叠在悬浮 title -->
     <div v-if="dir.status === 'error' && dir.errorMessage" class="strip error-strip rise-in-sm">
       <AppIcon name="warn" :size="14" class="text-danger" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-[#b3261e]" :title="dir.errorMessage">{{ dir.errorMessage }}</span>
+      <span class="flex-1 min-w-0 truncate text-[11px] text-[#b3261e]" :title="dir.errorDetail || dir.errorMessage">{{ dir.errorMessage }}</span>
     </div>
 
     <!-- 待处理挂起条：后台轮 defer 的冲突 + 批量删除超阈值的确认挂起，回窗口统一处理 -->
@@ -242,8 +242,8 @@ function onCancelSync() {
       <AppIcon name="warn" :size="14" class="text-warning-icon" />
       <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{
         pendingDeleteOpen > 0
-          ? `${pendingOpen} 项待处理（其中 ${pendingDeleteOpen} 项删除待确认，确认前不会删除任何文件）`
-          : `${pendingOpen} 个文件存在同步冲突，等你选择处理方式`
+          ? `${pendingOpen} 项等你处理（其中 ${pendingDeleteOpen} 项是删除，你确认前不会删除任何文件）`
+          : `${pendingOpen} 个文件两边都被改过，等你选择保留哪个`
       }}</span>
       <button
         type="button"

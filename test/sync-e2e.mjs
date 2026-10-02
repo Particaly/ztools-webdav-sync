@@ -484,7 +484,7 @@ try {
     s2err = e
     s2summary = e.summary
   }
-  check('S2 corrupt snapshot surfaces warning and conflict error', !!s2err && /冲突未解决/.test(s2err.message) && s2summary && s2summary.warnings.some((w) => /快照损坏|无基线/.test(w)), s2err && s2err.message)
+  check('S2 corrupt snapshot surfaces conflict error (baseline note is log-only now)', !!s2err && /冲突还没处理/.test(s2err.message), s2err && s2err.message)
   check('S2 corrupt snapshot blocks delete propagation', fs.existsSync(path.join(ROOT, 'safe', 'del.txt')))
   check('S2 corrupt snapshot blocks overwrite', (await fsp.readFile(path.join(ROOT, 'safe', 'a.txt'), 'utf-8')) === 'safe-a-v1')
   check(
@@ -532,7 +532,7 @@ try {
   } catch (e) {
     s5err = e
   }
-  check('S5 unresolved conflict fails the round', !!s5err && /冲突未解决/.test(s5err.message), s5err && s5err.message)
+  check('S5 unresolved conflict fails the round', !!s5err && /冲突还没处理/.test(s5err.message), s5err && s5err.message)
   check(
     'S5 both versions intact',
     (await fsp.readFile(path.join(SAFE_LOCAL, 'a.txt'), 'utf-8')) === 'safe-a-v4-local-x' &&
@@ -555,7 +555,7 @@ try {
   } catch (e) {
     s7err = e
   }
-  check('S7 remote delete failure fails the round', !!s7err && /删除远端失败/.test(s7err.message), s7err && s7err.message)
+  check('S7 remote delete failure fails the round', !!s7err && /无法从云端删除/.test(s7err.message), s7err && s7err.message)
   check('S7 remote file still exists', fs.existsSync(path.join(ROOT, 'safe', 'gone.faildelete.txt')))
   check('S7 baseline retains entry', (await services.sync._internals.baselineEntry(safeDir(), 'gone.faildelete.txt')) != null)
   // 收敛：移除远端文件后两侧皆无 → clean 丢弃条目，且不得把远端删除当成「新文件」下载回来
@@ -577,7 +577,7 @@ try {
       } catch (e) {
         s8err = e
       }
-      check('S8 local delete failure fails the round', !!s8err && /删除本地文件失败/.test(s8err.message), s8err && s8err.message)
+      check('S8 local delete failure fails the round', !!s8err && /无法删除/.test(s8err.message), s8err && s8err.message)
       check('S8 local file still present', fs.existsSync(path.join(SAFE_LOCAL, 'keepme.txt')))
       check('S8 baseline retains entry', (await services.sync._internals.baselineEntry(safeDir(), 'keepme.txt')) != null)
       spawnSync('icacls', [path.join(SAFE_LOCAL, 'keepme.txt'), '/reset'])
@@ -601,7 +601,7 @@ try {
   } catch (e) {
     g1err = e
   }
-  check('S9 download guard rejects changed target', !!g1err && /已被修改|下载中止/.test(g1err.message), g1err && g1err.message)
+  check('S9 download guard rejects changed target', !!g1err && /未下载/.test(g1err.message), g1err && g1err.message)
   check('S9 user content preserved', (await fsp.readFile(localRg, 'utf-8')) === 'LOCAL-CURRENT')
   const stRg = await fsp.stat(localRg)
   const g2 = await services.sync._internals.downloadOne(cfg, safeDir(), 'rg.txt', SAFE_LOCAL, null, {
@@ -906,8 +906,8 @@ try {
     await bump('x3.txt', 30000)
     const n3c = await services.sync.syncDirectory(cfg, n3Dir(), SP, {})
     check(
-      'N3 third distinct file marks fingerprint-unstable with warning',
-      n3c.downloaded === 0 && n3c.adopted === 1 && n3c.warnings.some((w) => /指纹不稳定/.test(w)),
+      'N3 third distinct file marks fingerprint-unstable (note is log-only now)',
+      n3c.downloaded === 0 && n3c.adopted === 1 && !n3c.warnings.some((w) => /指纹/.test(w)),
       JSON.stringify(n3c.warnings)
     )
     await bump('x2.txt', 30000)
@@ -1141,8 +1141,9 @@ try {
       crossErr = e
     }
     check(
-      'RD cross-origin redirect rejected with both URLs',
-      !!crossErr && /跨源/.test(crossErr.message) && crossErr.message.includes('127.0.0.1:5361') && crossErr.message.includes('127.0.0.1:9'),
+      'RD cross-origin redirect rejected (target in summary, source in detail)',
+      !!crossErr && /另一个网站/.test(crossErr.message) && crossErr.message.includes('127.0.0.1:9') &&
+        String(crossErr.detail || '').includes('127.0.0.1:5361'),
       crossErr && crossErr.message
     )
     // 完整同步：引擎对集合请求已统一带尾斜杠，档位服务器不再触发重定向，流程照常成功
@@ -1435,7 +1436,7 @@ try {
       const localKept = (await fsp.readdir(path.join(B3_C, 'sub'))).length
       check(
         'B3c shallow infinity response aborts round as incomplete scan (zero deletes)',
-        !!b3cErr && /未包含任何嵌套条目/.test(b3cErr.message) && localKept === 60,
+        !!b3cErr && /没能完整读取文件列表/.test(b3cErr.message) && /嵌套条目/.test(String(b3cErr.detail || '')) && localKept === 60,
         `${b3cErr ? b3cErr.message : 'no error'} localKept=${localKept}`
       )
       check(
@@ -1700,12 +1701,12 @@ try {
       }
       check(
         'ES1f synth-vs-actual mismatch surfaces as 412 precondition error',
-        !!s11err && !!s11err.summary && /412/.test(s11err.summary.errors[0] || '') && s11err.summary.scan && s11err.summary.scan.skippedDirs === 3,
+        !!s11err && !!s11err.summary && /暂未上传/.test(s11err.summary.errors[0] || '') && s11err.summary.scan && s11err.summary.scan.skippedDirs === 3,
         s11err ? `${s11err.message} | scan=${JSON.stringify(s11err.summary.scan)}` : 'no error'
       )
       check(
-        'ES1f anomaly warning forces a full scan next round',
-        !!s11err && s11err.summary.warnings.some((w) => /下一轮将强制全量扫描/.test(w)),
+        'ES1f anomaly note is log-only, full scan forced next round',
+        !!s11err && !s11err.summary.warnings.some((w) => /强制全量扫描/.test(w)),
         s11err ? JSON.stringify(s11err.summary.warnings) : ''
       )
       const s12 = await syncP(A, ES1_RP, undefined, { onConflict: () => 'remote' })
@@ -2132,7 +2133,7 @@ try {
       const hpNotified = await hpWait(() => HP_NOTES.length >= 1, 15000)
       check(
         'HPa deferred-conflict notification routed through the injected notify port',
-        hpNotified && HP_NOTES.length === 1 && /1 个待处理冲突/.test(HP_NOTES[0] || ''),
+        hpNotified && HP_NOTES.length === 1 && /1 个文件需要你选择保留哪一个/.test(HP_NOTES[0] || ''),
         JSON.stringify({ notified: hpNotified, notes: HP_NOTES })
       )
       hpSched.cleanup()
@@ -2268,7 +2269,7 @@ try {
     p1midErr = e
   }
   await setMidair(null)
-  check('P1 midair PUT is rejected with 412 and skips the file', !!p1midErr && /412|已被其他设备修改/.test(p1midErr.message), p1midErr && p1midErr.message)
+  check('P1 midair PUT is rejected with 412 and skips the file', !!p1midErr && /其他设备修改/.test(p1midErr.message), p1midErr && p1midErr.message)
   check(
     'P1 midair: remote keeps peer version (local edit NOT uploaded this round)',
     (await fsp.readFile(path.join(ROOT, 'px1', 'race-midair.txt'), 'utf-8')).startsWith('MIDAIR-PEER-EDIT-')
@@ -2319,7 +2320,7 @@ try {
   await fsp.writeFile(path.join(P2_A, 'race-midair.txt'), 'p2-v1')
   await fsp.writeFile(path.join(P2_A, 'a.txt'), 'p2-content')
   const p2s1 = await syncP(P2_A, '/px2')
-  check('P2 first sync uploads with B-tier warning', p2s1.uploaded === 2 && p2s1.tier === 'B' && p2s1.warnings.some((w) => /多设备并发安全/.test(w)), JSON.stringify(p2s1.warnings))
+  check('P2 first sync uploads with B-tier warning', p2s1.uploaded === 2 && p2s1.tier === 'B' && p2s1.warnings.some((w) => /多台设备/.test(w)), JSON.stringify(p2s1.warnings))
   const p2s1b = await syncP(P2_A, '/px2')
   check('P2 second-level mtime does not cause ping-pong', isNoop(p2s1b), JSON.stringify(p2s1b))
   // B 档复查拦截：midair 钩子（propfind 触发点）在复查 PROPFIND 时改写远端内容 → 复查发现不符
@@ -2332,7 +2333,7 @@ try {
     p2midErr = e
   }
   await setMidair(null)
-  check('P2 midair overwrite abandoned by pre-PUT recheck', !!p2midErr && /复查发现远端已变化|跳过/.test(p2midErr.message), p2midErr && p2midErr.message)
+  check('P2 midair overwrite abandoned by pre-PUT recheck', !!p2midErr && /暂未上传/.test(p2midErr.message), p2midErr && p2midErr.message)
   check('P2 midair: remote holds peer version (local edit not uploaded)', (await fsp.readFile(path.join(ROOT, 'px2', 'race-midair.txt'), 'utf-8')).startsWith('MIDAIR-PEER-EDIT-'))
   const p2s2 = await syncP(P2_A, '/px2', { ...SP, conflictStrategy: 'local' })
   check('P2 converges via conflict resolution after recheck abort', p2s2.conflicts === 1 && p2s2.uploaded === 1, JSON.stringify(p2s2))
@@ -2459,7 +2460,7 @@ try {
   await fsp.writeFile(path.join(P7_A, 'race-midair.txt'), 'p7-v1')
   await fsp.writeFile(path.join(P7_A, 'a.txt'), 'p7-content')
   const p7s1 = await syncP(P7_A, '/px7')
-  check('P7 first sync uploads with concurrency warning', p7s1.uploaded === 2 && p7s1.warnings.some((w) => /多设备并发安全/.test(w)), JSON.stringify(p7s1.warnings))
+  check('P7 first sync uploads with concurrency warning', p7s1.uploaded === 2 && p7s1.warnings.some((w) => /多台设备/.test(w)), JSON.stringify(p7s1.warnings))
   // 已知边界（记录在案）：复查（Depth:0 PROPFIND）通过后、PUT 落地前，钩子把远端改写为
   // 对端版本；P7 忽略条件头 → PUT 照常覆盖，对端修改丢失（last-writer-wins）
   await fsp.writeFile(path.join(P7_A, 'race-midair.txt'), 'p7-v2-local-longer')
@@ -2497,13 +2498,13 @@ try {
   await fsp.writeFile(path.join(ROOT, 'px8', 'r2.txt'), 'p8-remote-2')
   const P8_S = await freshStore('p8a')
   const p8caps = await services.dav.probeCapabilities(cfg, true)
-  check('P8 probe classifies tier C (write rejected)', p8caps.tier === 'C' && p8caps.writable === false && p8caps.notes.some((n) => /探测|HTTP 403/.test(n)), JSON.stringify(p8caps.notes))
+  check('P8 probe classifies tier C (write rejected)', p8caps.tier === 'C' && p8caps.writable === false && p8caps.notes.some((n) => /HTTP 403/.test(n)), JSON.stringify(p8caps.notes))
   const P8_A = await tmpLocal('p8a')
   await fsp.writeFile(path.join(P8_A, 'new-local.txt'), 'p8-local-only')
   const p8s1 = await syncP(P8_A, '/px8')
   check(
     'P8 read-only round downloads only, uploads skipped, round does not fail',
-    p8s1.downloaded === 2 && p8s1.uploaded === 0 && p8s1.warnings.some((w) => /只读/.test(w)) && p8s1.errors.length === 0,
+    p8s1.downloaded === 2 && p8s1.uploaded === 0 && p8s1.warnings.some((w) => /只能下载/.test(w)) && p8s1.errors.length === 0,
     JSON.stringify(p8s1)
   )
   check('P8 local-only file not uploaded', !fs.existsSync(path.join(ROOT, 'px8', 'new-local.txt')))
@@ -2690,7 +2691,7 @@ try {
       const roCaps = await services.dav.probeCapabilities(cfg, true, '/shared-ro')
       check(
         'W4 read-only subpath classifies tier C with reason',
-        roCaps.tier === 'C' && roCaps.writable === false && /403/.test(roCaps.writeReason || ''),
+        roCaps.tier === 'C' && roCaps.writable === false && /权限/.test(roCaps.writeReason || '') && roCaps.notes.some((n) => /403/.test(n)),
         JSON.stringify(roCaps)
       )
       const rwCaps = await services.dav.probeCapabilities(cfg, false, '/ok-write')
@@ -2706,7 +2707,7 @@ try {
       const w4sum = await syncP(W4_LOCAL, '/shared-ro')
       check(
         'W4 sync into read-only subpath downloads only',
-        w4sum.downloaded === 1 && w4sum.uploaded === 0 && w4sum.errors.length === 0 && w4sum.warnings.some((w) => /只读/.test(w)),
+        w4sum.downloaded === 1 && w4sum.uploaded === 0 && w4sum.errors.length === 0 && w4sum.warnings.some((w) => /只能下载/.test(w)),
         JSON.stringify(w4sum)
       )
       check('W4 read-only subpath keeps local-only file off remote', !fs.existsSync(path.join(ROOT, 'shared-ro', 'local-only.txt')))
@@ -2726,7 +2727,7 @@ try {
       const w5caps = await services.dav.probeCapabilities(cfg, true, '/mkcolpath')
       check(
         'W5 non-permission MKCOL failure stays tier B (not C) with retry-soon marker',
-        w5caps.tier === 'B' && w5caps.writeRetrySoon === true && /409/.test(w5caps.writeReason || '') && !w5caps.degraded,
+        w5caps.tier === 'B' && w5caps.writeRetrySoon === true && w5caps.notes.some((n) => /409/.test(n)) && !w5caps.degraded,
         JSON.stringify(w5caps)
       )
     } finally {
@@ -2768,7 +2769,7 @@ try {
       }
       const w7ms = Date.now() - w7t0
       const w7msgs = w7err && w7err.errors ? w7err.errors.join(';') : String(w7err && w7err.message)
-      check('W7 persistent 503 trips round breaker with clear message', !!w7err && /熔断|连续失败/.test(w7msgs), w7msgs)
+      check('W7 persistent 503 trips round breaker with clear message', !!w7err && /连续多次出错/.test(w7msgs), w7msgs)
       check('W7 round duration bounded by circuit (not per-file retries)', w7ms < 45000, `${w7ms}ms`)
       // 熔断轮的机器可读字段 —— 调度层据此归因
       //「服务器连续无响应」并计入跨轮退避，不再解析错误文案
@@ -2926,7 +2927,7 @@ try {
         'PF1 round 2 skips backed-off file, round succeeds with skip warning',
         pf1s2.errors.length === 0 &&
           pf1s2.uploaded === 0 &&
-          pf1s2.warnings.some((w) => /跳过 1 个持续失败/.test(w) && /bad\.toolarge\.txt/.test(w) && /下次重试/.test(w)),
+          pf1s2.warnings.some((w) => /1 个文件一直同步失败/.test(w) && /bad\.toolarge\.txt/.test(w) && /下次重试/.test(w)),
         JSON.stringify(pf1s2.warnings)
       )
       const f2 = (await services.sync._internals.getFailures(pf1dir))['bad.toolarge.txt']
@@ -3175,7 +3176,7 @@ try {
       }
       check(
         'BV4 vanish file fails batch verify while round errors',
-        !!bv4err && /上传批量校验失败 gone\.vanish\.txt：远端未见该文件/.test(bv4err.message),
+        !!bv4err && /「gone\.vanish\.txt」上传后核对失败，下次同步会重试/.test(bv4err.message),
         bv4err && bv4err.message
       )
       const okEntry = await services.sync._internals.baselineEntry(bv4dir, 'ok.txt')
@@ -3255,7 +3256,7 @@ try {
     const l2s = await syncP(L2_LOCAL, '/l2')
     check(
       'L2 yields to another device holding a fresh lease (zero transfers, not an error)',
-      l2s.yielded === true && l2s.uploaded === 0 && l2s.downloaded === 0 && l2s.totalFiles === 0 && l2s.warnings.some((w) => /另一设备正在同步/.test(w)),
+      l2s.yielded === true && l2s.uploaded === 0 && l2s.downloaded === 0 && l2s.totalFiles === 0 && l2s.warnings.some((w) => /另一台设备正在同步/.test(w)),
       JSON.stringify(l2s)
     )
     check(
@@ -3318,7 +3319,7 @@ try {
     } catch (e) {
       l4err = e
     }
-    check('L4 abort during transfer fails the round with abort message', !!l4err && /中止/.test(l4err.message), l4err && l4err.message)
+    check('L4 abort during transfer fails the round with abort message', !!l4err && /已取消同步/.test(l4err.message), l4err && l4err.message)
     check('L4 lease released on abort (no lock file left)', !fs.existsSync(path.join(ROOT, 'l4', '.webdav-sync.lock')))
     const l4done = l4err && l4err.summary ? l4err.summary.uploaded : 0
     const l4b = await syncP(L4_LOCAL, '/l4')
@@ -3354,7 +3355,7 @@ try {
       await fsp.rm(err503Flag, { force: true }).catch(() => {})
     }
     const l5msgs = l5err && l5err.errors ? l5err.errors.join(';') : String(l5err && l5err.message)
-    check('L5 round terminated by breaker under 503 storm (errors mention breaker)', !!l5err && /熔断|连续失败/.test(l5msgs), l5msgs)
+    check('L5 round terminated by breaker under 503 storm (errors mention breaker)', !!l5err && /连续多次出错/.test(l5msgs), l5msgs)
     check(
       'L5 lease released despite open breaker (DELETE bypasses circuit: no lock file, no leftover mark)',
       !fs.existsSync(path.join(ROOT, 'l5', '.webdav-sync.lock')) && !(await services.sync._internals.getDirMeta(l5dir)).lockLeftover
@@ -3378,8 +3379,8 @@ try {
     try {
       l6s1 = await syncP(L6_LOCAL, '/l6')
       check(
-        'L6 round succeeds (uploads intact) but lock release fails with warning',
-        l6s1.uploaded === 2 && l6s1.errors.length === 0 && l6s1.warnings.some((w) => /租约锁释放失败/.test(w)),
+        'L6 round succeeds (uploads intact); lock release failure is log-only now',
+        l6s1.uploaded === 2 && l6s1.errors.length === 0 && !l6s1.warnings.some((w) => /租约锁/.test(w)),
         JSON.stringify(l6s1.warnings)
       )
       check('L6 lock file left on remote after failed release', fs.existsSync(l6lock))
@@ -3411,7 +3412,7 @@ try {
       const l7s = await syncP(L7_LOCAL, '/l7')
       check(
         'L7 write-back race lost: round yields after reading peer deviceId',
-        l7s.yielded === true && l7s.uploaded === 0 && l7s.totalFiles === 0 && l7s.planned === 1 && l7s.warnings.some((w) => /另一设备正在同步/.test(w)),
+        l7s.yielded === true && l7s.uploaded === 0 && l7s.totalFiles === 0 && l7s.planned === 1 && l7s.warnings.some((w) => /另一台设备正在同步/.test(w)),
         JSON.stringify(l7s)
       )
       check('L7 user files untouched on remote during yielded round', !fs.existsSync(path.join(ROOT, 'l7', 'a.txt')))
@@ -3470,7 +3471,7 @@ try {
     ])
     check(
       'L9 second concurrent round returns immediately with concurrent flag, zero counts, no progress',
-      r2.concurrent === true && r2.uploaded === 0 && r2.downloaded === 0 && progressB === 0 && r2.warnings.some((w) => /已有同步在进行/.test(w)),
+      r2.concurrent === true && r2.uploaded === 0 && r2.downloaded === 0 && progressB === 0 && r2.warnings.some((w) => /正在同步中/.test(w)),
       JSON.stringify(r2)
     )
     check(
@@ -3628,7 +3629,7 @@ try {
       }
       check(
         'L12 peer-created file not overwritten this round (round errors, REMOTE_CHANGED-style)',
-        !!l12err && /写前查重发现远端已出现同名文件/.test(l12err.message),
+        !!l12err && /暂未上传：云端的文件刚被其他设备修改/.test(l12err.message),
         l12err && l12err.message
       )
       check(
@@ -3661,7 +3662,7 @@ try {
         }
         check(
           'L12 dedup request failure skips upload without blind PUT (transient semantics)',
-          !!dferr && /写前查重失败/.test(dferr.message) && !fs.existsSync(path.join(ROOT, 'dedupfail-l12', 'new.txt')),
+          !!dferr && /暂未处理：无法确认云端文件的最新状态/.test(dferr.message) && !fs.existsSync(path.join(ROOT, 'dedupfail-l12', 'new.txt')),
           dferr && dferr.message
         )
         const dff = await services.sync._internals.getFailures(dfdir)
@@ -3738,7 +3739,7 @@ try {
       }
       check(
         'P404 existing-parent group still drops on peer-created same name',
-        !!p404err && /写前查重发现远端已出现同名文件/.test(p404err.message),
+        !!p404err && /暂未上传：云端的文件刚被其他设备修改/.test(p404err.message),
         p404err && p404err.message
       )
       check(
@@ -3777,7 +3778,7 @@ try {
       const lockGetIdx = lines.findIndex((l) => l === 'GET /dav/l13/.webdav-sync.lock')
       check(
         'L13 write round yields after planning: zero transfers, totalFiles=0, planned set',
-        l13s1.yielded === true && l13s1.uploaded === 0 && l13s1.downloaded === 0 && l13s1.totalFiles === 0 && l13s1.planned === 2 && l13s1.warnings.some((w) => /另一设备正在同步/.test(w)),
+        l13s1.yielded === true && l13s1.uploaded === 0 && l13s1.downloaded === 0 && l13s1.totalFiles === 0 && l13s1.planned === 2 && l13s1.warnings.some((w) => /另一台设备正在同步/.test(w)),
         JSON.stringify(l13s1)
       )
       check(
@@ -3955,7 +3956,7 @@ try {
     fs.writeFileSync(path.join(ROOT, '.wdsync-test-reqlog'), 'x')
     try {
       const r = await runCancelRound(CA1_LOCAL, '/ca1', 'GET /dav/ca1/big-throttle.bin', 500)
-      check('CA1 cancelled download round ends with abort message', !!r.err && /中止/.test(r.err.message) && r.err.phase === 'execute', r.err && r.err.message)
+      check('CA1 cancelled download round ends with abort message', !!r.err && /已取消同步/.test(r.err.message) && r.err.phase === 'execute', r.err && r.err.message)
       check('CA1 cancel takes effect far before the throttled transfer finishes', r.abortToSettleMs > 0 && r.abortToSettleMs < 1000 && r.sawBytes, `settle=${r.abortToSettleMs}ms（完整传输约 1900ms）bytesObserved=${r.sawBytes}`)
       const lines = await waitAbortLine('GET', '/dav/ca1/big-throttle.bin')
       check('CA1 server observed the in-flight GET aborted', lines.some((l) => l === '!ABORT GET /dav/ca1/big-throttle.bin'), lines.filter((l) => l.startsWith('!ABORT')).join(' | '))
@@ -4007,7 +4008,7 @@ try {
     fs.writeFileSync(path.join(ROOT, '.wdsync-test-reqlog'), 'x')
     try {
       const r = await runCancelRound(CA2_LOCAL, '/ca2', 'PUT /dav/ca2/up-throttle.bin', 500)
-      check('CA2 cancelled upload round ends with abort message', !!r.err && /中止/.test(r.err.message), r.err && r.err.message)
+      check('CA2 cancelled upload round ends with abort message', !!r.err && /已取消同步/.test(r.err.message), r.err && r.err.message)
       check('CA2 cancel interrupts the in-flight PUT promptly', r.abortToSettleMs > 0 && r.abortToSettleMs < 1000, `settle=${r.abortToSettleMs}ms`)
       const lines = await waitAbortLine('PUT', '/dav/ca2/up-throttle.bin')
       check('CA2 server observed the in-flight PUT aborted', lines.some((l) => l === '!ABORT PUT /dav/ca2/up-throttle.bin'), lines.filter((l) => l.startsWith('!ABORT')).join(' | '))
@@ -4052,7 +4053,7 @@ try {
       })
       check(
         'CA2 next round auto-detects the partial and re-uploads with ZERO conflicts/dialogs',
-        ca2b.errors.length === 0 && ca2b.uploaded === 1 && ca2b.conflicts === 0 && ca2Conflicts === 0 && ca2b.warnings.some((w) => /半截/.test(w)),
+        ca2b.errors.length === 0 && ca2b.uploaded === 1 && ca2b.conflicts === 0 && ca2Conflicts === 0 && ca2b.warnings.some((w) => /不完整文件/.test(w)),
         `calls=${ca2Conflicts} ${JSON.stringify({ ...ca2b, warnings: ca2b.warnings })}`
       )
       const ca2remote = await fsp.readFile(path.join(ROOT, 'ca2', 'up-throttle.bin'))
@@ -4084,7 +4085,7 @@ try {
       fs.writeFileSync(path.join(ROOT, '.wdsync-test-reqlog'), 'x')
       try {
         const r = await runCancelRound(CA3_LOCAL, '/ca3', 'PUT /dav/ca3/up-throttle.bin', 500)
-        check('CA3 (B tier) cancelled upload round ends with abort message', !!r.err && /中止/.test(r.err.message), r.err && r.err.message)
+        check('CA3 (B tier) cancelled upload round ends with abort message', !!r.err && /已取消同步/.test(r.err.message), r.err && r.err.message)
         check('CA3 (B tier) cancel interrupts the in-flight PUT promptly', r.abortToSettleMs > 0 && r.abortToSettleMs < 1000, `settle=${r.abortToSettleMs}ms`)
         const lines = await waitAbortLine('PUT', '/dav/ca3/up-throttle.bin')
         check('CA3 (B tier) server observed the in-flight PUT aborted', lines.some((l) => l === '!ABORT PUT /dav/ca3/up-throttle.bin'), lines.filter((l) => l.startsWith('!ABORT')).join(' | '))
@@ -4150,7 +4151,7 @@ try {
     fs.writeFileSync(path.join(ROOT, '.wdsync-test-reqlog'), 'x')
     try {
       const r = await runCancelRound(CA4_LOCAL, '/ca4', 'GET /dav/ca4/adopt-throttle.bin', 400)
-      check('CA4 cancelled verify round ends with abort message', !!r.err && /中止/.test(r.err.message), r.err && r.err.message)
+      check('CA4 cancelled verify round ends with abort message', !!r.err && /已取消同步/.test(r.err.message), r.err && r.err.message)
       check('CA4 cancel interrupts the in-flight verify download promptly', r.abortToSettleMs > 0 && r.abortToSettleMs < 1000, `settle=${r.abortToSettleMs}ms`)
       const lines = await waitAbortLine('GET', '/dav/ca4/adopt-throttle.bin')
       check('CA4 server observed the in-flight verify GET aborted', lines.some((l) => l === '!ABORT GET /dav/ca4/adopt-throttle.bin'), lines.filter((l) => l.startsWith('!ABORT')).join(' | '))
@@ -4186,7 +4187,7 @@ try {
       } catch (e) {
         ca6err = e
       }
-      check('CA6 plan-phase cancel ends the round with abort message', !!ca6err && /中止/.test(ca6err.message), ca6err && ca6err.message)
+      check('CA6 plan-phase cancel ends the round with abort message', !!ca6err && /已取消同步/.test(ca6err.message), ca6err && ca6err.message)
       const lines = await readReqlog()
       check('CA6 cancel before lock acquisition issues zero lease-lock requests', lines.every((l) => !l.includes('.webdav-sync.lock')), lines.filter((l) => l.includes('.webdav-sync.lock')).join(' | '))
       check('CA6 cancelled round uploads nothing', !lines.some((l) => l.startsWith('PUT /dav/ca6/a.txt')) && !fs.existsSync(path.join(ROOT, 'ca6', 'a.txt')))
@@ -4246,7 +4247,7 @@ try {
     }
     check(
       'PU1 netcut round fails with NETWORK error (not abort), same-round retry suppressed with a note',
-      !!pu1err && /网络请求失败|ECONNRESET/.test(pu1err.message) && /本轮不再重试/.test(pu1err.errors ? pu1err.errors[0] : pu1err.message),
+      !!pu1err && /网络连接失败|ECONNRESET/.test(pu1err.message) && /本次不再重试/.test(pu1err.errors ? pu1err.errors[0] : pu1err.message),
       pu1err && pu1err.message
     )
     check('PU1 sibling file still committed in the failed round', (await services.sync._internals.baselineEntry(pu1dir, 'ok.txt')) != null)
@@ -4273,7 +4274,7 @@ try {
     })
     check(
       'PU1 next round auto re-uploads the partial with zero conflicts/dialogs',
-      pu1b.errors.length === 0 && pu1b.uploaded === 1 && pu1b.conflicts === 0 && pu1calls === 0 && pu1b.warnings.some((w) => /半截/.test(w)),
+      pu1b.errors.length === 0 && pu1b.uploaded === 1 && pu1b.conflicts === 0 && pu1calls === 0 && pu1b.warnings.some((w) => /不完整文件/.test(w)),
       `calls=${pu1calls} ${JSON.stringify({ ...pu1b, warnings: pu1b.warnings })}`
     )
     check('PU1 converged remote equals local', (await fsp.readFile(pu1Half)).equals(pu1a))
@@ -4323,7 +4324,7 @@ try {
         return 'local'
       },
     })
-    const pu5halfWarns = pu5b.warnings.filter((w) => /半截/.test(w))
+    const pu5halfWarns = pu5b.warnings.filter((w) => /不完整文件/.test(w))
     check(
       'PU5 multiple open intents dedup to ONE half warning + ONE forced re-upload (zero conflicts)',
       pu5b.errors.length === 0 && pu5b.uploaded === 1 && pu5b.conflicts === 0 && pu5calls === 0 && pu5halfWarns.length === 1,
@@ -4354,7 +4355,7 @@ try {
     } catch (e) {
       pu2err = e
     }
-    check('PU2 overwrite upload interrupted with NETWORK', !!pu2err && /网络请求失败|ECONNRESET/.test(pu2err.message), pu2err && pu2err.message)
+    check('PU2 overwrite upload interrupted with NETWORK', !!pu2err && /网络连接失败|ECONNRESET/.test(pu2err.message), pu2err && pu2err.message)
     const pu2remoteNow = await fsp.readFile(path.join(ROOT, 'pu2', 'over.bin'))
     check(
       'PU2 remote old content replaced by a real prefix of v2 (not v1)',
@@ -4412,8 +4413,8 @@ try {
       `hint=${pu3info && pu3info.hint} ${JSON.stringify(pu3b)}`
     )
     check(
-      'PU3 prefix mismatch settles the intent as NOT-ours (recovery warning, dropped marker)',
-      pu3b.warnings.some((w) => /非本机半截/.test(w)),
+      'PU3 prefix mismatch settles the intent as NOT-ours (recovery note is log-only now)',
+      !pu3b.warnings.some((w) => /崩溃恢复/.test(w)),
       JSON.stringify(pu3b.warnings)
     )
     check('PU3 converged after user choice local', (await fsp.readFile(path.join(ROOT, 'pu3', 'peer.bin'))).equals(pu3buf))
@@ -4451,7 +4452,7 @@ try {
     pu4warn = pu4b.warnings
     check(
       'PU4 over-limit partial stays a conflict WITH the partial-upload hint',
-      pu4b.conflicts === 1 && pu4b.uploaded === 1 && pu4info != null && pu4info.hint === 'partial-upload' && pu4warn.some((w) => /超过内容校验上限/.test(w)),
+      pu4b.conflicts === 1 && pu4b.uploaded === 1 && pu4info != null && pu4info.hint === 'partial-upload' && pu4warn.some((w) => /太大无法自动对比/.test(w)),
       `hint=${pu4info && pu4info.hint} ${JSON.stringify(pu4warn)}`
     )
     // 注：轮末 WAL 必然截断为空（冲突解决的落地意图了结了开放意图）；「冲突时刻意图
@@ -4484,7 +4485,7 @@ try {
     const pu6a = await syncP(PU6A_LOCAL, '/pu6a', PUP)
     check(
       'PU6a deleted local → intent aborted at recovery, half downloaded back, no forced upload, no conflict',
-      pu6a.downloaded === 1 && pu6a.conflicts === 0 && pu6a.uploaded === 0 && pu6a.warnings.some((w) => /本地文件已变化或不存在/.test(w)),
+      pu6a.downloaded === 1 && pu6a.conflicts === 0 && pu6a.uploaded === 0 && !pu6a.warnings.some((w) => /崩溃恢复/.test(w)),
       JSON.stringify({ ...pu6a, warnings: pu6a.warnings })
     )
     check(
@@ -4618,8 +4619,8 @@ try {
     try {
       const pu8br = await syncP(PU8B_LOCAL, '/pu8b', PUP)
       check(
-        'PU8b GET failure falls back to size adoption (no transfer, no conflict, warning noted)',
-        pu8br.uploaded === 0 && pu8br.downloaded === 0 && pu8br.conflicts === 0 && pu8br.warnings.some((w) => /按大小采纳/.test(w)) && (await services.sync._internals.baselineEntry(pu8bdir, 'adoptgetfail.bin')) != null,
+        'PU8b GET failure falls back to size adoption (no transfer, no conflict; recovery note is log-only now)',
+        pu8br.uploaded === 0 && pu8br.downloaded === 0 && pu8br.conflicts === 0 && !pu8br.warnings.some((w) => /按大小采纳/.test(w)) && (await services.sync._internals.baselineEntry(pu8bdir, 'adoptgetfail.bin')) != null,
         JSON.stringify({ ...pu8br, warnings: pu8br.warnings })
       )
       check('PU8b follow-up round is a no-op', isNoop(await syncP(PU8B_LOCAL, '/pu8b', PUP)))
@@ -4655,8 +4656,8 @@ try {
       },
     })
     check(
-      'PU9 over-aged open intent dropped at recovery (warning), falls back to normal conflict planning',
-      pu9b.conflicts === 1 && pu9b.warnings.some((w) => /超龄/.test(w)) && pu9calls === 1,
+      'PU9 over-aged open intent dropped at recovery (note is log-only), falls back to normal conflict planning',
+      pu9b.conflicts === 1 && !pu9b.warnings.some((w) => /超龄/.test(w)) && pu9calls === 1,
       `calls=${pu9calls} ${JSON.stringify({ ...pu9b, warnings: pu9b.warnings })}`
     )
     check('PU9 converged after user choice local', (await fsp.readFile(path.join(ROOT, 'pu9', 'stale.bin'))).equals(pu9buf))
@@ -4827,7 +4828,7 @@ try {
     })
     check(
       'PU12b over-aged chain (aged by firstAt) dropped → normal conflict, asked once, no forced re-upload',
-      pu12bb.conflicts === 1 && pu12bb.warnings.some((w) => /超龄/.test(w)) && pu12bcalls === 1,
+      pu12bb.conflicts === 1 && !pu12bb.warnings.some((w) => /超龄/.test(w)) && pu12bcalls === 1,
       `calls=${pu12bcalls} ${JSON.stringify({ ...pu12bb, warnings: pu12bb.warnings })}`
     )
     check('PU12b converged after user choice local', (await fsp.readFile(path.join(ROOT, 'pu12b', 'chain.bin'))).equals(pu12bbuf))
@@ -4872,8 +4873,7 @@ try {
     check(
       'PU13 default budget confirms all 3 adoptions with no budget warning',
       pu13full.errors.length === 0 &&
-        pu13full.warnings.filter((w) => /内容已确认/.test(w)).length === 3 &&
-        !pu13full.warnings.some((w) => /超出本轮预算/.test(w)),
+        pu13full.warnings.length === 0,
       JSON.stringify(pu13full.warnings)
     )
     // (a) 预算 = 单文件大小：第 1 条确认 GET 后预算归零，其余 2 条回退按大小采纳 ——
@@ -4888,14 +4888,13 @@ try {
         pu13small.errors.length === 0 &&
           pu13small.uploaded === 0 &&
           pu13small.downloaded === 0 &&
-          pu13small.warnings.filter((w) => /内容已确认/.test(w)).length === 1,
+          pu13small.warnings.length === 0,
         JSON.stringify({ ...pu13small, warnings: pu13small.warnings })
       )
       check(
         'PU13 budget exhaustion aggregates into ONE warning (2 files), per-file fallback suppressed',
-        pu13small.warnings.filter((w) => /超出本轮预算/.test(w)).length === 1 &&
-          pu13small.warnings.some((w) => /2 个文件/.test(w)) &&
-          pu13small.warnings.filter((w) => /按大小采纳上传意图/.test(w)).length === 0,
+        !pu13small.warnings.some((w) => /超出本轮预算/.test(w)) &&
+          !pu13small.warnings.some((w) => /按大小采纳上传意图/.test(w)),
         JSON.stringify(pu13small.warnings)
       )
       const pu13req = (await fsp.readFile(REQLOG, 'utf-8').catch(() => '')).split('\n').filter(Boolean)
@@ -4953,7 +4952,7 @@ try {
     await setMidair(null)
     check(
       'PC1 round 1 fails on midair 412 while sibling still resolves',
-      !!pc1err && /412|已被其他设备修改/.test(pc1err.message),
+      !!pc1err && /其他设备修改/.test(pc1err.message),
       pc1err && pc1err.message
     )
     check('PC1 onConflict asked exactly once (applyToRemaining covers the sibling)', pc1Calls === 1, `calls=${pc1Calls}`)
@@ -4976,7 +4975,7 @@ try {
     })
     check(
       'PC1 round 2 reuses pending choice without asking again',
-      pc1Calls === 1 && pc1s2.conflicts === 1 && pc1s2.uploaded === 1 && pc1s2.errors.length === 0 && pc1s2.warnings.some((w) => /沿用上次冲突处理策略/.test(w)),
+      pc1Calls === 1 && pc1s2.conflicts === 1 && pc1s2.uploaded === 1 && pc1s2.errors.length === 0 && pc1s2.warnings.some((w) => /按你上次的选择自动处理/.test(w)),
       `calls=${pc1Calls} ${JSON.stringify(pc1s2)}`
     )
     check('PC1 remote f now holds the local version', (await fsp.readFile(path.join(ROOT, 'pc1', 'f-midair.txt'), 'utf-8')) === 'pc1-f-LOCAL-v2')
@@ -5004,7 +5003,7 @@ try {
     } catch (e) {
       pc2err = e
     }
-    check('PC2 unrecognized choice still fails the round as unresolved', !!pc2err && /冲突未解决/.test(pc2err.message), pc2err && pc2err.message)
+    check('PC2 unrecognized choice still fails the round as unresolved', !!pc2err && /冲突还没处理/.test(pc2err.message), pc2err && pc2err.message)
     const pc2pend = await services.sync.listPendingConflicts(pc2dir)
     check(
       'PC2 pending registered without choice, both sides intact',
@@ -5031,7 +5030,7 @@ try {
     })
     check(
       'PC2 next round resolves via the set choice without asking',
-      pc2Calls2 === 0 && pc2s2.conflicts === 1 && pc2s2.downloaded === 1 && pc2s2.errors.length === 0 && pc2s2.warnings.some((w) => /沿用上次冲突处理策略/.test(w)),
+      pc2Calls2 === 0 && pc2s2.conflicts === 1 && pc2s2.downloaded === 1 && pc2s2.errors.length === 0 && pc2s2.warnings.some((w) => /按你上次的选择自动处理/.test(w)),
       `calls=${pc2Calls2} ${JSON.stringify(pc2s2)}`
     )
     check('PC2 local now holds the remote version', (await fsp.readFile(path.join(PC2_LOCAL, 'a.txt'), 'utf-8')) === 'pc2-a-REMOTE-v2-longer')
@@ -5060,7 +5059,7 @@ try {
       pc3err = e
     }
     await setMidair(null)
-    check('PC3 round 1 fails via midair 412 (pending kept on disk)', !!pc3err && /412/.test(pc3err.message), pc3err && pc3err.message)
+    check('PC3 round 1 fails via midair 412 (pending kept on disk)', !!pc3err && /其他设备修改/.test(pc3err.message), pc3err && pc3err.message)
     // 换根再换回：DirStateStore 关闭后重开，挂起必须从 pending-conflicts.json 恢复
     await switchDevice(STORAGE_MAIN)
     await switchDevice(PC3_S)
@@ -5102,7 +5101,7 @@ try {
       await setMidair(null)
       check(
         'PC4 round 1 abandoned by B-tier recheck (REMOTE_CHANGED, round fails)',
-        !!pc4err && /复查发现远端已变化|跳过/.test(pc4err.message),
+        !!pc4err && /暂未上传：云端的文件刚被其他设备修改/.test(pc4err.message),
         pc4err && pc4err.message
       )
       const pc4pend = await services.sync.listPendingConflicts(pc4dir)
@@ -5333,7 +5332,7 @@ try {
       }
       check(
         'FC5a 250 network-class errors (200 kept + 50 dropped) still classify as network',
-        !!fc5aerr && fc5aerr.summary && fc5aerr.summary.failureClass === 'network' && fc5aerr.summary.errors.length === 200 && fc5aerr.summary.errorsDropped === 50 && fc5aerr.summary.errors.every((m) => m.includes('上传批量校验失败')),
+        !!fc5aerr && fc5aerr.summary && fc5aerr.summary.failureClass === 'network' && fc5aerr.summary.errors.length === 200 && fc5aerr.summary.errorsDropped === 50 && fc5aerr.summary.errors.every((m) => m.includes('上传后核对失败')),
         fc5aerr && JSON.stringify({ failureClass: fc5aerr.summary.failureClass, len: fc5aerr.summary.errors.length, dropped: fc5aerr.summary.errorsDropped, head: fc5aerr.summary.errors[0] })
       )
       check('FC5a failed round commits nothing (uploaded=0)', fc5aerr && fc5aerr.summary.uploaded === 0)
@@ -5378,7 +5377,7 @@ try {
       }
       check(
         'FC5b 250 network (dedup probe 503) + 60 permanent (413, all dropped): failureClass=mixed via incremental counts',
-        !!fc5berr && fc5berr.summary && fc5berr.summary.failureClass === 'mixed' && fc5berr.summary.errors.length === 200 && fc5berr.summary.errorsDropped === 110 && fc5berr.summary.errors.every((m) => m.includes('写前查重失败')),
+        !!fc5berr && fc5berr.summary && fc5berr.summary.failureClass === 'mixed' && fc5berr.summary.errors.length === 200 && fc5berr.summary.errorsDropped === 110 && fc5berr.summary.errors.every((m) => m.includes('暂未处理')),
         fc5berr && JSON.stringify({ failureClass: fc5berr.summary.failureClass, len: fc5berr.summary.errors.length, dropped: fc5berr.summary.errorsDropped, head: fc5berr.summary.errors[0] })
       )
       // 恢复轮：60 个 413 文件上一轮已入永久失败退避表（15min 起，本轮汇总跳过不报错）；
@@ -5388,7 +5387,7 @@ try {
       const fc5bfix = await syncP(FC5B_LOCAL, '/b2b2')
       check(
         'FC5b fault-free round uploads 250, skips 60 on permanent-failure backoff, no errors',
-        fc5bfix.errors.length === 0 && fc5bfix.uploaded === 250 && fc5bfix.warnings.some((w) => w.includes('跳过 60 个持续失败文件')) && fc5bfix.failureClass === undefined,
+        fc5bfix.errors.length === 0 && fc5bfix.uploaded === 250 && fc5bfix.warnings.some((w) => w.includes('60 个文件一直同步失败')) && fc5bfix.failureClass === undefined,
         JSON.stringify({ uploaded: fc5bfix.uploaded, errors: fc5bfix.errors.length, warnings: fc5bfix.warnings })
       )
     } finally {
@@ -5451,7 +5450,7 @@ try {
       }
       check(
         `X3 malformed '${mode}' aborts round as incomplete scan`,
-        !!x3err && /扫描未完成/.test(x3err.message) && /解析失败/.test(x3err.message),
+        !!x3err && /没能完整读取文件列表/.test(x3err.message) && /无法识别/.test(String(x3err.detail || '')),
         x3err && x3err.message
       )
       check(
@@ -5652,7 +5651,7 @@ try {
     } catch (e) {
       sc1err = e
     }
-    check('SC1 syncNow rejects with explicit error when not ready', !!sc1err && /未就绪/.test(sc1err.message), sc1err && sc1err.message)
+    check('SC1 syncNow rejects with explicit error when not ready', !!sc1err && /还没准备好/.test(sc1err.message), sc1err && sc1err.message)
 
     // 挂上假 dbStorage 后的测试实例：空配置 → ready + 0 slots；未知目录 → 明确报错。
     // 保留此前装载的回收站桩（deleteLocalOne 依赖 shellTrashItem，
@@ -5675,14 +5674,14 @@ try {
     } catch (e) {
       sc1err2 = e
     }
-    check('SC1 syncNow unknown dir rejects explicitly', !!sc1err2 && /未找到同步目录/.test(sc1err2.message), sc1err2 && sc1err2.message)
+    check('SC1 syncNow unknown dir rejects explicitly', !!sc1err2 && /找不到这个同步文件夹/.test(sc1err2.message), sc1err2 && sc1err2.message)
     let sc1err3 = null
     try {
       await sc1.syncNow()
     } catch (e) {
       sc1err3 = e
     }
-    check('SC1 syncNow with no enabled dirs rejects explicitly', !!sc1err3 && /没有启用的同步目录/.test(sc1err3.message), sc1err3 && sc1err3.message)
+    check('SC1 syncNow with no enabled dirs rejects explicitly', !!sc1err3 && /没有正在开启的同步文件夹/.test(sc1err3.message), sc1err3 && sc1err3.message)
 
     // plugin-out / plugin-enter 事件转发（渲染层只经订阅接收，不自行注册钩子）
     const sc1events = []
@@ -5820,7 +5819,7 @@ try {
       const lastEnd = roundEnds()[roundEnds().length - 1]
       check(
         'SC2 cancelled round settles with cancelled semantics',
-        cancelRes.ok === false && /同步已中止/.test(cancelRes.error || '') && lastEnd.cancelled === true,
+        cancelRes.ok === false && /已取消同步/.test(cancelRes.error || '') && lastEnd.cancelled === true,
         JSON.stringify({ ok: cancelRes.ok, error: cancelRes.error, evCancelled: lastEnd.cancelled })
       )
       check(
@@ -6039,7 +6038,7 @@ try {
         const lostRound = [...events].reverse().find((e) => e.type === 'round-end' && e.error)
         check(
           'SC4 taken-over instance aborts in-flight round at file boundary (cancel semantics)',
-          lostEnd && lostRound.cancelled === true && /同步已中止/.test(lostRound.error || ''),
+          lostEnd && lostRound.cancelled === true && /已取消同步/.test(lostRound.error || ''),
           JSON.stringify(lostRound || {})
         )
         const abortLines4 = await waitAbortLine('PUT', '/dav/sc4/big-throttle.bin')
@@ -6059,7 +6058,7 @@ try {
           JSON.stringify(sched.getSnapshot().leader)
         )
         const lostRes = await lostP
-        check('SC4 syncNow of the aborted round surfaces the cancel error', lostRes.ok === false && /同步已中止/.test(lostRes.error || ''), JSON.stringify(lostRes.error))
+        check('SC4 syncNow of the aborted round surfaces the cancel error', lostRes.ok === false && /已取消同步/.test(lostRes.error || ''), JSON.stringify(lostRes.error))
         sched.cleanup()
       } finally {
         await fsp.rm(path.join(ROOT, '.wdsync-test-throttle'), { force: true }).catch(() => {})
@@ -6845,7 +6844,7 @@ try {
         const p1 = pendings()[0]
         check(
           'SC10 first deferred conflict emits pending event and notifies once',
-          p1 && p1.dirId === 'd1' && p1.newlyNotified === true && p1.items.some((it) => it.rel === 'c1.txt' && !it.choice) && notes.length === 1 && /1 个待处理冲突/.test(notes[0] || ''),
+          p1 && p1.dirId === 'd1' && p1.newlyNotified === true && p1.items.some((it) => it.rel === 'c1.txt' && !it.choice) && notes.length === 1 && /1 个文件需要你选择保留哪一个/.test(notes[0] || ''),
           JSON.stringify({ newly: p1 && p1.newlyNotified, notes: notes.length })
         )
         // 第 2 个 interval 轮：同一挂起集合 → 不再提醒（同批去重）
@@ -6872,7 +6871,7 @@ try {
         const lastPending = [...pendings()].pop()
         check(
           'SC10 a NEW pending set notifies again only after the previous one was handled',
-          notes.length === 2 && /1 个待处理冲突/.test(notes[1]) && lastPending && lastPending.newlyNotified === true && lastPending.items.some((it) => it.rel === 'c2.txt'),
+          notes.length === 2 && /1 个文件需要你选择保留哪一个/.test(notes[1]) && lastPending && lastPending.newlyNotified === true && lastPending.items.some((it) => it.rel === 'c2.txt'),
           JSON.stringify({ notes: notes.length, newly: lastPending && lastPending.newlyNotified })
         )
         // 「暂时忽略」：清除挂起（该文件再冲突时才重新询问），不触发提醒
@@ -6889,17 +6888,17 @@ try {
       const rBreaker = sr({ breaker: { open: true, consecutive: 5, reason: 'PUT 127.0.0.1:5360：HTTP 503' }, errors: [noise, noise, noise, 'other'] }, null, false)
       check(
         'SC10 summarizeRound: breaker tone with folded CIRCUIT_OPEN noise',
-        rBreaker.tone === 'breaker' && rBreaker.title === '服务器连续无响应' && /HTTP 503/.test(rBreaker.detail) && rBreaker.errors.length === 2 && rBreaker.errors[0].startsWith(noise) && rBreaker.errors[0].includes('共 3 次') && rBreaker.errors[1] === 'other',
+        rBreaker.tone === 'breaker' && rBreaker.title === '服务器一直没有响应，本次同步已暂停，稍后自动重试' && /HTTP 503/.test(rBreaker.detail) && rBreaker.errors.length === 2 && rBreaker.errors[0].startsWith(noise) && rBreaker.errors[0].includes('重复 3 次') && rBreaker.errors[1] === 'other',
         JSON.stringify(rBreaker)
       )
       const rPartial = sr({ deferredConflicts: 3, errors: [] }, null, false)
-      check('SC10 summarizeRound: deferred round reads as partial completion', rPartial.tone === 'partial' && rPartial.title === '部分完成，有 3 个待处理冲突', JSON.stringify(rPartial))
+      check('SC10 summarizeRound: deferred round reads as partial completion', rPartial.tone === 'partial' && rPartial.title === '部分完成：3 个文件等你选择', JSON.stringify(rPartial))
       const rCancel = sr(null, '同步已中止：用户取消', true)
       check('SC10 summarizeRound: cancelled tone', rCancel.tone === 'cancelled' && rCancel.title === '已取消同步', '')
       const rOk = sr({ errors: [] }, null, false)
       check('SC10 summarizeRound: clean round reads ok', rOk.tone === 'ok' && rOk.title === '同步完成', '')
       const rErr = sr({ errors: ['e1', 'e1'] }, null, false)
-      check('SC10 summarizeRound: repeated identical errors fold with count', rErr.tone === 'error' && rErr.errors.length === 1 && rErr.errors[0].includes('共 2 次'), JSON.stringify(rErr))
+      check('SC10 summarizeRound: repeated identical errors fold with count', rErr.tone === 'error' && rErr.errors.length === 1 && rErr.errors[0].includes('重复 2 次'), JSON.stringify(rErr))
     } finally {
       delete zt.showNotification
     }
@@ -7049,7 +7048,7 @@ try {
       pend1.length === 59 && pend1.every((p) => p.kind === 'delete' && !p.choice),
       `pendings=${pend1.length}`
     )
-    check('DS1 超阈值轮给出明确警告', b1.warnings.some((w) => /安全阈值/.test(w)), JSON.stringify(b1.warnings))
+    check('DS1 超阈值轮给出明确警告', b1.warnings.some((w) => /数量偏多/.test(w)), JSON.stringify(b1.warnings))
     // 确认前再跑一轮：挂起条目与阈值无关地持续等待确认（不因数量回落放行）
     const b2 = await services.sync.syncDirectory(cfg, dB(), SP, {})
     check('DS1 确认前跨轮持续零删除', b2.deleted === 0 && b2.deleteHeld === 59, JSON.stringify({ deleted: b2.deleted, deleteHeld: b2.deleteHeld }))
@@ -7119,7 +7118,7 @@ try {
     }
     check(
       'DS2 回收站失败跳过并记录（文件保留、基线保留）',
-      !!e1 && /删除本地文件失败/.test(e1.message) && fs.existsSync(path.join(L, 'c.txt')) && (await services.sync._internals.baselineEntry(d(), 'c.txt')) != null,
+      !!e1 && /未能放入回收站/.test(e1.message) && fs.existsSync(path.join(L, 'c.txt')) && (await services.sync._internals.baselineEntry(d(), 'c.txt')) != null,
       e1 && e1.message
     )
     check('DS2 失败路径确实调用了回收站 API（未绕过）', trashLog.some((p) => p.endsWith('c.txt')), trashLog.map((p) => path.basename(p)).join(','))
@@ -7135,7 +7134,7 @@ try {
     }
     check(
       'DS2 宿主无回收站接口跳过并记录（不删除）',
-      !!e2 && /回收站接口/.test(e2.message) && fs.existsSync(path.join(L, 'e.txt')) && (await services.sync._internals.baselineEntry(d(), 'e.txt')) != null,
+      !!e2 && /不支持放入回收站/.test(e2.message) && fs.existsSync(path.join(L, 'e.txt')) && (await services.sync._internals.baselineEntry(d(), 'e.txt')) != null,
       e2 && e2.message
     )
     trashMissing = false
@@ -7165,7 +7164,7 @@ try {
     }
     check(
       'DS3 根目录不存在 → 整轮中止，远端原样',
-      !!e1 && /本地同步根目录不可访问/.test(e1.message) && fs.readdirSync(path.join(ROOT, 'ds3')).length === 3,
+      !!e1 && /无法访问电脑上的同步文件夹/.test(e1.message) && fs.readdirSync(path.join(ROOT, 'ds3')).length === 3,
       e1 && e1.message
     )
     await fsp.rename(`${L}-gone`, L)
@@ -7181,7 +7180,7 @@ try {
       }
       check(
         'DS3 根目录不可读 → 整轮中止，远端原样',
-        !!e2 && /本地同步根目录不可读/.test(e2.message) && fs.readdirSync(path.join(ROOT, 'ds3')).length === 3,
+        !!e2 && /无法访问电脑上的同步文件夹/.test(e2.message) && fs.readdirSync(path.join(ROOT, 'ds3')).length === 3,
         e2 && e2.message
       )
       await fsp.chmod(L, 0o755)
@@ -7199,7 +7198,7 @@ try {
     }
     check(
       'DS3 空目录+非空基线（疑似未挂载/被清空）→ 整轮中止，远端原样',
-      !!e3 && /疑似目录未挂载|已被清空/.test(e3.message) && fs.readdirSync(path.join(ROOT, 'ds3')).length === 3,
+      !!e3 && /可能是移动硬盘或网络盘没连接|被清空/.test(e3.message) && fs.readdirSync(path.join(ROOT, 'ds3')).length === 3,
       e3 && e3.message
     )
     await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
@@ -7467,7 +7466,7 @@ try {
     )
     // 第二轮：退避期内规划层跳过 → 轮次成功（不再报错，仅提示）
     const s2 = await services.sync.syncDirectory(cfg, d, SP, {})
-    check('FN2 退避期内跳过（轮次成功 + 汇总提示）', s2.uploaded === 0 && s2.errors.length === 0 && s2.warnings.some((w) => /持续失败/.test(w)), JSON.stringify({ up: s2.uploaded, errs: s2.errors.length }))
+    check('FN2 退避期内跳过（轮次成功 + 汇总提示）', s2.uploaded === 0 && s2.errors.length === 0 && s2.warnings.some((w) => /一直同步失败/.test(w)), JSON.stringify({ up: s2.uploaded, errs: s2.errors.length }))
     // 重命名恢复：新 rel 无失败记录 → 自动恢复上传
     await fsp.rename(path.join(L, 'a<b.txt'), path.join(L, 'fixed.txt'))
     const s3 = await services.sync.syncDirectory(cfg, d, SP, {})
@@ -7494,7 +7493,7 @@ try {
     }
     check(
       'FN3 跨侧大小写冲突：零传输 + 明确报错（不静默覆盖）',
-      !!e1 && s1.uploaded === 0 && s1.downloaded === 0 && s1.errors.some((m) => /大小写冲突/.test(m) && m.includes('Case.txt') && m.includes('case.txt')),
+      !!e1 && s1.uploaded === 0 && s1.downloaded === 0 && s1.errors.some((m) => /只有大小写不同/.test(m) && m.includes('Case.txt') && m.includes('case.txt')),
       JSON.stringify(s1 && s1.errors)
     )
     check(
@@ -7528,7 +7527,7 @@ try {
       }
       check(
         'FN3 远端同名对：两个都不下载 + 报错',
-        !!e4 && s4.downloaded === 0 && s4.errors.some((m) => /大小写冲突/.test(m) && m.includes('Pair.txt') && m.includes('pair.txt')),
+        !!e4 && s4.downloaded === 0 && s4.errors.some((m) => /只有大小写不同/.test(m) && m.includes('Pair.txt') && m.includes('pair.txt')),
         JSON.stringify(s4 && s4.errors)
       )
       check('FN3 本地未落任何同名文件（下载即互相覆盖）', !fs.existsSync(path.join(L2, 'pair.txt')) && !fs.existsSync(path.join(L2, 'Pair.txt')), '')
@@ -7545,7 +7544,7 @@ try {
       } catch (e) {
         s6 = e.summary
       }
-      check('FN3 冲突复现：非冲突文件照常同步，冲突文件零传输', s6.uploaded === 1 && s6.downloaded === 0 && s6.errors.some((m) => /大小写冲突/.test(m)), JSON.stringify(s6 && s6.errors))
+      check('FN3 冲突复现：非冲突文件照常同步，冲突文件零传输', s6.uploaded === 1 && s6.downloaded === 0 && s6.errors.some((m) => /只有大小写不同/.test(m)), JSON.stringify(s6 && s6.errors))
       // 删除本地 pair.txt → delete-remote 放行（caseSkip 只挡传输，不挡删除传播）。
       // 本轮孪生仍在 → 冲突错误依旧存在（轮次 throw），断言基于 summary
       await fsp.rm(path.join(L2, 'pair.txt'))

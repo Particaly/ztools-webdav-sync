@@ -18,7 +18,7 @@ const statusText = computed(() =>
       <AppIcon name="cloud-sync" :size="18" />
     </div>
     <div class="flex flex-col gap-px">
-      <div class="app-name">WebDAV Sync</div>
+      <div class="app-name">WebDAV 同步</div>
       <div class="flex items-center gap-[5px]">
         <span class="dot" :class="store.connStatus.value" />
         <span class="text-[11px] text-ink-2 leading-[1.2]">{{ statusText }}</span>

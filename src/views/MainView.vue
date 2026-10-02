@@ -20,13 +20,13 @@ const store = useStore()
       <template v-if="store.configured.value">
         <div class="flex items-center gap-[7px]">
           <div class="flex items-center gap-[7px]">
-            <span class="text-[13px] font-semibold text-ink-1">同步目录</span>
+            <span class="text-[13px] font-semibold text-ink-1">同步文件夹</span>
             <span class="text-[11px] text-ink-4">{{ store.state.dirs.length }}</span>
           </div>
           <span class="flex-spacer" />
           <AppButton variant="primary" size="sm" @click="store.state.showAdd = true">
             <AppIcon name="plus" :size="13" />
-            添加目录
+            添加文件夹
           </AppButton>
         </div>
 
@@ -68,18 +68,18 @@ const store = useStore()
               />
             </svg>
           </div>
-          <h1 class="m-0 text-[18px] font-semibold text-ink-1">开始使用 WebDAV Sync</h1>
-          <p class="mt-[6px] mb-0 text-[12px] text-ink-2">连接 WebDAV 服务器，并选择需要同步的本地目录</p>
+          <h1 class="m-0 text-[18px] font-semibold text-ink-1">开始使用 WebDAV 同步</h1>
+          <p class="mt-[6px] mb-0 text-[12px] text-ink-2">连接你的网盘，再选择要同步的电脑文件夹</p>
           <div class="h-[22px]" />
           <div class="flex gap-[10px]">
             <AppButton variant="primary" size="lg" strong pad="0 16px" @click="store.state.route = 'settings'">
               <AppIcon name="cloud-up" :size="15" />
               配置 WebDAV
             </AppButton>
-            <AppButton size="lg" @click="store.openGuide()">了解 WebDAV</AppButton>
+            <AppButton size="lg" @click="store.openGuide()">WebDAV 是什么？</AppButton>
           </div>
           <div class="h-[26px]" />
-          <p class="m-0 text-[11px] text-ink-4">支持坚果云、Nextcloud、Synology 等标准 WebDAV 服务</p>
+          <p class="m-0 text-[11px] text-ink-4">支持坚果云、Nextcloud、群晖 NAS 等提供 WebDAV 功能的网盘</p>
         </div>
       </div>
     </main>
@@ -88,7 +88,7 @@ const store = useStore()
     <StatusBar v-if="store.configured.value" />
     <footer v-else class="flex items-center gap-2 h-[44px] px-4 bg-fill-bar border-t border-solid border-line-bar shrink-0">
       <AppIcon name="info" :size="13" class="text-ink-4" />
-      <span class="text-[12px] text-ink-2">首次使用？查看配置指南了解如何连接你的 WebDAV 服务器</span>
+      <span class="text-[12px] text-ink-2">第一次使用？看看教程，学会怎么连接网盘</span>
       <button type="button" class="help-link" @click="store.openGuide()">查看指南</button>
     </footer>
 

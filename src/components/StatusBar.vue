@@ -7,10 +7,10 @@ import { fmtRelTime } from '../composables/format'
 
 const store = useStore()
 
-const leftText = computed(() => `共 ${store.state.dirs.length} 个同步目录`)
+const leftText = computed(() => `共 ${store.state.dirs.length} 个同步文件夹`)
 const syncLabel = computed(() => {
   const pending = store.conflictPendingCount.value
-  if (pending > 0) return `最近一次同步：${fmtRelTime(store.lastSyncAt.value)} · ${pending} 个冲突待处理`
+  if (pending > 0) return `最近一次同步：${fmtRelTime(store.lastSyncAt.value)} · ${pending} 项待处理`
   return `${store.anySyncing.value ? '上次同步' : '最近一次同步'}：${fmtRelTime(store.lastSyncAt.value)}`
 })
 </script>
