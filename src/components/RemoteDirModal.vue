@@ -23,8 +23,10 @@ const props = withDefaults(
     initialPath?: string
     /** 弹窗标题 */
     title?: string
+    /** 弹窗副标题：说明本次选择的用途（同步位置 / 功能测试目录等） */
+    subtitle?: string
   }>(),
-  { initialPath: '', title: '选择云端文件夹' }
+  { initialPath: '', title: '选择云端文件夹', subtitle: '选择云端的一个文件夹作为同步位置' }
 )
 
 const emit = defineEmits<{ pick: [path: string]; close: [] }>()
@@ -126,7 +128,7 @@ onMounted(() => {
 <template>
   <AppModal
     :title="title"
-    subtitle="选择云端的一个文件夹作为同步位置"
+    :subtitle="subtitle"
     :width="380"
     @close="emit('close')"
   >
@@ -210,10 +212,12 @@ onMounted(() => {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    transition: background 0.12s ease;
 
     &:hover:not(.current) {
       background: var(--bg-badge);
       text-decoration: underline;
+      text-underline-offset: 2px;
     }
 
     // 当前级不可点，弱化为正文色
@@ -248,6 +252,7 @@ onMounted(() => {
     padding: 7px 8px;
     border-radius: 6px;
     text-align: left;
+    transition: background 0.12s ease;
 
     &:hover {
       background: var(--bg-seg);

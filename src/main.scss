@@ -8,8 +8,8 @@
   /* 文字 */
   --text-1: #202124;
   --text-2: #5f6368;
-  --text-3: #7c8287;
-  --text-muted: #9aa0a6;
+  --text-3: #757b81;
+  --text-muted: #8b9199;
   --icon-dark: #4a5056;
   --btn-text: #3a3f44;
 
@@ -26,7 +26,10 @@
   --amber-deep: #8a5a0b;
   --amber-icon: #d97706;
   --amber-bg: #fffbf3;
+  --amber-strip-br: #f0e0c4;
   --red: #ea4335;
+  --red-strip-bg: #fdf3f2;
+  --red-strip-br: #f4d7d4;
 
   /* 边框与背景 */
   --br-window: #e1e5ea;
@@ -42,14 +45,17 @@
   --bg-track: #edf0f3;
   --overlay: rgba(33, 41, 51, 0.5);
 
-  /* 字体 */
-  --font-ui: 'Inter', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  /* 字体：拉丁优先系统级 San Francisco / Inter，中文回落苹方 / 雅黑 */
+  --font-ui: -apple-system, 'Inter', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Courier New', monospace;
 
   /* 阴影 */
   --shadow-card: 0 1px 2px rgba(33, 41, 51, 0.04);
   --shadow-btn: 0 1px 3px var(--blue-shadow);
   --shadow-pop: 0 6px 20px rgba(33, 41, 51, 0.12);
+
+  /* 键盘焦点环（:focus-visible 专用，鼠标点击不出现） */
+  --focus-ring: 0 0 0 2px #fff, 0 0 0 4px rgba(26, 115, 232, 0.4);
 }
 
 /* 基础样式（轻量 reset，保持与原版一致） */
@@ -64,8 +70,10 @@ body {
   color: var(--text-1);
   background: #fff;
   font-size: 12px;
-  line-height: 1.4;
+  /* 中文正文 1.5 行高：11px 提示文字不挤，标题按需局部收紧 */
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
   user-select: none;
 }
 
@@ -82,9 +90,20 @@ input {
   font-family: inherit;
 }
 
+/* body 全局禁选中文本，但输入控件必须可选中（复制地址 / 密码） */
+input,
+textarea {
+  user-select: text;
+}
+
+/* 鼠标交互不画 outline；键盘 Tab 导航用统一焦点环（box-shadow，避免与圆角冲突） */
 input:focus,
 button:focus {
   outline: none;
+}
+
+button:focus-visible {
+  box-shadow: var(--focus-ring);
 }
 
 input::placeholder {
@@ -245,6 +264,25 @@ input::placeholder {
   transition: transform 0.3s var(--ease-swift);
 }
 
+/* ============================================================
+   InfoTip 行内问号说明
+   位于 .pref-row（设置行）内时默认隐藏问号图标，悬停整行时浮现；
+   聚焦（键盘 Tab）与气泡打开期间保持可见。其余位置始终显示。
+   ============================================================ */
+.info-tip {
+  transition: opacity 0.12s ease;
+}
+
+.pref-row .info-tip:not(.is-open) {
+  opacity: 0;
+}
+
+.pref-row:hover .info-tip,
+.pref-row .info-tip:focus-within,
+.pref-row .info-tip.is-open {
+  opacity: 1;
+}
+
 /* 轻量入场：块级内容自下方浮起（空状态、行内提示条） */
 @keyframes rise-in {
   from {
@@ -289,14 +327,16 @@ input::placeholder {
   }
 }
 
-/* 尊重系统「减弱动态效果」设置：动画与过渡降为瞬时 */
+/* 尊重系统「减弱动态效果」设置：动画与过渡降为瞬时（含入场延迟一并清零） */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    animation-delay: 0s !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
     scroll-behavior: auto !important;
   }
 }

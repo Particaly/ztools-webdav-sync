@@ -1,29 +1,41 @@
 /**
- * 存储层（src-ztools/preload/store.js）独立单元测试。
+ * 存储层（src-ztools/preload/store.mts）独立单元测试（vitest 迁移版）。
  * 覆盖：半行日志、CRC 错误、压缩中途崩溃、快照损坏、日志重放幂等、
  * WAL 生命周期、deviceId 稳定性、5 万条目加载耗时与内存、
  * 凭据混淆 AES-256-GCM（U17）。
- * 用法：node test/store-unit.mjs
+ * 运行：npx vitest run test/unit（或 npm run test:unit）
+ *
+ * 结构说明：用例链强顺序依赖（U3 直接改 U2 的日志文件、U4 改 U3 的……），
+ * 因此整体保持单一 test 顺序执行；check() 沿用软失败登记 + 末尾一次性抛出，
+ * 语义与旧 node 脚本一致（所有用例跑完、失败清单一次列出）。
  */
-import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { test } from 'vitest'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const PRELOAD = path.join(HERE, '..', 'src-ztools', 'preload')
+const PRELOAD = path.join(HERE, '..', '..', 'src-ztools', 'preload')
 
 const results = []
 function check(name, cond, detail = '') {
   results.push({ name, ok: !!cond })
+  // 迁移对拍通道：设置 WDSYNC_E2E_JSONL=<路径> 时逐用例追加 JSONL
+  if (process.env.WDSYNC_E2E_JSONL) {
+    try {
+      fs.appendFileSync(process.env.WDSYNC_E2E_JSONL, JSON.stringify({ section: 'store-unit', name, ok: !!cond }) + '\n')
+    } catch (_) {
+      /* 对拍输出失败不影响测试本身 */
+    }
+  }
   console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
 }
 
 // CJS 模块经 ESM 动态 import 取 module.exports
 const store = await import(pathToFileURL(path.join(PRELOAD, 'store.mts')).href)
-const ROOT = path.join(os.tmpdir(), `wdsync-store-unit-${Date.now()}`)
+const ROOT = path.join(os.tmpdir(), `wdsync-store-unit-${Date.now()}-${process.pid}`)
 await fsp.mkdir(ROOT, { recursive: true })
 // 显式切到本次运行的独立根：避免命中跨运行持久化的 fallback 目录
 await store.setRootForTest(ROOT)
@@ -40,7 +52,8 @@ const entryOf = (n) => ({
   retag: `"e${n}"`,
 })
 
-try {
+test('存储层单元（U1–U18，强顺序链）', async () => {
+  try {
   // U1 deviceId：同根稳定、跨根隔离
   const id1 = await store.getDeviceId()
   const id1b = await store.getDeviceId()
@@ -525,7 +538,7 @@ try {
       re != null && re.lastFullScanAt === 1700000000000 && re.collections['a'].e === '"x"' && re.collections['a'].e !== re.collections['a/b'].e && re.collections['a/b'].m === 1699999000000,
       JSON.stringify(re)
     )
-    // 磁盘形状契约：保存对象原样落盘（引擎外的消费方 / 测试直改文件的前提）
+    // 磁盘形状契约：保存对象原样落盘（引擎外的消费方 / 测试直接改文件的前提）
     const onDisk = JSON.parse(await fsp.readFile(path.join(scDirP, 'scan-cache.json'), 'utf-8'))
     check('U18 on-disk content matches the saved object', JSON.stringify(onDisk) === JSON.stringify(cacheObj))
     // 损坏 → null + warning（只记一次，不跨调用刷屏）
@@ -609,9 +622,9 @@ try {
   // preload 侧引擎与调度器源码不得出现裸全局 setTimeout/setInterval/clearTimeout/
   // clearInterval 调用 —— 宿主 contextIsolation:false 下 preload 的全局计时器就是
   // Blink DOM timer，页面真进入 hidden 后被钳到 ≥1s（实测），
-  // 隐藏态后台轮的锁静置 / 续租 / 退避 / 取消轮询都会被拖到分钟级。只允许经
+  // 隐藏态后台轮的锁静置 / 续租 / 取消轮询都会被拖到分钟级。只允许经
   // node:timers 的引用（nodeTimers.xxx 形态；成员调用的点前缀使其与裸调用可区分）。
-  // 构建产物（dist/services.js）的同项检查在 e2e --built 模式下执行（彼时刚重新构建）。
+  // 构建产物（dist/services.js）的同项检查在 e2e built 模式下执行（彼时刚重新构建）。
   // 附带守护：crashResidueSweep 等测试后门只存在于 sync._internals，不得进入渲染层类型。
   {
     const bareTimerRe = /(?<![.\w$])(setTimeout|setInterval|clearTimeout|clearInterval)\s*\(/
@@ -630,15 +643,18 @@ try {
         offending.slice(0, 3).map(([n, l]) => `L${n}: ${l.trim().slice(0, 70)}`).join(' | ')
       )
     }
-    const envSrc = fs.readFileSync(path.join(HERE, '..', 'src', 'env.d.ts'), 'utf-8')
+    const envSrc = fs.readFileSync(path.join(HERE, '..', '..', 'src', 'env.d.ts'), 'utf-8')
     check('U16 renderer types keep _internals / crashResidueSweep out of public API', !/_internals|crashResidueSweep/.test(envSrc))
   }
-} catch (e) {
-  check('unexpected error', false, e && e.stack ? e.stack.split('\n').slice(0, 4).join(' | ') : String(e))
-} finally {
-  await fsp.rm(ROOT, { recursive: true, force: true }).catch(() => {})
-}
+  } catch (e) {
+    check('unexpected error', false, e && e.stack ? e.stack.split('\n').slice(0, 4).join(' | ') : String(e))
+  } finally {
+    await fsp.rm(ROOT, { recursive: true, force: true }).catch(() => {})
+  }
 
-const failed = results.filter((r) => !r.ok)
-console.log(`\n===== ${results.length - failed.length}/${results.length} passed =====`)
-process.exit(failed.length ? 1 : 0)
+  const failed = results.filter((r) => !r.ok)
+  console.log(`\n===== ${results.length - failed.length}/${results.length} passed =====`)
+  if (failed.length) {
+    throw new Error(`存储层单元测试 ${failed.length} 项失败：\n${failed.map((f) => `  ❌ ${f.name}`).join('\n')}`)
+  }
+})

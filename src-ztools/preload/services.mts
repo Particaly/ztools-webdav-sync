@@ -35,6 +35,9 @@ import type {
   DavCapabilities,
   DavConfig,
   DavTier,
+  DeleteBatch,
+  DeleteBatchNode,
+  DeleteScope,
   NetOpts,
   Prefs,
   SyncMode,
@@ -217,6 +220,172 @@ const DELETE_BATCH_MIN = 50
 const DELETE_BATCH_RATIO = 0.2
 
 /**
+ * 批量删除快照的节点上限：目录树聚合后（目录节点 + 文件叶）超过此数时，从最深的
+ * 目录开始折叠（子节点收拢进父目录的聚合计数，父目录仍可整体决策），直到不超；
+ * 全平树（没有目录层可折叠）最后按 rel 排序截断。UI 的树形展示与目录级决策只依赖
+ * 目录结构，折叠 / 截断不影响「按目录决策」「全部决策」的完整性（total / bytes
+ * 始终是全量真值）。
+ */
+const MAX_BATCH_NODES = 3000
+
+/** 批量删除快照的聚合输入：rel → 本地文件大小（字节数，用于「影响多少数据」展示） */
+type DeleteBatchMembers = Map<string, number>
+
+/**
+ * 把「全部未决策删除候选」（rel → 大小）聚合成批量删除快照的目录树：
+ * 逐文件建 trie（目录节点 + 文件叶），后序聚合子树文件数与字节数；节点总数超
+ * MAX_BATCH_NODES 时按深度从深到浅折叠目录（折叠 = 清空其子节点，聚合计数留在
+ * 目录节点上，用户可对该目录整体决策），全平树折叠不动时按 rel 排序截断。
+ * 纯函数：不触碰存储，输出形态见 types.mts 的 DeleteBatch / DeleteBatchNode。
+ * @param members 未决策删除候选（nfc 归一 rel → 本地大小）
+ * @param at 快照构建时刻（毫秒）
+ */
+function buildDeleteBatch(members: DeleteBatchMembers, at: number): DeleteBatch {
+  interface TrieNode {
+    name: string
+    children: Map<string, TrieNode>
+    isDir: boolean
+    files: number
+    bytes: number
+  }
+  const newnode = (name: string, isDir: boolean): TrieNode => ({ name, children: new Map(), isDir, files: 0, bytes: 0 })
+  const root = newnode('', true)
+  for (const [rel, size] of members) {
+    const segs = rel.split('/')
+    let cur = root
+    for (let i = 0; i < segs.length - 1; i++) {
+      const seg = segs[i]
+      let next = cur.children.get(seg)
+      if (!next) {
+        next = newnode(seg, true)
+        cur.children.set(seg, next)
+      }
+      cur = next
+    }
+    const leafName = segs[segs.length - 1]
+    let leaf = cur.children.get(leafName)
+    if (!leaf) {
+      leaf = newnode(leafName, false)
+      cur.children.set(leafName, leaf)
+    }
+    leaf.files = 1
+    leaf.bytes = Math.max(0, Number(size) || 0)
+  }
+  // 后序聚合：目录节点的 files / bytes = 直接文件叶 + 子目录聚合
+  let totalFiles = 0
+  let totalBytes = 0
+  const dirsByDepth: Array<{ node: TrieNode; rel: string; depth: number }> = []
+  const agg = (node: TrieNode, rel: string, depth: number): void => {
+    let files = 0
+    let bytes = 0
+    for (const child of node.children.values()) {
+      const childRel = rel ? `${rel}/${child.name}` : child.name
+      if (child.isDir) {
+        agg(child, childRel, depth + 1)
+        dirsByDepth.push({ node: child, rel: childRel, depth: depth + 1 })
+        files += child.files
+        bytes += child.bytes
+      } else {
+        files += 1
+        bytes += child.bytes
+      }
+    }
+    node.files = files
+    node.bytes = bytes
+    if (node.isDir && node.children.size === 0) {
+      // 空目录占位（理论上不会出现 —— 目录节点只随文件叶创建），防御性归零
+      node.files = 0
+      node.bytes = 0
+    }
+  }
+  agg(root, '', 0)
+  for (const child of root.children.values()) {
+    if (child.isDir) totalFiles += child.files
+    else totalFiles += 1
+    totalBytes += child.bytes
+  }
+  // 折叠：从最深的目录开始，把子节点收拢进目录节点（目录本身保留，仍可整体决策）
+  dirsByDepth.sort((a, b) => b.depth - a.depth)
+  const countNodes = (node: TrieNode): number => {
+    let n = 1
+    for (const c of node.children.values()) n += countNodes(c)
+    return n
+  }
+  let nodeCount = countNodes(root) - 1 // 根（同步目录本身）不是快照节点
+  for (const { node } of dirsByDepth) {
+    if (nodeCount <= MAX_BATCH_NODES) break
+    if (node.children.size === 0) continue
+    nodeCount -= countNodes(node) - 1
+    node.children.clear()
+  }
+  // 摊平输出（深度优先，目录在前）；仍超上限（全平树无目录可折叠）按 rel 排序截断
+  const nodes: DeleteBatchNode[] = []
+  const emit = (node: TrieNode, rel: string): void => {
+    const childRels: Array<[TrieNode, string]> = []
+    for (const child of node.children.values()) {
+      const childRel = rel ? `${rel}/${child.name}` : child.name
+      childRels.push([child, childRel])
+    }
+    childRels.sort((a, b) => (a[0].isDir === b[0].isDir ? a[1].localeCompare(b[1]) : a[0].isDir ? -1 : 1))
+    for (const [child, childRel] of childRels) {
+      nodes.push({ rel: childRel, isDir: child.isDir, files: child.isDir ? child.files : 1, bytes: child.bytes })
+      if (child.isDir) emit(child, childRel)
+    }
+  }
+  emit(root, '')
+  if (nodes.length > MAX_BATCH_NODES) nodes.length = MAX_BATCH_NODES
+  return { at, total: totalFiles, bytes: totalBytes, nodes }
+}
+
+/**
+ * 计算「快照中未被任何 scope 覆盖的文件数」（listDeleteBatch 的 undecided 字段）：
+ * 从树顶往下走，节点命中任一 scope（本节点或祖先在 scope 前缀之下）即整块计入
+ * 已覆盖、不再下钻 —— scope 覆盖天然含其子树；多 scope 重叠经「先命中先吸收」
+ * 天然去重。快照因截断没逐个列出的文件按其所在目录节点的聚合口径参与计算。
+ * 纯函数；scopes 为空时未决策数 = total。
+ * @param batch 批量删除快照
+ * @param scopes 当前生效的删除范围决策
+ */
+function computeUndecidedFiles(batch: DeleteBatch, scopes: DeleteScope[]): number {
+  if (!scopes.length) return batch.total
+  const hit = (rel: string): boolean =>
+    scopes.some((s) => s.prefix === '' || s.prefix === rel || rel.startsWith(s.prefix + '/'))
+  // 根层逐个扫描顶层节点（根本身不可决策，空前缀 scope 在下探前先判）
+  let covered = 0
+  const walk = (node: DeleteBatchNode): void => {
+    if (hit(node.rel)) {
+      covered += node.files
+      return
+    }
+    // 子节点关系由 rel 前缀推断：只下探直接子层（找以 node.rel + '/' 开头的节点）
+    const prefix = node.rel + '/'
+    for (const child of batch.nodes) {
+      if (child.rel.startsWith(prefix) && !child.rel.slice(prefix.length).includes('/')) walk(child)
+    }
+  }
+  for (const n of batch.nodes) {
+    if (!n.rel.includes('/')) walk(n)
+  }
+  return Math.max(0, batch.total - covered)
+}
+
+/**
+ * rel 是否落在删除范围决策的前缀之内（与 DirStateStore.matchDeleteScope 同一
+ * 匹配规则：rel === prefix、rel 在 prefix 目录之下、或 prefix 为空 = 全部）。
+ * 独立纯函数：setDeleteScope 无快照时按逐文件记录计算覆盖数复用。
+ */
+function scopeHitsRel(prefix: string, rel: string): boolean {
+  return prefix === '' || prefix === rel || rel.startsWith(prefix + '/')
+}
+
+/**
+ * 远端根丢失决策挂起的 rel 键（'.' 不可能是文件相对路径，与逐文件挂起天然无碰撞）：
+ * 远端同步根 404 且本地基线非空时，整目录级决策（重新上传 / 移除本地）登记为
+ * kind='root-lost' 的挂起记录，选择经 setPendingChoice 落地、下一轮根探测消费。
+ */
+const ROOT_LOST_PENDING_REL = '.'
+
+/**
  * 长阶段分片让出：批处理循环每 YIELD_EVERY 条目实际让出一次事件循环。
  * 动机：await 一个已就绪的 Promise 只排微任务，node:timers 的回调（调度器 5s 心跳 /
  * 1s tick，走 libuv 定时器阶段）得不到执行机会 —— 数万条目的紧凑规划 / 批量校验 /
@@ -357,7 +526,7 @@ function createMultistatusStream(): any {
   let firstError: any = null
   let cur: any = null // 当前 <response> 的累积条目
   let capture: any = null // 正在收集文本的 prop：{ field, buf }
-  const FIELDS = new Set(['href', 'getcontentlength', 'getlastmodified', 'getetag'])
+  const FIELDS = new Set(['href', 'getcontentlength', 'getlastmodified', 'getetag', 'status'])
   parser.on('error', (e) => {
     if (firstError == null) firstError = e
   })
@@ -390,6 +559,7 @@ function createMultistatusStream(): any {
       if (capture.field === 'href') cur.href = v
       else if (capture.field === 'getcontentlength') cur.size = Number(v) || 0
       else if (capture.field === 'getlastmodified') cur.mtime = v ? Date.parse(v) || 0 : 0
+      else if (capture.field === 'status') cur.status = v
       else cur.etag = v
       capture = null
       return
@@ -403,7 +573,7 @@ function createMultistatusStream(): any {
       } catch (_) {
         /* 保留原值 */
       }
-      entries.push({ href, isDir: cur.isDir, size: cur.size, mtime: cur.mtime, etag: cur.etag })
+      entries.push({ href, isDir: cur.isDir, size: cur.size, mtime: cur.mtime, etag: cur.etag, status: cur.status || '' })
       cur = null
     }
   })
@@ -1183,6 +1353,8 @@ function acceptRemoteItem(files: Map<string, any>, probeResidue: Array<{ rel: st
  * 与本地扫描对齐的安全性要求：
  *   - 根目录 / 子目录 PROPFIND 404 一律记为「无法确认」而不是「远端已删除」：
  *     子树缺失可能来自权限、瞬时故障或挂载前缀变化，绝不能触发删除传播。
+ *     同口径覆盖「207 + 根条目 404 propstat」形态（部分网关对缺失路径不回
+ *     HTTP 404 状态）：集合自身条目携带 404 propstat 时同样上报根缺失。
  *   - 非 207 响应同样记为扫描错误。complete === false 时调用方必须禁止本轮删除。
  *   - 同步系统自身文件（SYNC_SKIP_NAMES）与引擎临时文件在 ignoreHidden
  *     判定之前一律排除：它们不是用户业务文件，ignoreHidden=false 时同样不可进入候选集合。
@@ -1269,7 +1441,18 @@ async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreHidden: 
           // href 为集合自身的条目返回空 rel；infinity 响应的其余条目 rel 即
           // 相对同步根的完整路径（可能多段）
           const rel = relFromHref(cfg, base, item.href).replace(/\/+$/, '')
-          if (!rel) continue
+          if (!rel) {
+            // 集合自身条目携带 404 propstat = 服务器以 207 形态告知「集合不存在」
+            //（部分网关 / 服务对缺失路径不回 HTTP 404 状态，而是 207 + 404 propstat；
+            // 根探测 Depth:0 也只见 207）。与 HTTP 404 分支同语义上报，交由 I1 闸门
+            // 的根丢失兜底接管 —— 绝不能解读成「远端为空」触发批量删除
+            if (/404/.test(String(item.status || ''))) {
+              complete = false
+              errors.push({ rel: '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
+              return { files, complete, errors, probeResidue, depth: 'infinity', collections, skippedDirs }
+            }
+            continue
+          }
           acceptRemoteItem(files, probeResidue, rel, item, !rel.includes('/'), ignoreHidden, excludeMatcher)
         }
         await harvestCollections()
@@ -1331,7 +1514,16 @@ async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreHidden: 
     }
     for (const item of items) {
       const childRel = relFromHref(cfg, cur, item.href)
-      if (!childRel) continue // 集合自身
+      if (!childRel) {
+        // 集合自身条目（根级 = prefix 为空）：携带 404 propstat 时与 infinity 分支
+        // 同语义上报根缺失 —— 否则该 207 会被解读成「远端为空」，非空基线下
+        // 规划出批量 delete-local（仅靠删除阈值兜底）
+        if (!prefix && /404/.test(String(item.status || ''))) {
+          complete = false
+          errors.push({ rel: '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
+        }
+        continue // 集合自身
+      }
       const rel = prefix ? `${prefix}/${childRel.replace(/\/+$/, '')}` : childRel.replace(/\/+$/, '')
       if (acceptRemoteItem(files, probeResidue, rel, item, !prefix, ignoreHidden, excludeMatcher) && item.isDir) {
         // 子集合 etag 跳过判定：缓存有该子集合的非空 etag 且与
@@ -3682,8 +3874,10 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     errorsDropped: 0,
     /** 批量删除确认挂起数：超过阈值的待删整批登记「待确认删除」，确认前零删除 */
     deleteHeld: 0,
-    /** 用户选择「保留不删」（删除挂起 choice='keep'）而抑制的删除数 */
+    /** 用户选择「保留不删」（删除挂起 choice='keep'）而抑制的删除数（仅 delete-remote：云端副本保留） */
     deleteKept: 0,
+    /** 「不删除」决策命中 delete-local（云端已缺、本地完好）而恢复上传的文件数（云端副本由本地上传恢复） */
+    deleteRestored: 0,
     /** 远端根重建保护跳过的删除数（待重新上传和解，清零后恢复删除传播） */
     deleteRootGuard: 0,
     /** 空目录清理：本地 / 远端移除的空目录数（仅清理因本轮同步删除而变空的目录） */
@@ -3712,7 +3906,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     else summary.errorsDropped++
   }
 
-  onProgress({ phase: 'scan', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 })
+  onProgress({ phase: 'scan', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, stage: 'scan' })
 
   // 清理上一轮崩溃残留的临时文件，再进入扫描 —— 避免清理与扫描器竞态
   await cleanupOrphanTemps(dir.localPath)
@@ -3766,10 +3960,112 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   //    扫描期失败的错误附带 failureClass（调度层跨轮退避的机器可读输入）——
   //    5xx/429/423 归 network（与 networkFailure 同口径），401/403/404 等配置类归 other
   const rootProbe = await davRequest(cfg, 'PROPFIND', dir.remotePath, { isCollection: true, headers: { Depth: '0' } })
-  if (rootProbe.status === 404) await mkdirDeep(cfg, dir.remotePath)
-  else if (rootProbe.status >= 400) {
+  // 根探测状态归一：部分网关 / 服务对缺失集合不回 HTTP 404，而是 207 + 集合自身
+  // 条目携带 404 propstat（扫描层 listRemoteSafe 对同形态另有识别，此处归一后
+  // 下游的决策闸 / 选择消费 / 重建逻辑全部按 404 复用）。解析失败按状态码原语义。
+  let rootProbeStatus = rootProbe.status
+  if (rootProbeStatus === 207 || rootProbeStatus === 200) {
+    try {
+      const probeItems = parseMultistatus(rootProbe.body ? rootProbe.body.toString('utf-8') : '')
+      const selfGone = probeItems.some(
+        (it: any) => it && !relFromHref(cfg, dir.remotePath, it.href).replace(/\/+$/, '') && /404/.test(String(it.status || ''))
+      )
+      if (selfGone) rootProbeStatus = 404
+    } catch (_) {
+      /* 畸形 body：按状态码判定（207 → 照常进入扫描，由扫描层给结论） */
+    }
+  }
+  // 本轮是否处于「移除本地」决策的执行态（choice 消费轮或标记延续轮）：
+  // 仅用于 rootWasRebuilt 处的提示文案分支（移除轮不能说「文件会重新上传」）
+  let rootRemovalArmed = false
+  /**
+   * 远端根丢失的统一停轮：登记（或沿用）kind='root-lost' 待决策挂起并抛出
+   * root-lost 错误 —— 决策落地前零删除零传输。登记条目 local.size 携带受影响的
+   * 基线文件数（决策弹窗展示用）；已有挂起（含已带 choice 的）不覆盖，避免把
+   * 用户已做出的选择冲掉。调度器据 summary.rootLostHeld 触发一次性系统提醒，
+   * 渲染层据 pending-conflicts 事件弹出决策弹窗。
+   */
+  const stopForRootLost = async (): Promise<never> => {
+    const existing = store.getPending(ROOT_LOST_PENDING_REL)
+    if (!existing || existing.kind !== 'root-lost') {
+      store.setPending(ROOT_LOST_PENDING_REL, {
+        kind: 'root-lost',
+        local: { size: store.entries.size, mtimeMs: Date.now() },
+        remote: { size: 0, mtimeMs: 0, etag: '' },
+        createdAt: Date.now(),
+      })
+      await store.savePendings().catch(() => {})
+    }
+    // summary 附在错误上：调度器 round-end 事件用它把 rootLostHeld 送达渲染层
+    //（弹决策弹窗），并作为一次性系统提醒的触发输入
+    summary.rootLostHeld = 1
+    throw syncFail(`云端同步文件夹「${dir.remotePath}」已不存在，需要你确认处理方式：把电脑上的文件重新上传到云端，或把电脑上已同步的文件也删除`, {
+      phase: 'root-lost',
+      failureClass: 'other',
+      summary,
+    })
+  }
+  if (rootProbeStatus === 404) {
+    if (store.entries.size === 0) {
+      // 基线为空（首次同步 / 内容已和解）：无内容可保护，维持自动重建
+      await mkdirDeep(cfg, dir.remotePath)
+    } else {
+      // ---- 远端根丢失决策闸（基线非空：本地有内容，去留必须由用户决定）----
+      // 云端同步根消失可能是「用户在网页端删除了它」（此时自动重建 + 全量重传会
+      // 违背用户意图），也可能是服务器瞬时故障 / 目录被挪动 —— 引擎无法区分，
+      // 因此不再自动重建，挂起等待用户二选一：
+      //   upload       —— 重建云端文件夹并按根重建保护语义恢复上传（既有 DS4 链路）；
+      //   remove-local —— 跟随云端删除：meta.rootLostRemoval 标记使规划期的
+      //                   delete-local 按用户已确认执行（移入回收站），未决的逐文件
+      //                   删除确认挂起随之作废（根级决策已覆盖其问题）。
+      // 选择前每轮以 root-lost 错误收场（不重建、不传输、零删除）；根在决策前恢复
+      // （挪动回去 / 服务器瞬时 404）则挂起记录自动撤销，无需用户操作。
+      const lostRec = store.getPending(ROOT_LOST_PENDING_REL)
+      const lostChoice = lostRec && lostRec.kind === 'root-lost' ? lostRec.choice : undefined
+      if (lostChoice === 'upload') {
+        // 消费「重新上传」选择。保护标记先于 MKCOL 写入：建根失败（网络瞬时故障）
+        // 的重试轮命中下方 rootRebuilt 分支继续恢复，不再重复打扰用户
+        store.clearPending(ROOT_LOST_PENDING_REL)
+        await store.savePendings().catch(() => {})
+        if (!store.meta.rootRebuilt) store.meta.rootRebuilt = { at: Date.now() }
+        await store.saveMeta().catch(() => {})
+        await mkdirDeep(cfg, dir.remotePath)
+      } else if (lostChoice === 'remove-local' || store.meta.rootLostRemoval) {
+        // 消费「移除本地」选择（或标记延续轮：上轮选择后未和解完毕）。标记先于
+        // MKCOL 写入，建根失败的重试轮直接走同一分支；未决的逐文件删除确认挂起
+        // 在首次消费时作废（根级「移除」已回答它们的问题；keep 保留类不受影响，
+        // 由逐文件挂起独立持续抑制）
+        if (!store.meta.rootLostRemoval) {
+          store.meta.rootLostRemoval = { at: Date.now() }
+          for (const p of store.listPending()) {
+            if (p.kind === 'delete') store.clearPending(p.rel)
+          }
+        }
+        if (lostRec) {
+          store.clearPending(ROOT_LOST_PENDING_REL)
+          await store.savePendings().catch(() => {})
+        }
+        await store.saveMeta().catch(() => {})
+        await mkdirDeep(cfg, dir.remotePath)
+        rootRemovalArmed = true
+      } else if (store.meta.rootRebuilt) {
+        // 恢复进行中（此前已选「重新上传」且尚未和解，根又一次 404）：按既有保护
+        // 语义继续重建重传，不再打断 —— 决策只在「全新丢失」时询问一次
+        await mkdirDeep(cfg, dir.remotePath)
+      } else {
+        // 未决策（首次发现或重试）：登记挂起并停轮
+        await stopForRootLost()
+      }
+    }
+  } else if (rootProbeStatus >= 400) {
     const st = rootProbe.status
     throw syncFail(`无法访问云端文件夹（HTTP ${st}）`, { phase: 'scan', failureClass: st === 429 || st === 423 || st >= 500 ? 'network' : 'other' })
+  } else if (store.getPending(ROOT_LOST_PENDING_REL)) {
+    // 根已恢复（决策前用户把文件夹挪了回来 / 服务器瞬时 404）：撤销未决策的挂起，
+    // 本轮照常同步。meta.rootLostRemoval 不在此撤销 —— 移除执行未和解完毕前必须
+    // 延续（见轮末解除判定），其语义不受根恢复影响
+    store.clearPending(ROOT_LOST_PENDING_REL)
+    await store.savePendings().catch(() => {})
   }
   /**
    * 远端根 404 后被重建（本轮探测到 404 并 MKCOL）且本地基线非空：
@@ -3781,10 +4077,14 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
    *（全部基线文件要么重新上传成功、要么两侧皆无），届时自动恢复正常删除传播。
    * 用户经挂起通道显式确认过的删除（kind='delete', choice='delete'）不受此保护拦截。
    */
-  const rootWasRebuilt = rootProbe.status === 404 && store.entries.size > 0
+  const rootWasRebuilt = rootProbeStatus === 404 && store.entries.size > 0
   if (rootWasRebuilt) {
     if (!store.meta.rootRebuilt) store.meta.rootRebuilt = { at: Date.now() }
-    pushWarning(`云端的同步文件夹之前丢失了，已重新创建。为防止误删，暂时不会同步「删除」操作，电脑上的文件会重新上传，恢复后自动正常`)
+    pushWarning(
+      rootRemovalArmed
+        ? '云端文件夹已按你的选择重建，电脑上已同步的文件将被移除（有改动的文件会保留并重新上传）'
+        : '云端的同步文件夹之前丢失了，已重新创建。为防止误删，暂时不会同步「删除」操作，电脑上的文件会重新上传，恢复后自动正常'
+    )
   }
 
   /**
@@ -3838,12 +4138,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       dirtyList && useDirty
         ? scanDirtyFast(dir.localPath, dirtyList, store, prefs.ignoreHidden, excludeMatcher, (n) =>
             // 快速核对完成后强制报告一次最终计数（与全量扫描的终态送达同契约）
-            onProgress({ phase: 'scan', filesDone: n, filesTotal: 0, bytesDone: 0, bytesTotal: 0 }, true)
+            onProgress({ phase: 'scan', filesDone: n, filesTotal: 0, bytesDone: 0, bytesTotal: 0, stage: 'scan' }, true)
           )
         : scanDirSafe(dir.localPath, prefs.ignoreHidden, excludeMatcher, (n) =>
             // 扫描进度事件经 force 外发：scanDirSafe 内部已按 SCAN_PROGRESS_MS 节流
             //（含末次强制报告），这里不再吃引擎层节流 —— 保证最终扫描计数必然送达
-            onProgress({ phase: 'scan', filesDone: n, filesTotal: 0, bytesDone: 0, bytesTotal: 0 }, true)
+            onProgress({ phase: 'scan', filesDone: n, filesTotal: 0, bytesDone: 0, bytesTotal: 0, stage: 'scan' }, true)
           ),
       capsPromise,
       capsPromise.then((c) => {
@@ -3895,8 +4195,21 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //     没有，最可能是服务器把 infinity 当 Depth:1 应答；残缺树会被决策层解读
     //     成「远端已删除」→ 批量 delete-local。阈值与批量删除闸同口径（只在大规模
     //     时拦截，个别深层文件真实被删不触发）；命中按「扫描不完整」中止整轮
-    //    （I1 闸门接管：零删除、零传输），下一轮如服务器行为恢复则自然继续。
-    if (remoteScan.depth === 'infinity' && store.entries.size > 0) {
+    //    （I1 闸门接管：零删除、零传输）。已不完整的扫描（如根缺失上报）不再
+    //     叠加本阀门。根重建 / 移除执行的窗口期（本轮或标记延续轮重建了云端根，
+    //     「远端为空」是已知伪象且删除传播已被停用）必须跳过 —— 否则「重新上传」
+    //     的恢复轮会撞阀门死循环，永远传不上去。命中同时把该服务器的缓存能力
+    //     持久降级为 depthInfinity=false（best-effort）：下一轮起改用逐目录扫描
+    //    （对只回第一层的服务器语义恰好正确），直到下次能力探测（TTL 过期 /
+    //     手动重探）自然恢复 —— 避免「服务器永远浅应答、每轮都撞阀门」的死循环。
+    if (
+      remoteScan.complete &&
+      remoteScan.depth === 'infinity' &&
+      store.entries.size > 0 &&
+      !rootWasRebuilt &&
+      !store.meta.rootRebuilt &&
+      !store.meta.rootLostRemoval
+    ) {
       const shallowThreshold = Math.max(DELETE_BATCH_MIN, Math.ceil(store.entries.size * DELETE_BATCH_RATIO))
       let nestedBase = 0
       for (const k of store.entries.keys()) {
@@ -3916,6 +4229,18 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         if (!nestedScan) {
           remoteScan.complete = false
           remoteScan.errors.push({ rel: '.', message: 'Depth:infinity 响应未包含任何嵌套条目，疑似服务器只返回了第一层（为避免批量误删，本轮按扫描不完整处理）' })
+          // 持久降级（浅应答服务器改成逐目录形态即可正常工作）：
+          try {
+            const state = await storage.openServerState(originOf(cfg), (cfg && cfg.username) || '')
+            const cached = state.getCachedCapabilities(PROBE_TTL_MS)
+            if (cached && cached.depthInfinity) {
+              const toSave = { ...cached, depthInfinity: false }
+              toSave.notes = [...(toSave.notes || []), 'Depth:infinity 响应疑似只返回第一层，已降级为逐目录扫描（下次能力探测自动恢复）']
+              await state.saveCapabilities(toSave).catch(() => {})
+            }
+          } catch (_) {
+            /* 降级失败不影响本轮中止语义：下一轮再撞阀门时重试 */
+          }
         }
       }
     }
@@ -3925,6 +4250,19 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //    的误导性报错只留给真实的扫描故障。
     if (!localScan.complete || !remoteScan.complete) {
       if (shouldAbort()) throw syncFail('已取消同步', { phase: 'scan' })
+      // 远端根级 404（根在探测后 / 扫描前的窗口内消失，或单请求形态的根缺失上报）
+      // 与「部分目录读不出」是两类故障：前者正是「同步目标被删除」的场景，按根丢失
+      // 决策闸处理（登记待决策、零删除零传输）；后者维持 I1 原语义。基线为空或
+      // 「移除本地」执行中不适用 —— 前者无内容可保护，后者已有明确决策在执行。
+      if (
+        !remoteScan.complete &&
+        localScan.complete &&
+        store.entries.size > 0 &&
+        !store.meta.rootLostRemoval &&
+        (remoteScan.errors || []).some((e: any) => e && e.rel === '.' && String(e.message || '').includes('404'))
+      ) {
+        await stopForRootLost()
+      }
       const scanProblems = [
         ...localScan.errors.map((e: any) => `本地 ${e.rel}: ${e.message}`),
         ...remoteScan.errors.map((e: any) => `远端 ${e.rel}: ${e.message}`),
@@ -3932,8 +4270,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       // 扫描失败的 failureClass（远端扫描失败属 network —— 服务器 /
       // 网络不可用，调度层据此退避）；仅本地扫描不完整归 other；双侧都不完整归 mixed
       const scanClass = !remoteScan.complete && !localScan.complete ? 'mixed' : !remoteScan.complete ? 'network' : 'other'
-      const scanErr = syncFail('没能完整读取文件列表，本次同步已停止，避免误删文件', { phase: 'scan', errors: scanProblems, failureClass: scanClass })
+      // summary 携带「友好标题 + 逐条具体原因」：渲染层错误条据此把为什么读不出来
+      //（404 / 403 / 网络中断…）展示出来，而不是只有一句笼统的停止说明无从行动
+      const scanFailMsg = '没能完整读取文件列表，本次同步已停止，避免误删文件'
+      const scanErr = syncFail(scanFailMsg, { phase: 'scan', errors: scanProblems, failureClass: scanClass })
       scanErr.detail = scanProblems[0]
+      scanErr.summary = { ...summary, errors: [scanFailMsg, ...scanProblems], failureClass: scanClass }
       throw scanErr
     }
 
@@ -4102,18 +4444,38 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     }
     summary.totalFiles = plan.length
     const planByRel = new Map(plan.map((it) => [it.rel, it]))
+    // 扫描到的全部文件字节（两侧并集）：云端占用估算的数据来源，与传输量无关
+    //（「需要上传 / 下载多少字节」由传输阶段的 transferBytesTotal 承担）
+    let scanBytesTotal = 0
+    for (const it of plan) scanBytesTotal += (it.l ? it.l.size : 0) + (it.r ? it.r.size : 0)
+    // 计划需要上传 + 下载的总字节（传输进度的分母）：由 pushTransfer 按任务累加，
+    // 删除任务计 0；写前查重剔除任务时同步扣减
+    let transferBytesTotal = 0
     // verifyDone / verifyTotal：规划期内容校验（verify）的进度字段（追加需求），
     // 无校验任务时保持 0；有任务时由下方 verify 池持续更新
-    onProgress({ phase: 'plan', filesDone: 0, filesTotal: plan.length, bytesDone: 0, bytesTotal: 0, verifyDone: 0, verifyTotal: 0 })
+    onProgress({ phase: 'plan', filesDone: 0, filesTotal: plan.length, bytesDone: 0, bytesTotal: 0, stage: 'plan', scanBytesTotal, verifyDone: 0, verifyTotal: 0 })
 
-    let bytesTotal = 0
-    for (const it of plan) bytesTotal += (it.l ? it.l.size : 0) + (it.r ? it.r.size : 0)
     let filesDone = 0
     let bytesDoneAcc = 0
     // tick / emitPlan 经节流 onProgress 外发；force=true 的终态调用保证池收尾后的
-    // 最终计数必然送达（中间事件被节流丢弃不损失信息，计数单调不减）
+    // 最终计数必然送达（中间事件被节流丢弃不损失信息，计数单调不减）。
+    // currentTask 是最后被领取的传输任务（并发 worker 下为近似「正在进行」），
+    // 供 UI 展示「正在上传 / 下载 …」。
+    let currentTask: { op: string; rel: string } | null = null
     const tick = (force = false) =>
-      onProgress({ phase: 'transfer', filesDone, filesTotal: plan.length, bytesDone: bytesDoneAcc, bytesTotal }, force)
+      onProgress(
+        {
+          phase: 'transfer',
+          filesDone,
+          filesTotal: plan.length,
+          bytesDone: bytesDoneAcc,
+          bytesTotal: transferBytesTotal,
+          stage: 'transfer',
+          scanBytesTotal,
+          ...(currentTask ? { currentOp: currentTask.op, currentFile: currentTask.rel } : {}),
+        } as SyncProgress,
+        force
+      )
 
     const createdDirs = new Set<any>()
     const transfers: any[] = []
@@ -4289,14 +4651,17 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 退避记录保留（与「传输成功才清除」的语义一致）。
     const UPLOADED_PENDING = Symbol('wdsync-uploaded-pending')
     /**
-     * 与 transfers 平行的任务元数据：{ rel, kind }，kind ∈
-     * upload / download / delete-local / delete-remote / conflict。供规划完成后的
-     * 两道闸读取：按需拿锁的「远端写」判定（upload / delete-remote / conflict）与
+     * 与 transfers 平行的任务元数据：{ rel, kind, bytes }，kind ∈
+     * upload / download / delete-local / delete-remote / conflict，bytes 为该任务的
+     * 传输字节估算（upload = 本地大小、download = 远端大小、conflict = 两侧之和、
+     * 删除 = 0）—— 全部任务 bytes 之和即传输进度分母 transferBytesTotal。供规划完成后的
+     * 两道闸读取：按需拿锁的「远端写」判定（upload / delete-remote / conflict）、
      * B 档写前查重的按 rel 剔除（与 transfers 同步 splice，下标始终对齐）。
      */
     const transferMeta: any[] = []
-    const pushTransfer = (rel: any, fn: any, kind: any) => {
-      transferMeta.push({ rel, kind })
+    const pushTransfer = (rel: any, fn: any, kind: any, bytes = 0) => {
+      transferMeta.push({ rel, kind, bytes })
+      transferBytesTotal += bytes
       transfers.push(async () => {
         try {
           const r = await fn()
@@ -4517,6 +4882,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             filesTotal: plan.length,
             bytesDone: verifyBytes,
             bytesTotal: verifyBytesTotal,
+            stage: 'verify',
+            scanBytesTotal,
             verifyDone,
             verifyTotal: verifyJobs.length,
           },
@@ -4600,13 +4967,19 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
      * 半截强制重传必有扫描期远端条目（残缺文件本身），不进此集合。
      * 两段提交：intent → PUT（uploadOne）→ 暂存；基线提交与 done 移到批量校验阶段。
      */
-    const pushUploadTransfer = (it: any) => {
+    /**
+     * 上传任务入队（两段提交：intent → PUT → 暂存，基线提交与 done 在批量校验阶段）。
+     * @param settlePendings 传入 true 时按冲突落地语义在基线提交成功后清除该文件的
+     *   挂起记录（runUploadOp fromConflict → 批量提交点 clearPending）——「不删除」
+     *   决策的恢复上传用它清掉已解决的删除挂起；半截强制重传同样传 true
+     *   （远端被证实为本机残缺文件，等效 choice='local'）。
+     */
+    const pushUploadTransfer = (it: any, settlePendings = false) => {
       const scanR = it.r
       if (!scanR && caps.tier === 'B') bNewUploads.add(it.rel)
       pushTransfer(
         it.rel,
         async () => {
-          // fromConflict：半截强制重传按冲突落地语义清挂起（远端被证实为本机残缺文件，等效 choice='local'）
           const parked = await runUploadOp(
             it,
             scanR && scanR.origName,
@@ -4616,11 +4989,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               bytesDoneAcc += it.l.size
               return up
             },
-            forceUploads.has(it.rel)
+            settlePendings || forceUploads.has(it.rel)
           )
           return parked ? UPLOADED_PENDING : undefined
         },
-        'upload'
+        'upload',
+        it.l.size
       )
     }
     for (const it of plan) {
@@ -4788,7 +5162,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               summary.bytesDown += it.r.size
               bytesDoneAcc += it.r.size
             }),
-          'download'
+          'download',
+          it.r.size
         )
         continue
       }
@@ -4862,30 +5237,44 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           summary.conflicts++
           return uploadPending ? UPLOADED_PENDING : undefined
         },
-        'conflict'
+        'conflict',
+        // 冲突的落地动作要到执行期（用户选择）才知道方向：按两侧之和估算传输分母
+        (it.l ? it.l.size : 0) + (it.r ? it.r.size : 0)
       )
     }
 
     // ---- 删除安全闸（规划第二遍之后、按需拿锁 / B 档查重之前）----
     // 删除类动作统一在此过闸（规划期只收集）。逐项判定，先到先得：
-    //   1. 挂起标记 kind='delete' 且 choice='delete'（用户已确认）→ 照常入队执行
-    //      —— 显式同意优先于一切保护（含远端根重建保护）；
-    //   2. 挂起标记 choice='keep'（用户选择保留）→ 抑制（deleteKept），标记保留，
-    //      该文件的删除传播持续抑制直至状态变化（标记在规划期自动失效清理）；
-    //   3. 挂起标记无 choice（待确认）→ 抑制 ——「确认前零删除」的绝对约束，
+    //   1. 挂起标记 kind='delete' 且 choice='delete'（用户逐文件显式确认，无 scope
+    //      来源）→ 照常入队执行 —— 显式同意优先于一切保护（含远端根重建保护）；
+    //   2. 删除范围决策（目录树上的批量选择）命中 → 照 choice 执行 / 消费 ——
+    //      最具体（最长前缀）者胜，覆盖逐文件挂起表装不下的部分（「全部不删除 /
+    //      全部确认删除」的落地通道）与同代盖章记录的细化决策；
+    //   3. 挂起标记 choice='keep'（用户逐文件保留）或 scope 盖章记录 → 按方向消费
+    //     （consumeKeepChoice）：delete-local 恢复上传（deleteRestored）、
+    //      delete-remote 抑制（deleteKept）；恢复成功后情形消失，scope 自动剪枝；
+    //   4. 挂起标记无 choice（待确认）→ 抑制 ——「确认前零删除」的绝对约束，
     //      与阈值无关：已挂起的条目永远等确认，不因后续轮次数量回落而放行；
-    //   4. 无标记的新鲜删除：
-    //      a. 远端根重建保护生效中（meta.rootRebuilt）→ delete-local 改判为「恢复上传」
+    //   5. 无标记的新鲜删除：
+    //      a. 远端根丢失「移除本地」决策执行中（meta.rootLostRemoval）→ delete-local
+    //         视为用户已确认（根级决策覆盖批量阈值与重建保护），入队执行；本地有
+    //         改动的文件不会到这里 —— 规划层已将其判为 upload（改动优先于删除）；
+    //      b. 远端根重建保护生效中（meta.rootRebuilt）→ delete-local 改判为「恢复上传」
     //         并计入 deleteRootGuard（远端缺失是根消失伪象，复活取向重传远端），
     //         delete-remote 暂缓；上传与远端和解后自动恢复删除传播；
-    //      b. 新鲜删除总数 > max(50, 基线条目数×20%) → 整批挂起：逐项登记
+    //      c. 新鲜删除总数 > max(50, 基线条目数×20%) → 整批挂起：逐项登记
     //         kind='delete' 挂起记录（无 choice），计入 deleteHeld，本轮零删除，
-    //         用户经待处理面板确认 / 保留后下一轮落地；
-    //      c. 其余 → 照常入队执行。
+    //         用户经待处理面板确认 / 保留后下一轮落地；同时构建 / 刷新批量删除
+    //         快照（目录树，「全部 / 按目录」范围决策的完整事实源）；
+    //      d. 其余 → 照常入队执行。
     // 已确认 / 用户选择保留的删除不计入阈值（阈值只度量「未经确认的批量删除」，
     // 否则已确认的整批会永远无法执行）。挂起登记失败（条目上限满）只影响
     //「下一轮是否需重新登记」，不影响零删除约束 —— 抑制由数量判定驱动。
     const deleteThreshold = Math.max(DELETE_BATCH_MIN, Math.ceil(store.entries.size * DELETE_BATCH_RATIO))
+    // removalForced：本轮经 rootLostRemoval 标记放行的 delete-local 数。轮末解除判定
+    // 的输入 —— 降为 0 的干净轮说明「移除本地」已和解（待移除文件要么已删除、
+    // 要么因本地改动改走上传），标记可解除，恢复正常删除语义（含批量阈值保护）
+    let removalForced = 0
     const registerDeleteHold = (it: any) => {
       const ok = store.setPending(it.rel, {
         kind: 'delete',
@@ -4952,19 +5341,74 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     }
     const freshDeletes: any[] = []
     let deleteThresholdTripped = false
+    /**
+     * 「不删除」决策的消费（逐文件保留 / 范围决策 / 盖章记录共用），按方向落地：
+     *   - delete-local（云端已缺、本地完好且未变 —— 规划真值表保证）：只抑制会把
+     *     两端永久卡在分叉态（云端侧没有任何恢复通道，且每轮重复提示）。改判为
+     *     「恢复上传」（复活取向，与无基线保护 / 根重建保护同语义）：本地文件原样
+     *     保留，云端缺失的副本由本地上传恢复，两端重新一致。settlePendings 使基线
+     *     提交成功后清除该文件的删除挂起（决策完成）；恢复失败（网络 / 412）挂起
+     *     保留，下一轮继续按决策重试；恢复全部成功后 scope 零匹配自动剪枝。
+     *   - delete-remote（本地已删、云端完好）：抑制 = 云端副本按用户意愿保留
+     *    （本地删除是用户自己的动作，引擎不反向恢复），计入 deleteKept。
+     */
+    const consumeKeepChoice = (entry: any) => {
+      if (entry.act === 'delete-local' && entry.it.l) {
+        summary.deleteRestored++
+        pushUploadTransfer(entry.it, true)
+      } else {
+        summary.deleteKept++
+      }
+    }
+    // 本轮命中的删除范围决策前缀 → 命中文件数（轮末剪枝输入：零命中的 scope 视为
+    // 情形已消失自动移除，避免陈旧 keep 永远压制未来的新删除事件）
+    const scopeMatchCounts = new Map<string, number>()
+    // 未决策删除候选（rel → 本地大小）：历史登记无 choice 的 + 本轮新鲜的 ——
+    // 触发拦截时据此构建 / 刷新批量删除快照（UI 目录树与「全部」类决策的事实源）
+    const undecidedMembers = new Map<string, number>()
     for (const entry of deletePlanItems) {
       const it = entry.it
       const pd = store.getPending(it.rel)
-      if (pd && pd.kind === 'delete') {
-        if (pd.choice === 'delete') {
+      // 1. 用户逐文件显式选择（setPendingChoice，无 scope 来源标记）：最优先，
+      //    范围决策不得翻案 ——「全部」只作用于当前树里未决策的部分
+      if (pd && pd.kind === 'delete' && pd.choice && pd.scope == null) {
+        if (pd.choice === 'delete') pushDeleteTransfer(entry)
+        else consumeKeepChoice(entry)
+        continue
+      }
+      // 2. 删除范围决策（目录树上的批量选择）：按前缀匹配，最具体者胜。覆盖逐文件
+      //    挂起表装不下的候选（「全部不删除 / 全部确认删除」的落地通道）；同代盖章
+      //    记录的细化决策（文件级 scope 压过子树 scope）也在此消费
+      const scope = store.matchDeleteScope(it.rel)
+      if (scope) {
+        scopeMatchCounts.set(scope.prefix, (scopeMatchCounts.get(scope.prefix) || 0) + 1)
+        if (scope.choice === 'delete') {
           pushDeleteTransfer(entry)
-          continue
+        } else {
+          consumeKeepChoice(entry)
         }
-        if (pd.choice === 'keep') {
-          summary.deleteKept++
-          continue
-        }
-        summary.deleteHeld++ // 待确认：标记已存在，抑制（不重复登记）
+        undecidedMembers.delete(it.rel)
+        continue
+      }
+      if (pd && pd.kind === 'delete' && pd.choice) {
+        // 3. 范围决策盖章的记录（scope 已剪枝 / 代际更迭后由盖章兜底）：按盖章选择
+        //    消费 —— 与逐文件确认同语义（删除执行成功后清除；失败保留重试）
+        if (pd.choice === 'delete') pushDeleteTransfer(entry)
+        else consumeKeepChoice(entry)
+        continue
+      }
+      if (pd && pd.kind === 'delete') {
+        // 4. 待确认：标记已存在，抑制（不重复登记）。「确认前零删除」绝对约束：
+        //    与阈值无关，已挂起的条目永远等确认，不因数量回落放行
+        summary.deleteHeld++
+        undecidedMembers.set(it.rel, pd.local ? pd.local.size : 0)
+        continue
+      }
+      if (store.meta.rootLostRemoval && entry.act === 'delete-local') {
+        // 根丢失「移除本地」决策执行中：用户已在根级确认移除，delete-local 等同
+        // 已确认删除（先于根重建保护与批量阈值判定）
+        removalForced++
+        pushDeleteTransfer(entry)
         continue
       }
       if (store.meta.rootRebuilt) {
@@ -4983,13 +5427,26 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       for (const entry of freshDeletes) {
         registerDeleteHold(entry.it)
         summary.deleteHeld++
+        undecidedMembers.set(entry.it.rel, entry.it.l ? entry.it.l.size : 0)
       }
       deleteThresholdTripped = true
       pushWarning(
         `这次要删除的文件有 ${freshDeletes.length} 个，数量偏多，为防止误删，没有删除任何文件。请在「待处理」里确认，确认后下次同步才会执行`
       )
+      // 构建 / 刷新批量删除快照：含历史登记未决策的 + 本轮新鲜的（含登记超上限
+      // 未持久化的部分 —— 它们没有逐文件记录，快照是它们对用户可见的唯一通道）
+      store.setDeleteBatch(buildDeleteBatch(undecidedMembers, Date.now()))
     } else {
       for (const entry of freshDeletes) pushDeleteTransfer(entry)
+    }
+    // 范围决策剪枝 + 快照清理（仅扫描完整轮：扫描不完整时「零匹配 / 无未决策」
+    // 不可信 —— 残缺的远端列表会把「还没看到」误判成「情形已消失」）。剪枝：
+    // 零匹配的 scope 视为情形已消失自动移除。快照清除：本轮未触发拦截且已无
+    // 未决策候选（scope 消费 / 逐文件确认 / 逐文件选择覆盖完毕）—— UI 树随之消失。
+    if (remoteScan.complete) {
+      const pruned = store.pruneDeleteScopes(new Set(scopeMatchCounts.keys()))
+      if (pruned > 0) logNote(`${pruned} 条删除范围决策覆盖的删除已不存在（文件恢复 / 处理完毕），已自动清除`)
+      if (!deleteThresholdTripped && undecidedMembers.size === 0) store.clearDeleteBatch()
     }
 
     // ---- 规划完成后、worker 执行前的两道闸（按需租约锁 → B 档新上传写前查重）----
@@ -5022,6 +5479,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 马上要释放的锁发出 GET/PUT/回读共 4 个请求与 1.5s 写回静置。
     const hasRemoteWrite = transferMeta.some((t) => t.kind === 'upload' || t.kind === 'delete-remote' || t.kind === 'conflict')
     if (hasRemoteWrite && !aborted && !shouldAbort() && prefs.leaseLock !== false) {
+      // 锁阶段进度（含 GET → PUT → 1.5s 写回静置 → 回读确认的完整窗口）：
+      // UI 显示「正在确认租约锁…」。force 外发 —— 与 verify 终态事件同相位，不吃节流
+      onProgress({ phase: 'plan', filesDone: 0, filesTotal: plan.length, bytesDone: 0, bytesTotal: 0, stage: 'lock', scanBytesTotal }, true)
       const deviceId = await storage.getDeviceId()
       const acq = await acquireLeaseLock(cfg, lockPath, deviceId)
       if (acq.warn) logNote(acq.warn)
@@ -5084,10 +5544,11 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 天然不触发查重。规划期已取消的轮次跳过查重（worker 池随即按取消收场，
     // 不再为已取消的传输发守护请求；取消引发的请求失败也不报噪声错误）。
     if (bNewUploads.size > 0 && !shouldAbort()) {
-      /** 从执行队列按 rel 剔除一个任务（transfers 与 transferMeta 同下标同步 splice） */
+      /** 从执行队列按 rel 剔除一个任务（transfers 与 transferMeta 同下标同步 splice；字节分母同步扣减） */
       const dropTransferByRel = (rel: any) => {
         const i = transferMeta.findIndex((t) => t.rel === rel)
         if (i < 0) return false
+        transferBytesTotal -= transferMeta[i].bytes || 0
         transferMeta.splice(i, 1)
         transfers.splice(i, 1)
         return true
@@ -5159,6 +5620,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     }
 
     // 7. 并发池执行
+    // 传输开始事件（force 外发）：锁 / 查重闸门已过，UI 由此切入「正在同步文件」段，
+    // 并拿到传输字节分母（此前阶段 bytesDone / bytesTotal 承载的是 verify 字节估算）
+    onProgress(
+      { phase: 'transfer', filesDone: 0, filesTotal: plan.length, bytesDone: 0, bytesTotal: transferBytesTotal, stage: 'transfer', scanBytesTotal },
+      true
+    )
     const conc = Math.max(1, Math.min(8, Number(prefs.concurrency) || 4))
     let idx = 0
     async function worker() {
@@ -5170,7 +5637,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           aborted = true
           return
         }
-        const job = transfers[idx++]
+        const i = idx++
+        // 领取即报告当前任务（节流下可能被合并，取最后领取者即可）：UI 显示「正在上传 / 下载 …」
+        const meta = transferMeta[i]
+        currentTask = meta ? { op: meta.kind, rel: meta.rel } : null
+        tick()
+        const job = transfers[i]
         try {
           await job()
         } catch (e: any) {
@@ -5183,6 +5655,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     }
     await Promise.all(Array.from({ length: conc }, worker))
     tick(true) // worker 池收尾：最终 filesDone / bytesDone 必然送达（节流豁免）
+    // 后置收尾段（force 外发）：瞬时重试 / 批量校验提交 / 基线落盘 / 空目录清理 ——
+    // UI 的整条进度按「传输 80% + 后置 10%」折算，此事件标记进入最后 10% 段
+    onProgress(
+      { phase: 'transfer', filesDone, filesTotal: plan.length, bytesDone: bytesDoneAcc, bytesTotal: transferBytesTotal, stage: 'finalize', scanBytesTotal },
+      true
+    )
     if (shouldAbort()) aborted = true
 
     // 瞬时失败当轮重试：worker 池全部结束后，对本轮收集的瞬时失败任务串行再执行
@@ -5317,6 +5795,24 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       } else {
         pushWarning('云端文件夹之前丢失过，还有文件没传完，暂时不会同步「删除」操作，传完后恢复正常')
       }
+    }
+
+    // ---- 远端根丢失「移除本地」标记的解除判定 ----
+    // 与 rootRebuilt 解除同口径的干净轮（无错误 / 未取消 / 非熔断 / 非只读 / 基线可信）
+    // 且本轮再无经标记放行的删除（待移除集合已和解：要么已删除、要么因本地改动改走
+    // 上传；keep 保留类由逐文件挂起独立抑制，不依赖本标记）→ 解除标记，恢复正常
+    // 删除语义（含批量阈值保护）。仍有待移除或本轮有失败 → 保守保留标记，下一轮继续。
+    if (
+      store.meta.rootLostRemoval &&
+      removalForced === 0 &&
+      !aborted &&
+      !roundBreaker.open &&
+      caps.tier !== 'C' &&
+      store.loadedOk &&
+      errorNetCount + errorOtherCount === 0
+    ) {
+      delete store.meta.rootLostRemoval
+      await store.saveMeta().catch(() => {})
     }
 
     // ---- 空目录清理（两端，best-effort，失败不报错）----
@@ -5482,8 +5978,11 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     if (summary.deleteHeld > 0 && !deleteThresholdTripped) {
       pushWarning(`有 ${summary.deleteHeld} 项删除在等你确认，确认前不会删除任何文件`)
     }
+    if (summary.deleteRestored > 0) {
+      pushWarning(`按你之前选的「不删除」，${summary.deleteRestored} 个文件已从电脑重新上传，云端已恢复`)
+    }
     if (summary.deleteKept > 0) {
-      pushWarning(`按你之前选的「不删除」，${summary.deleteKept} 个文件没有被删（两边都保留）`)
+      pushWarning(`按你之前选的「不删除」，${summary.deleteKept} 个文件的云端副本保留了下来（电脑上已删除的文件不会恢复）`)
     }
     // 空目录清理汇总（有清理动作才提示）
     if (summary.dirsPrunedLocal > 0 || summary.dirsPrunedRemote > 0) {
@@ -5568,8 +6067,12 @@ const services = {
      * 测试连接：PROPFIND depth 0。
      * 返回 { ok, latencyMs, error?, tier?, capabilities? } —— tier / capabilities 为
      * 新增字段（向后兼容）：能力探测失败不影响连通性结论（tier 为 null）。
+     * @param cfg 连接配置
+     * @param remotePath 能力摘要的探测目标远端路径（渲染层传入用户选定的功能测试
+     *   目录）；缺省为服务器基址 —— 同一服务器不同子树写权限可能不同，摘要需与
+     *   「功能测试」同口径。
      */
-    async testConnection(cfg: any) {
+    async testConnection(cfg: any, remotePath?: any) {
       const started = Date.now()
       try {
         const r = await davRequest(cfg, 'PROPFIND', '', {
@@ -5578,10 +6081,11 @@ const services = {
         })
         const latencyMs = Date.now() - started
         if (r.status === 207 || r.status === 200) {
-          // 附带档位与能力摘要：缓存优先（7 天 TTL），缺失才现场探测；探测异常不连坐
+          // 附带档位与能力摘要：缓存优先（7 天 TTL），缺失才现场探测；探测异常不连坐。
+          // 探测目标为调用方指定的远端路径（功能测试目录），缺省为基址
           let capabilities: any = null
           try {
-            capabilities = await probeCapabilities(cfg)
+            capabilities = await probeCapabilities(cfg, false, remotePath)
           } catch (_) {
             /* 探测失败不影响连接判定 */
           }
@@ -5665,12 +6169,18 @@ const services = {
     },
     /**
      * 清除某目录单个文件的冲突挂起记录（UI「忽略此挂起」入口：清除后该文件再冲突时
-     * 按常规流程重新询问 / 按 prefs 策略处理）。已立即落盘。
+     * 按常规流程重新询问 / 按 prefs 策略处理）。已立即落盘；同时向决策历史追加一条
+     * kind='ignore' 记录（「最近处理记录」可回看为什么不再询问）。
      * @returns 是否确实移除了条目
      */
     async clearPendingConflict(d: any, rel: any) {
       const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
+      const prev = st.getPending(rel)
       const removed = st.clearPending(rel)
+      if (removed) {
+        st.appendDecision({ at: Date.now(), rel: String(rel), kind: 'ignore', choice: 'ignore' })
+        await st.saveDecisionLog().catch(() => {})
+      }
       if (st.pendingsDirty) await st.savePendings().catch(() => {})
       return removed
     },
@@ -5679,7 +6189,9 @@ const services = {
      * 批量解决「已询问但未解决」的挂起）。已立即落盘；下一轮同步自动按该选择解决。
      * 冲突类挂起（缺省 kind）接受 'local' | 'remote' | 'both'；删除确认类挂起
      *（kind='delete'，批量删除超阈值登记）接受 'delete'（确认删除，下一轮执行）|
-     * 'keep'（保留两侧不删，持续抑制该文件的删除传播直至状态变化）。
+     * 'keep'（保留两侧不删，持续抑制该文件的删除传播直至状态变化）；根丢失决策类
+     *（kind='root-lost'，rel='.'）接受 'upload'（重建云端并重新上传）|
+     * 'remove-local'（移除本地已同步内容，跟随云端删除）。
      * @returns 是否成功（挂起记录不存在 → false，不新建 —— 只对已登记的条目生效）
      */
     async setPendingChoice(d: any, rel: any, choice: any) {
@@ -5687,13 +6199,109 @@ const services = {
       const prev = st.getPending(rel)
       if (!prev) return false
       const isDeleteKind = prev.kind === 'delete'
-      const valid = isDeleteKind ? choice === 'delete' || choice === 'keep' : choice === 'local' || choice === 'remote' || choice === 'both'
+      const isRootLostKind = prev.kind === 'root-lost'
+      const valid = isDeleteKind
+        ? choice === 'delete' || choice === 'keep'
+        : isRootLostKind
+          ? choice === 'upload' || choice === 'remove-local'
+          : choice === 'local' || choice === 'remote' || choice === 'both'
       if (!valid) {
-        throw new Error(`无效的挂起处理选择：${choice}（${isDeleteKind ? '删除确认仅支持 delete / keep' : '冲突仅支持 local / remote / both'}）`)
+        throw new Error(
+          `无效的挂起处理选择：${choice}（${
+            isDeleteKind ? '删除确认仅支持 delete / keep' : isRootLostKind ? '根丢失决策仅支持 upload / remove-local' : '冲突仅支持 local / remote / both'
+          }）`
+        )
       }
       const ok = st.setPending(rel, { ...prev, kind: prev.kind, choice, createdAt: prev.createdAt })
+      if (ok) {
+        // 决策历史：root-lost 类目录级决策携带受影响基线文件数（弹窗同口径），
+        // 供「最近处理记录」回看「当时选了什么、影响了多少文件」
+        const entry: any = {
+          at: Date.now(),
+          rel: String(rel),
+          kind: isRootLostKind ? 'root-lost' : isDeleteKind ? 'delete' : 'conflict',
+          choice: String(choice),
+        }
+        if (isRootLostKind && prev.local && prev.local.size > 0) entry.affected = prev.local.size
+        st.appendDecision(entry)
+        await st.saveDecisionLog().catch(() => {})
+      }
       if (st.pendingsDirty) await st.savePendings().catch(() => {})
       return ok
+    },
+    /**
+     * 列出某目录的决策历史（UI「最近处理记录」入口）。
+     * @param d 目录配置（格式同 syncDirectory 的 dir 参数）
+     * @returns [{ at, rel, kind, choice, affected? }] 按时间倒序（最新在前）；
+     *          kind ∈ 'conflict' | 'delete' | 'root-lost' | 'ignore'，choice 为用户的
+     *          选择值（忽略类恒为 'ignore'），affected 仅 root-lost 类携带
+     */
+    async listDecisionLog(d: any) {
+      const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
+      return st.listDecisionLog()
+    },
+    /**
+     * 读取某目录的批量删除快照（UI 待处理面板「删除确认目录树」的数据源）。
+     * 返回 DeleteBatchView：快照本体 + 当前生效的范围决策（scopes）+ 引擎算好的
+     * 未决策文件数（undecided，按树精确去重扣除 scope 覆盖部分）。
+     * 无快照但存在未决策删除记录（旧版本登记 / 未到阈值的单文件挂起）时从记录
+     * 合成单文件叶快照 —— 保证「有挂起必有决策入口」，不会出现记录在等待确认
+     * 却没有任何 UI 通道可达的死角。
+     * @param d 目录配置（格式同 syncDirectory 的 dir 参数）
+     * @returns DeleteBatchView | null（无快照且无未决策删除记录）
+     */
+    async listDeleteBatch(d: any) {
+      const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
+      let batch = st.getDeleteBatch()
+      if (!batch) {
+        const items = st.listPending().filter((p: any) => p.kind === 'delete' && !p.choice)
+        if (!items.length) return null
+        batch = buildDeleteBatch(new Map(items.map((p: any) => [p.rel, p.local ? p.local.size : 0])), Date.now())
+      }
+      const scopes = st.listDeleteScopes()
+      return { ...batch, scopes, undecided: computeUndecidedFiles(batch, scopes) }
+    },
+    /**
+     * 落一条删除范围决策（UI 目录树节点 / 底部「全部」按钮的入口）：在 prefix
+     * （nfc 归一；'' = 整个同步目录）范围内按 choice 消费全部删除候选 —— 含逐文件
+     * 挂起表装不下的部分。已登记的逐文件删除记录同步回写 choice（两条消费路径
+     * 语义一致、UI 列表不再重复展示）；决策历史追加一条 kind='delete' 记录
+     *（affected 携带覆盖文件数，「最近处理记录」可回看影响面）。
+     * 立即落盘；下一轮同步按 scope 自动执行 / 抑制。
+     * @param d 目录配置（格式同 syncDirectory 的 dir 参数）
+     * @param rel 范围前缀：'' = 整个同步目录；目录 rel = 该目录及其全部子树；
+     *            文件 rel = 单文件。'.' / '/' 保留字（根丢失决策专用）不可用
+     * @param choice 'delete'（确认删除，下一轮执行）| 'keep'（保留不删，持续抑制）
+     * @returns {{ ok: true, covered: number, stamped: number }} covered = 决策覆盖的
+     *          删除候选文件数（按当前快照口径；无快照时按未决策记录数），stamped =
+     *          同步回写 choice 的既有逐文件记录数
+     */
+    async setDeleteScope(d: any, rel: any, choice: any) {
+      const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
+      if (choice !== 'delete' && choice !== 'keep') {
+        throw new Error(`无效的删除范围选择：${choice}（仅支持 delete = 确认删除 / keep = 保留不删）`)
+      }
+      const raw = String(rel == null ? '' : rel)
+      if (raw === '.' || raw === '/') {
+        throw new Error('「.」是云端文件夹丢失决策的保留路径，整个同步目录请用空范围表示')
+      }
+      const prefix = nfc(raw)
+      const batch = st.getDeleteBatch()
+      // 代际 = 决策时的快照 at（无快照的扁平决策为 0）：盖章回写限定同代，跨代新
+      // 批次的决策不翻案旧代已盖章的逐文件记录（「全部」只作用于当前树的未决策项）
+      const gen = batch ? batch.at : 0
+      // 覆盖数 = 本次决策真正新覆盖的未决策文件数（决策前后的引擎口径差，天然
+      // 扣除已被其他 scope 覆盖的部分）；无快照时退回未决策记录数
+      const scopesBefore = st.listDeleteScopes()
+      const covered = batch
+        ? computeUndecidedFiles(batch, scopesBefore) - computeUndecidedFiles(batch, [...scopesBefore, { prefix, choice, at: 0, gen }])
+        : st.listPending().filter((p: any) => p.kind === 'delete' && !p.choice && scopeHitsRel(prefix, p.rel)).length
+      st.setDeleteScope(prefix, choice, gen)
+      const stamped = st.stampDeleteScopeChoices(prefix, choice, gen)
+      st.appendDecision({ at: Date.now(), rel: prefix || '.', kind: 'delete', choice, affected: covered > 0 ? covered : undefined })
+      await st.saveDecisionLog().catch(() => {})
+      if (st.pendingsDirty) await st.savePendings().catch(() => {})
+      return { ok: true, covered, stamped }
     },
     /**
      * 校验一份新的同步目录配置与既有目录是否嵌套 / 重叠（保存时调用）。
@@ -5709,6 +6317,12 @@ const services = {
       davRequest,
       scanDirSafe,
       listRemoteSafe,
+      /** 批量删除快照聚合（纯函数直检：目录树构建 / 折叠 / 截断） */
+      buildDeleteBatch,
+      /** 快照未决策文件数计算（纯函数直检：scope 覆盖去重） */
+      computeUndecidedFiles,
+      /** 范围前缀命中判定（纯函数直检，与 matchDeleteScope 同规则） */
+      scopeHitsRel,
       uploadOne,
       downloadOne,
       deleteLocalOne,

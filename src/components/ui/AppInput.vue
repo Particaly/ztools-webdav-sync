@@ -62,13 +62,24 @@ const inputAttrs = computed(() => {
   border-radius: 6px;
   background: #fff;
   width: 100%;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+
+  &:hover {
+    border-color: #c9d0d7;
+  }
 
   &:focus-within {
     border-color: var(--blue);
+    /* 焦点光晕：描边外一圈低透明度蓝，键盘与鼠标输入一致 */
+    box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.12);
   }
 
   &.invalid {
     border-color: var(--red);
+
+    &:focus-within {
+      box-shadow: 0 0 0 3px rgba(234, 67, 53, 0.12);
+    }
   }
 
   .input-icon {

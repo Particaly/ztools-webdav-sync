@@ -136,10 +136,18 @@ export interface SyncSummary {
    * 确认（下一轮执行）或保留。轮次以 partial 收场并系统提醒。
    */
   deleteHeld?: number
-  /** 用户选择「保留不删」（删除挂起 choice='keep'）而抑制的删除数 */
+  /** 用户选择「保留不删」（删除挂起 choice='keep'）而抑制的删除数（delete-remote：云端副本保留） */
   deleteKept?: number
+  /** 「不删除」决策命中 delete-local（云端已缺、本地完好）而恢复上传的文件数（云端副本由本地上传恢复） */
+  deleteRestored?: number
   /** 远端根 404 重建保护跳过的删除数（待本地内容重新上传和解，之后自动恢复删除传播） */
   deleteRootGuard?: number
+  /**
+   * 远端同步根丢失、等待用户决策（kind='root-lost' 挂起）的轮数标记：
+   * 决策（重新上传 / 移除本地）落地前每轮以该标记收场，零删除零传输；
+   * 渲染层据此弹出决策弹窗，调度器据此发系统提醒。
+   */
+  rootLostHeld?: number
   /** 空目录清理：本地 / 远端移除的空目录数（仅清理因本轮同步删除而变空的目录） */
   dirsPrunedLocal?: number
   dirsPrunedRemote?: number
@@ -169,6 +177,12 @@ export interface Prefs {
   concurrency: number
   /** 默认 WebDAV 目录：添加同步目录时预填的云端路径，空字符串表示不预填 */
   defaultRemoteDir: string
+  /**
+   * 功能测试目录：设置页「功能测试」在该目录内实际建删临时文件夹实测写权限
+   *（WebDAV 服务器不同子树的写权限可能不同，根目录不一定可写）。空字符串 =
+   * 未选择（渲染层在首次执行功能测试时弹远端目录选择器让用户指定）。
+   */
+  probeRemoteDir?: string
   /** 内容消歧上限（字节）：指纹模糊时下载到临时文件比对 hash 的最大文件大小，默认 50MB */
   verifyMaxBytes?: number
   /**
@@ -216,7 +230,17 @@ export interface ConflictInfo {
   hint?: 'partial-upload'
 }
 
-/** 同步进度回调载荷：verifyDone / verifyTotal 仅在 plan 阶段（规划期内容校验）有意义 */
+/**
+ * 同步进度回调载荷：verifyDone / verifyTotal 仅在 plan 阶段（规划期内容校验）有意义。
+ *
+ * 字节口径按阶段不同（UI 的进度折算只认 stage / phase，不直接用字节当百分比）：
+ *   plan（verify 池运行中）—— bytesDone / bytesTotal 承载规划期内容校验的字节估算；
+ *   transfer              —— bytesDone / bytesTotal 承载「计划需要上传 + 下载」的
+ *                            字节量（分母只含已入队的传输任务，不含未变化的文件；
+ *                            删除任务计 0），bytesDone 随传输完成递增。
+ * scanBytesTotal 恒为「本轮扫描到的全部文件字节（两侧并集）」，与传输量无关
+ *（云端占用估算的数据来源）。
+ */
 export interface SyncProgress {
   phase: 'scan' | 'plan' | 'transfer'
   filesDone: number
@@ -227,6 +251,25 @@ export interface SyncProgress {
   verifyDone?: number
   /** 规划期内容校验（verify）任务总数（plan 阶段下发，无校验任务时为 0） */
   verifyTotal?: number
+  /**
+   * 轮内细分阶段（当前正在执行的任务类别）：UI 据此展示「正在…」任务文案，并把
+   * 整轮进度按 前置 10% / 传输（字节）80% / 后置 10% 分段折算。缺省时 UI 按 phase
+   * 回落（旧事件形态兼容）。取值：
+   *   scan     扫描（本地 + 远端）
+   *   plan     变化判定 / 规划
+   *   verify   规划期内容校验（hash 消歧 / 下载比对）
+   *   lockwait 调度层等待目录锁（本机多实例互斥，他人正在同步该目录）
+   *   lock     远端租约锁确认（多设备互斥；含 PUT 后的写回静置观察窗）
+   *   transfer 传输（上传 / 下载 / 删除 / 冲突落地）
+   *   finalize 后置收尾（瞬时重试 / 批量校验提交 / 基线落盘 / 空目录清理）
+   */
+  stage?: 'scan' | 'plan' | 'verify' | 'lockwait' | 'lock' | 'transfer' | 'finalize'
+  /** 当前正在处理的任务类别（transfer 阶段；与 transferMeta 的 kind 同口径） */
+  currentOp?: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict'
+  /** 当前正在处理的文件相对路径（transfer 阶段展示「正在上传 / 下载 …」用；并发时为最后领取者） */
+  currentFile?: string
+  /** 本轮扫描到的全部文件字节（两侧并集；云端占用估算用，非传输量） */
+  scanBytesTotal?: number
 }
 
 /**
@@ -383,23 +426,123 @@ export interface FailureRecord {
   retryAtMs: number
 }
 
-/** 挂起记录的合法选择值（冲突类 local/remote/both；删除确认类 delete/keep） */
-export type PendingChoice = 'local' | 'remote' | 'both' | 'delete' | 'keep'
+/**
+ * 挂起记录的合法选择值（冲突类 local/remote/both；删除确认类 delete/keep；
+ * 远端根丢失决策类 upload/remove-local）
+ */
+export type PendingChoice = 'local' | 'remote' | 'both' | 'delete' | 'keep' | 'upload' | 'remove-local'
 
-/** 冲突 / 删除确认挂起记录（pending-conflicts.json 的条目形态） */
+/**
+ * 冲突 / 删除确认 / 根丢失决策挂起记录（pending-conflicts.json 的条目形态）。
+ * rel='.' 且 kind='root-lost' 为远端同步根丢失的整目录级决策记录：
+ * local.size 携带受影响的基线文件数，remote 恒为空指纹。
+ */
 export interface PendingRecord {
   local: { size: number; mtimeMs: number }
   remote: { size: number; mtimeMs: number; etag: string }
   createdAt: number
-  /** 'delete' = 删除确认类挂起；缺省为冲突类 */
-  kind?: 'delete'
+  /** 'delete' = 删除确认类挂起；'root-lost' = 远端根丢失决策类；缺省为冲突类 */
+  kind?: 'delete' | 'root-lost'
   /** 用户已做出但尚未成功落地的选择；缺省 = 未解决 */
   choice?: PendingChoice
+  /**
+   * choice 的来源标记：删除范围决策（setDeleteScope）盖章回写时记录其前缀 ——
+   * 区分「用户逐文件显式选择」（无此字段，规划期最优先、范围决策不得翻案）与
+   * 「范围决策盖章」（scope 存续时由 scope 消费、剪枝后由盖章兜底；同代更具体
+   * 的后点决策可改写）。用户经 setPendingChoice 的选择永不携带此字段。
+   */
+  scope?: string
+  /** 盖章时的批量代际（快照 at；无快照的扁平决策为 0）—— 跨代不互相改写 */
+  scopeGen?: number
 }
 
 /** listPending 的返回形态（挂起记录 + nfc rel 键） */
 export interface PendingListItem extends PendingRecord {
   rel: string
+}
+
+// ---- 批量删除快照与范围决策（pending-conflicts.json 的附加载荷）----
+
+/**
+ * 批量删除快照节点：批量删除闸拦截轮对「全部未决策删除候选」的聚合目录树里
+ * 的一个节点。目录节点（isDir=true）的 files / bytes 为子树聚合值；文件叶
+ *（isDir=false）恒为单文件（files=1）。rel 为 nfc 归一后的相对路径。
+ */
+export interface DeleteBatchNode {
+  rel: string
+  isDir: boolean
+  /** 该节点覆盖的文件数（目录 = 子树文件总数，文件叶 = 1） */
+  files: number
+  /** 该节点覆盖的字节数（目录 = 子树字节总数） */
+  bytes: number
+}
+
+/**
+ * 批量删除快照（deleteBatch）：触发批量删除阈值拦截的那一轮，对「全部未决策
+ * 删除候选」（新发现的 + 历史登记无 choice 的）做的目录聚合快照 —— 超出逐文件
+ * 挂起表上限（500 条）的部分没有逐文件记录，快照是 UI 树形展示与「全部」类
+ * 批量决策的完整事实源。所有未决策项被消费完（scope 覆盖 / 逐文件选择）后
+ * 由引擎清除；下一次触发拦截时整体重建。
+ */
+export interface DeleteBatch {
+  /** 快照构建时刻（毫秒） */
+  at: number
+  /** 受影响文件总数（含因节点上限未逐个列出的部分） */
+  total: number
+  /** 受影响字节总数 */
+  bytes: number
+  /** 聚合目录树节点（目录 + 文件叶，上限 MAX_BATCH_NODES，超出折叠 / 截断） */
+  nodes: DeleteBatchNode[]
+}
+
+/**
+ * 删除范围决策（deleteScope）：用户在目录树的某个节点（含文件叶 / 整个同步
+ * 目录 = 空前缀）做出的批量选择 —— 覆盖该前缀下全部删除候选，包括逐文件
+ * 挂起表装不下的部分。匹配规则：rel === prefix 或 rel 在 prefix 目录之下
+ *（prefix='' 匹配全部）；多 scope 命中时取最具体（最长前缀）者。
+ * 生命周期：连续多轮有效（每轮按匹配消费：delete 执行 / keep 抑制），
+ * 扫描完整且零匹配的轮自动剪枝（情形已消失，后续再出现按新事件重新询问）。
+ */
+export interface DeleteScope {
+  /** nfc 归一前缀；'' = 整个同步目录 */
+  prefix: string
+  /** 'delete' = 确认删除（下一轮执行）；'keep' = 保留不删（持续抑制） */
+  choice: 'delete' | 'keep'
+  /** 决策时刻（毫秒） */
+  at: number
+  /**
+   * 批量代际（决策时的快照 at；无快照的扁平决策为 0）：范围决策只对「没有逐文件
+   * 决策」的候选生效，盖章回写限定同代 —— 跨代的新批次决策不翻案旧代已盖章的
+   * 逐文件记录；同前缀的新决策覆盖旧槽位（最后一次为准）。keep 语义与逐文件
+   * 保留一致：持续抑制直至覆盖情形消失（引擎按零匹配剪枝）。
+   */
+  gen: number
+}
+
+/** listDeleteBatch 的返回形态（快照 + 当前 scopes + 引擎算好的未决策文件数） */
+export interface DeleteBatchView extends DeleteBatch {
+  /** 当前生效的删除范围决策（UI 据此渲染已决策 / 随上级决策状态） */
+  scopes: DeleteScope[]
+  /** 未决策文件数（total - 被 scopes 覆盖的文件数，引擎按树精确去重计算） */
+  undecided: number
+}
+
+/**
+ * 决策历史记录（decision-log.json 的条目形态）：用户对待处理挂起做出选择（或选择
+ * 忽略）时追加一条，供「最近处理记录」面板回看。纯展示性审计信息 —— 丢失 / 损坏
+ * 的最坏后果是历史列表变短，不影响同步正确性。
+ */
+export interface DecisionLogEntry {
+  /** 决策时刻（毫秒） */
+  at: number
+  /** 决策对象的文件相对路径；root-lost 类恒为 '.' */
+  rel: string
+  /** 'conflict' | 'delete' | 'root-lost' = 挂起类别；'ignore' = 用户选择忽略挂起 */
+  kind: 'conflict' | 'delete' | 'root-lost' | 'ignore'
+  /** 用户选择（忽略类为被忽略挂起原本的类别对应的合法值或 'ignore'） */
+  choice: string
+  /** 影响文件数（仅 root-lost 类目录级决策携带 = 受影响基线文件数） */
+  affected?: number
 }
 
 /** 基线 / WAL 日志行负载（{t:'set'|'del'|'clear'|'intent'|'done'|'abort', ...}） */

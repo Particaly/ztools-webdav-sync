@@ -58,6 +58,8 @@ const emit = defineEmits<{ close: [] }>()
   position: absolute;
   inset: 0;
   background: var(--overlay);
+  /* 轻磨砂：弹窗与页面内容形成景深层次 */
+  backdrop-filter: blur(3px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -68,7 +70,10 @@ const emit = defineEmits<{ close: [] }>()
   background: #fff;
   border: 1px solid var(--br-input);
   border-radius: 10px;
-  box-shadow: 0 12px 40px rgba(33, 41, 51, 0.18);
+  /* 双层阴影：近处锐利描定轮廓，远处柔和撑起悬浮感 */
+  box-shadow:
+    0 1px 2px rgba(33, 41, 51, 0.08),
+    0 12px 40px rgba(33, 41, 51, 0.18);
   overflow: hidden;
   /* 高度上限：不超过遮罩视口（上下各留 16px），避免弹窗撑破页面导致整页滚动 */
   max-height: calc(100% - 32px);
@@ -111,9 +116,11 @@ const emit = defineEmits<{ close: [] }>()
     display: flex;
     align-items: center;
     justify-content: center;
+    transition: background 0.12s ease, color 0.12s ease;
 
     &:hover {
       background: #f1f3f6;
+      color: var(--text-1);
     }
   }
 }

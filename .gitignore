@@ -12,5 +12,10 @@ src-ztools/preload/dist/
 # 运行工件而非源码，host-load-check 的 asar 内容检查会拒绝它们进入打包产物
 .throttle-bench*/
 
+# 图标设计源文件（SVG 源与多尺寸导出，仅供设计迭代；运行时只用 src-ztools/logo.png，
+# 已一次性从 design/exports 拷出，此后二者不再联动）
+design/
+
 # macOS Finder 元数据
 .DS_Store
+.zcode

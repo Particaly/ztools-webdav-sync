@@ -34,6 +34,8 @@ export function defaultPrefs(): Prefs {
     ignoreHidden: true,
     concurrency: 4,
     defaultRemoteDir: '',
+    // 功能测试目录：'' = 未选择（首次执行功能测试时弹目录选择器让用户指定）
+    probeRemoteDir: '',
     verifyMaxBytes: 50 * 1024 * 1024,
     deepVerify: false,
     deepVerifyDays: 7,
@@ -64,13 +66,13 @@ function normalizeRemote(p: string): string {
   return t.startsWith('/') ? t : '/' + t
 }
 
-// ---------- 档位文案（A 运行良好 / B 基本可用 / C 仅下载） ----------
+// ---------- 档位文案（A 运行良好 / B 基本可用 / C 仅可下载） ----------
 
 /** 档位短标签（主界面卡片 / 设置页展示）：面向用户的说法，不出现内部档位字母 */
 export function tierLabel(t?: DavTier | null): string {
   if (t === 'A') return '运行良好'
   if (t === 'B') return '基本可用'
-  if (t === 'C') return '仅下载'
+  if (t === 'C') return '仅可下载'
   return '尚未检测'
 }
 
@@ -89,7 +91,7 @@ interface PersistShape {
 }
 
 const state = reactive({
-  route: 'main' as 'main' | 'settings',
+  route: 'main' as 'main' | 'settings' | 'decisions',
   server: { serverUrl: '', username: '', password: '' } as DavConfig,
   dirs: [] as SyncDir[],
   prefs: defaultPrefs(),
@@ -101,10 +103,27 @@ const state = reactive({
   capabilities: null as DavCapabilities | null,
   probing: false, // 「重新探测」进行中
   showAdd: false,
+  /** 功能测试目录选择弹窗显隐：首次功能测试与设置页「修改测试目录」入口共用 */
+  showProbeDirPicker: false,
   conflictQueue: [] as ConflictInfo[],
   activeConflict: null as ConflictInfo | null,
   /** 冲突弹窗「对本轮剩余冲突都这样处理」勾选：置位后本轮后续冲突不再弹窗 */
   conflictApplyAll: false,
+  /**
+   * 远端根丢失决策弹窗的目标目录 id（null = 关闭）。自动触发统一经 autoPromptRootLost
+   *（pending-conflicts 事件、冷启动 / 回窗口 / 轮末兜底刷新等任一数据到手路径），
+   * 另有 DirRow 提示条 / 待处理面板 / 待处理中心的「去处理」直达入口；
+   * 「暂不处理」只关闭弹窗，决策仍以待处理挂起的形式保留（行内提示条可再进入）。
+   */
+  rootLostPromptDirId: null as string | null,
+  /** 全局待处理中心（PendingCenterModal）显隐；状态栏「N 项待处理」入口打开 */
+  pendingCenterOpen: false,
+  /**
+   * 待直达打开待处理面板的目录 id（null = 无）：待处理中心「去处理」的一次性通道
+   *（与 rootLostPromptDirId 同款），对应 DirRow 监听到后打开本地 PendingConflictsModal
+   * 并清回 null。
+   */
+  pendingPanelDirId: null as string | null,
   syncingAll: false,
   demo: false,
   cloudUsage: '' as string, // 设置页「云端占用」展示值
@@ -134,7 +153,7 @@ function capList<T>(items: T[] | null | undefined, renderDropped: (n: number) =>
 
 /** 持久化前的显式限长：lastResult 摘要中的列表与错误信息都有硬上限，写入体积有界 */
 function sanitizeDirForPersist(d: SyncDir): SyncDir {
-  const out: SyncDir = { ...d, progress: null, pendingConflicts: null, status: (d.status === 'syncing' ? 'idle' : d.status) as DirStatus }
+  const out: SyncDir = { ...d, progress: null, pendingConflicts: null, deleteBatch: null, status: (d.status === 'syncing' ? 'idle' : d.status) as DirStatus }
   out.errorMessage = d.errorMessage != null ? capStr(d.errorMessage) : null
   out.errorDetail = d.errorDetail != null ? capStr(d.errorDetail) : null
   if (d.lastResult) {
@@ -263,7 +282,8 @@ async function testConnection(opts?: { notify?: boolean }): Promise<TestResult> 
   } else {
     state.testing = true
     try {
-      result = await window.services.dav.testConnection(state.server)
+      // 附带能力摘要按已选测试目录取（未选择时为基址），档位展示口径与「功能测试」一致
+      result = await window.services.dav.testConnection(state.server, state.prefs.probeRemoteDir || undefined)
     } catch (e) {
       // 网络异常等 preload 抛错同样要给出可见反馈，而不是静默失败
       result = { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -286,9 +306,12 @@ async function testConnection(opts?: { notify?: boolean }): Promise<TestResult> 
 }
 
 /**
- * 重新探测服务器能力与档位（设置页「重新探测」入口）。
- * 复用 preload 的 probeCapabilities(cfg, force=true)：忽略缓存现场实测，
+ * 重新探测服务器能力与档位（设置页「功能测试」入口）。
+ * 复用 preload 的 probeCapabilities(cfg, force=true, remotePath)：忽略缓存现场实测，
  * 结果写回 state.capabilities 并以通知反馈档位结论。
+ * 探测目标为用户指定的测试目录（prefs.probeRemoteDir）—— WebDAV 服务器不同子树
+ * 的写权限可能不同，根目录不一定可写，写权限必须按用户认可的目录实测；尚未选择
+ * 测试目录时（首次功能测试）先弹远端目录选择器，确认后自动开始本次测试。
  */
 async function reprobe(): Promise<void> {
   if (!state.server.serverUrl.trim()) {
@@ -299,9 +322,13 @@ async function reprobe(): Promise<void> {
     toast.warning('当前环境不可用', '浏览器预览模式没有连接服务器的能力')
     return
   }
+  if (!state.prefs.probeRemoteDir) {
+    state.showProbeDirPicker = true
+    return
+  }
   state.probing = true
   try {
-    const caps = await window.services.dav.probeCapabilities({ ...state.server }, true)
+    const caps = await window.services.dav.probeCapabilities({ ...state.server }, true, state.prefs.probeRemoteDir)
     state.capabilities = caps
     toast.success(`检测完成：${tierLabel(caps.tier)}`, tierHint(caps.tier))
   } catch (e) {
@@ -309,6 +336,21 @@ async function reprobe(): Promise<void> {
   } finally {
     state.probing = false
   }
+}
+
+/**
+ * 确认功能测试目录（首次功能测试的选择与设置页「修改测试目录」共用入口）。
+ * 写入 prefs.probeRemoteDir（经 prefs 深度 watch 自动持久化）并立即以新目录执行
+ * 一次功能测试 —— 换目录的动机通常是原目录不可写，当场重测直接给出结论；
+ * 选择了相同目录时只关闭弹窗，不重复发起探测。
+ * @param path 远端目录选择器回传的绝对路径（以 / 开头；容错补齐缺省的起始斜杠）
+ */
+function confirmProbeDir(path: string) {
+  state.showProbeDirPicker = false
+  const p = String(path || '').trim()
+  if (!p || p === state.prefs.probeRemoteDir) return
+  state.prefs.probeRemoteDir = p.startsWith('/') ? p : '/' + p
+  void reprobe()
 }
 
 // ---------- 同步 ----------
@@ -380,7 +422,9 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
       prefs,
       {
         onProgress: (p) => {
-          // verifyDone / verifyTotal：规划期内容校验进度的可选透传（UI 不强制展示，数据要在）
+          // verifyDone / verifyTotal：规划期内容校验进度的可选透传（UI 不强制展示，数据要在）；
+          // stage / currentOp / currentFile / scanBytesTotal：细分阶段与当前任务，
+          // 供 DirRow 折算「前置 10% + 传输字节 80% + 后置 10%」并展示「正在…」文案
           dir.progress = {
             filesDone: p.filesDone,
             filesTotal: p.filesTotal,
@@ -388,7 +432,13 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
             bytesTotal: p.bytesTotal,
             verifyDone: p.verifyDone,
             verifyTotal: p.verifyTotal,
+            stage: p.stage,
+            currentOp: p.currentOp,
+            currentFile: p.currentFile,
+            scanBytesTotal: p.scanBytesTotal,
           }
+          // 云端占用估算取「扫描到的全部文件字节」；bytesTotal 已改为传输字节口径，不再作占用来源
+          if (p.scanBytesTotal) dir.lastBytesTotal = p.scanBytesTotal
         },
         onConflict: (info) =>
           new Promise<ConflictChoice>((resolve) => {
@@ -400,7 +450,8 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
       }
     )
     dir.lastResult = summary
-    dir.lastBytesTotal = dir.progress?.bytesTotal ?? dir.lastBytesTotal
+    // 云端占用估算：扫描到的全部文件字节（progress 已随轮末清空，这里最后留存一次）
+    dir.lastBytesTotal = dir.progress?.scanBytesTotal ?? dir.lastBytesTotal
     dir.lastSyncAt = Date.now()
     dir.justCompleted = true
     dir.conflictFile = null
@@ -673,16 +724,21 @@ function applySlotView(slot: SchedulerSlotView) {
   if (slot.state === 'running' || slot.state === 'queued') {
     dir.status = 'syncing'
     if (slot.progress) {
+      const p = slot.progress
       dir.progress = {
-        filesDone: slot.progress.filesDone,
-        filesTotal: slot.progress.filesTotal,
-        bytesDone: slot.progress.bytesDone,
-        bytesTotal: slot.progress.bytesTotal,
-        verifyDone: slot.progress.verifyDone,
-        verifyTotal: slot.progress.verifyTotal,
+        filesDone: p.filesDone,
+        filesTotal: p.filesTotal,
+        bytesDone: p.bytesDone,
+        bytesTotal: p.bytesTotal,
+        verifyDone: p.verifyDone,
+        verifyTotal: p.verifyTotal,
+        stage: p.stage,
+        currentOp: p.currentOp,
+        currentFile: p.currentFile,
+        scanBytesTotal: p.scanBytesTotal,
       }
-      // 轮末 progress 即清空，云端占用估算在最后一次进度里留存
-      if (slot.progress.bytesTotal) dir.lastBytesTotal = slot.progress.bytesTotal
+      // 轮末 progress 即清空，云端占用估算在最后一次进度里留存（扫描字节口径）
+      if (p.scanBytesTotal) dir.lastBytesTotal = p.scanBytesTotal
     }
   }
 }
@@ -727,7 +783,9 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
     dir.conflictFile = null
     if (summary) dir.lastResult = summary
     dir.lastSyncAt = Date.now()
-    dir.justCompleted = true
+    // 部分完成轮（有删除确认 / 冲突挂起）不亮「同步完成」绿幅 —— 有事项在等
+    // 用户处理时，行内状态保持低调的「已同步」，把注意力让给黄色待处理提示条
+    dir.justCompleted = !(disp && disp.tone === 'partial')
     if (disp && disp.tone === 'partial') toast.info(disp.title, '回窗口后在文件夹列表统一处理')
     if (summary?.warnings?.length) {
       toast.warning(summary.warnings[0], summary.warnings.length > 1 ? `另有 ${summary.warnings.length - 1} 条提示` : undefined)
@@ -737,6 +795,12 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
     }, 12000)
   }
   dir.progress = null
+  // 摘要带挂起计数（删除确认 / 后台冲突 defer / 根丢失）时兜底拉一次该目录的
+  // 挂起列表：pending-conflicts 事件是主通道，但任何送达缺口都不该让「处理入口」
+  // 消失 —— 目录行提示条、状态栏入口与待处理中心都依赖这份数据
+  const heldCount =
+    (Number(summary?.deleteHeld) || 0) + (Number(summary?.deferredConflicts) || 0) + (Number(summary?.rootLostHeld) || 0)
+  if (heldCount > 0) void refreshPendingConflicts(dir)
   // 本轮结束：清空「应用到全部」勾选，下一轮冲突重新询问
   state.conflictApplyAll = false
   persist()
@@ -810,21 +874,56 @@ function applyPendingConflicts(dirId: string, items: Array<{ rel: string; create
   const dir = state.dirs.find((d) => d.id === dirId)
   if (!dir) return
   dir.pendingConflicts = items.slice(0, MAX_LIST_ITEMS)
+  // 「云端文件夹丢失」待决策的自动弹窗不认事件上的 newlyNotified（只在轮末发一次，
+  // 渲染层不在场时即永久丢失）：数据到手即交给 autoPromptRootLost 判定是否补弹
+  autoPromptRootLost()
 }
 
-/** 拉取某目录当前挂起冲突（面板打开 / 事件外的兜底刷新） */
+/**
+ * 「云端文件夹丢失」决策弹窗的统一自动触发，任一数据到手路径都会调用（事件 /
+ * 冷启动 / 回窗口 / 轮末兜底 / 面板打开刷新）：发现未决策的 root-lost 挂起、且弹窗
+ * 从未为这条登记展示过（rootLostPromptedAt ≠ 挂起 createdAt）时弹窗。送达缺口不再
+ * 让弹窗失约；已展示过的登记（含「暂不处理」）也不自动重复打扰，行内提示条可再进入。
+ * 待处理中心开着时跳过 —— 中心自身已把根丢失分组排最前，且弹窗会被面板压在下面。
+ */
+function autoPromptRootLost() {
+  if (state.rootLostPromptDirId && !state.dirs.some((d) => d.id === state.rootLostPromptDirId)) {
+    state.rootLostPromptDirId = null
+  }
+  if (state.rootLostPromptDirId || state.pendingCenterOpen) return
+  for (const d of state.dirs) {
+    const rec = (d.pendingConflicts ?? []).find((p) => p.kind === 'root-lost' && !p.choice)
+    if (rec && d.rootLostPromptedAt !== rec.createdAt) {
+      state.rootLostPromptDirId = d.id
+      return
+    }
+  }
+}
+
+/** 目录是否存在未决策的「云端文件夹丢失」挂起（提示条 / 面板入口的显示条件） */
+export function dirRootLostOpen(d: SyncDir): boolean {
+  return (d.pendingConflicts ?? []).some((p) => p.kind === 'root-lost' && !p.choice)
+}
+
+/** 拉取某目录当前挂起冲突（面板打开 / 事件外的兜底刷新）。
+ *  同步拉取批量删除快照（listDeleteBatch）—— 删除确认的目录树数据源：逐文件
+ *  挂起表有 500 条上限，超限部分没有逐文件记录，只有快照承载；两类数据同源
+ *  同刷新时机（面板打开 / 轮末兜底 / 冷启动 / 回窗口），一处拉取保证口径一致。 */
 async function refreshPendingConflicts(dir: SyncDir) {
   if (!window.services || state.demo) return
+  const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
   try {
-    const items = await window.services.sync.listPendingConflicts({
-      id: dir.id,
-      localPath: dir.localPath,
-      remotePath: dir.remotePath,
-      mode: dir.mode,
-    })
+    const items = await window.services.sync.listPendingConflicts(dirArg)
     dir.pendingConflicts = (items || []).slice(0, MAX_LIST_ITEMS)
+    // 兜底刷新也是数据到手路径：事件丢失后的回窗口 / 冷启动 / 面板打开都经这里补弹
+    autoPromptRootLost()
   } catch {
     /* 读取失败保持旧值 */
+  }
+  try {
+    dir.deleteBatch = await window.services.sync.listDeleteBatch(dirArg)
+  } catch {
+    dir.deleteBatch = null
   }
 }
 
@@ -832,17 +931,123 @@ async function refreshAllPendingConflicts() {
   for (const d of state.dirs) await refreshPendingConflicts(d)
 }
 
-/** 全目录未处理（无 choice）挂起数（状态栏角标等展示） */
+/** 全目录未处理（无 choice）挂起数（状态栏角标等展示）：逐条类（冲突 / 根丢失）
+ *  按挂起记录计，删除确认按批量快照的未决策数计（undecided 是引擎真值 —— 逐文件
+ *  记录有 500 条上限，超出部分只有快照知道；快照缺失时退回记录口径兜底） */
 const pendingConflictTotal = computed(() =>
-  state.dirs.reduce((acc, d) => acc + (d.pendingConflicts?.filter((p) => !p.choice).length ?? 0), 0)
+  state.dirs.reduce((acc, d) => {
+    const itemOpen = (d.pendingConflicts ?? []).filter((p) => !p.choice && p.kind !== 'delete').length
+    const deleteOpen = d.deleteBatch ? d.deleteBatch.undecided : (d.pendingConflicts ?? []).filter((p) => !p.choice && p.kind === 'delete').length
+    return acc + itemOpen + deleteOpen
+  }, 0)
 )
 
 /**
- * 为一批挂起记录落 choice（逐条或「对剩余都这样处理」）。冲突类 local / remote /
- * both；删除确认类（kind='delete'）delete = 确认删除（下一轮执行）、keep = 保留不删。
- * 落完刷新面板并触发一轮手动同步（下一轮会按 choice 自动解决；手动成功同时清退避）。
+ * 全局待处理中心的目录分组（仅含有未决策挂起的目录，根丢失排最前）：每目录按
+ * 根丢失 / 删除确认 / 冲突三类计数，供聚合面板渲染与「去处理」直达。删除确认
+ * 计数与角标同口径：优先批量快照的 undecided（真值，覆盖超上限部分）。
  */
-async function applyPendingChoices(dir: SyncDir, rels: string[], choice: 'local' | 'remote' | 'both' | 'delete' | 'keep') {
+const pendingCenterGroups = computed(() => {
+  const groups: Array<{ dir: SyncDir; rootLost: number; deleteConfirm: number; conflict: number }> = []
+  for (const d of state.dirs) {
+    let rootLost = 0
+    let conflict = 0
+    for (const p of d.pendingConflicts ?? []) {
+      if (p.choice) continue
+      if (p.kind === 'root-lost') rootLost++
+      else if (p.kind !== 'delete') conflict++
+    }
+    const deleteConfirm = d.deleteBatch
+      ? d.deleteBatch.undecided
+      : (d.pendingConflicts ?? []).filter((p) => !p.choice && p.kind === 'delete').length
+    if (rootLost + deleteConfirm + conflict > 0) groups.push({ dir: d, rootLost, deleteConfirm, conflict })
+  }
+  groups.sort((a, b) => (b.rootLost > 0 ? 1 : 0) - (a.rootLost > 0 ? 1 : 0))
+  return groups
+})
+
+/** 打开全局待处理中心（状态栏入口）：先全量刷新各目录挂起列表保证数据新鲜 */
+async function openPendingCenter() {
+  state.pendingCenterOpen = true
+  await refreshAllPendingConflicts()
+}
+
+/** 决策记录页的目录分组行：开放计数（待决策）+ 已决策进度（部分决策的展示与判定） */
+export interface DecisionGroup {
+  dir: SyncDir
+  /** 未决策的「云端文件夹丢失」挂起数（0/1，目录级决策） */
+  rootLost: number
+  /** 未决策的删除确认数（批量快照 undecided 真值；无快照退回逐文件记录口径） */
+  deleteConfirm: number
+  /** 未决策的冲突数（无 choice 的冲突挂起） */
+  conflict: number
+  /** 已选择、待下一轮生效的冲突数（同一批决策做了一部分） */
+  decidedConflict: number
+  /** 已决策的删除数（快照口径 total - undecided；无快照退回已选逐文件记录数） */
+  decidedDelete: number
+}
+
+/**
+ * 决策记录页的目录分组（待决策 / 部分决策两类，互斥）：
+ *   待决策 —— 有未决策事项且同一批里还没做过任何选择（根丢失 / 删除确认 / 冲突）；
+ *   部分决策 —— 同一批事项里已做出部分选择但还有未决策的剩余（删除树已决策部分
+ *   子树、冲突已选部分文件），可从决策记录页「继续处理」完成剩余决策。
+ * 已全部决策（无开放项）的目录不出现；仅剩「已选待生效、无开放项」的目录也不出现
+ *（选择由下一轮同步自动消费，无决策可继续）。待决策组内根丢失排最前（与待处理
+ * 中心同口径）；删除确认计数与角标同源（优先快照 undecided 真值）。
+ */
+const decisionGroups = computed(() => {
+  const pending: DecisionGroup[] = []
+  const partial: DecisionGroup[] = []
+  for (const d of state.dirs) {
+    let rootLost = 0
+    let conflict = 0
+    let decidedConflict = 0
+    for (const p of d.pendingConflicts ?? []) {
+      if (p.kind === 'root-lost') {
+        if (!p.choice) rootLost++
+        continue
+      }
+      if (p.kind === 'delete') continue
+      if (p.choice) decidedConflict++
+      else conflict++
+    }
+    const batch = d.deleteBatch
+    const deleteConfirm = batch
+      ? batch.undecided
+      : (d.pendingConflicts ?? []).filter((p) => !p.choice && p.kind === 'delete').length
+    const decidedDelete = batch
+      ? Math.max(0, batch.total - batch.undecided)
+      : (d.pendingConflicts ?? []).filter((p) => p.choice && p.kind === 'delete').length
+    if (!rootLost && !conflict && !deleteConfirm) continue
+    const g: DecisionGroup = { dir: d, rootLost, deleteConfirm, conflict, decidedConflict, decidedDelete }
+    const isPartial = (decidedConflict > 0 && conflict > 0) || (decidedDelete > 0 && deleteConfirm > 0)
+    ;(isPartial ? partial : pending).push(g)
+  }
+  pending.sort((a, b) => (b.rootLost > 0 ? 1 : 0) - (a.rootLost > 0 ? 1 : 0))
+  return { pending, partial }
+})
+
+/**
+ * 待处理中心「去处理」直达：根丢失目录级决策弹 RootLostModal（既有 rootLostPromptDirId
+ * 通道），其余经 pendingPanelDirId 一次性通道让对应 DirRow 打开本地待处理面板。
+ */
+function goPendingDir(d: SyncDir) {
+  if ((d.pendingConflicts ?? []).some((p) => p.kind === 'root-lost' && !p.choice)) {
+    state.rootLostPromptDirId = d.id
+  } else {
+    state.pendingPanelDirId = d.id
+  }
+  state.pendingCenterOpen = false
+}
+
+/**
+ * 为一批冲突挂起记录落 choice（逐条或「对剩余都这样处理」）：local / remote / both。
+ * （删除确认类不走这里 —— 目录树决策走 applyDeleteScope 的范围通道，覆盖逐文件
+ * 记录装不下的部分。）落完刷新面板并触发一轮手动同步（下一轮按 choice 自动解决）；
+ * 同步进行中不排队（下一轮自动消费选择），改为明确提示而不是静默吞掉。
+ */
+async function applyPendingChoices(dir: SyncDir, rels: string[], choice: 'local' | 'remote' | 'both') {
   if (!window.services || state.demo || !rels.length) return
   const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
   try {
@@ -851,8 +1056,40 @@ async function applyPendingChoices(dir: SyncDir, rels: string[], choice: 'local'
     toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
   }
   await refreshPendingConflicts(dir)
-  const remaining = dir.pendingConflicts?.filter((p) => !p.choice).length ?? 0
+  const remaining = (dir.pendingConflicts ?? []).filter((p) => !p.choice && p.kind !== 'delete' && p.kind !== 'root-lost').length
   toast.success('已记录处理方式', remaining > 0 ? `还有 ${remaining} 个待处理` : '下次同步时生效')
+  if (dir.status === 'syncing') {
+    toast.info('正在同步，本次选择将在下一轮生效')
+    return
+  }
+  void syncDir(dir)
+}
+
+/**
+ * 落一条删除范围决策（目录树节点或底部「全部」按钮）：引擎按前缀写入 scope 并
+ * 同步回写既有逐文件记录，覆盖逐文件挂起表装不下的部分。落完刷新面板数据并触发
+ * 一轮手动同步（下一轮按 scope 自动执行 / 抑制）；同步进行中改为明确提示。
+ * @param rel 范围前缀：'' = 全部；目录 rel = 该目录及子树；文件 rel = 单文件
+ */
+async function applyDeleteScope(dir: SyncDir, rel: string, choice: 'delete' | 'keep') {
+  if (!window.services || state.demo) return
+  const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
+  try {
+    const res = await window.services.sync.setDeleteScope(dirArg, rel, choice)
+    const scope = rel ? `「${rel}」` : ''
+    toast.success(
+      '已记录处理方式',
+      res && res.covered > 0 ? `${scope}影响 ${res.covered} 个文件，下次同步时生效` : '下次同步时生效'
+    )
+  } catch (e) {
+    toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
+    return
+  }
+  await refreshPendingConflicts(dir)
+  if (dir.status === 'syncing') {
+    toast.info('正在同步，本次选择将在下一轮生效')
+    return
+  }
   void syncDir(dir)
 }
 
@@ -868,6 +1105,32 @@ async function ignorePendingConflict(dir: SyncDir, rel: string) {
     /* 清除失败保留旧值 */
   }
   await refreshPendingConflicts(dir)
+}
+
+/**
+ * 「云端文件夹丢失」决策（kind='root-lost' 挂起，rel='.'）：把用户的选择写入挂起
+ * 记录并立即触发一轮同步 —— 下一轮根探测消费该选择：
+ *   upload       —— 重建云端文件夹，电脑上的文件按根重建保护语义重新上传；
+ *   remove-local —— 跟随云端删除，电脑上已同步的文件移入回收站（未同步过的新文件
+ *                   保留并上传到重建的云端文件夹；本地有改动的文件同样保留）。
+ * 选择前每轮同步以「云端文件夹已不存在，等待确认」收场，零删除零传输。
+ */
+async function resolveRootLost(dir: SyncDir, choice: 'upload' | 'remove-local') {
+  state.rootLostPromptDirId = null
+  if (!window.services || state.demo) return
+  const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
+  try {
+    await window.services.sync.setPendingChoice(dirArg, '.', choice)
+  } catch (e) {
+    toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
+    return
+  }
+  await refreshPendingConflicts(dir)
+  toast.success(
+    '已记录处理方式',
+    choice === 'upload' ? '正在重建云端文件夹并重新上传' : '正在移除电脑上已同步的文件'
+  )
+  void syncDir(dir)
 }
 
 /** 绑定调度器：订阅 + 握手（幂等；demo / 浏览器预览形态跳过） */
@@ -944,7 +1207,7 @@ async function init() {
   if (configured.value) {
     // 先读能力缓存（无网络开销）立即呈现档位；随后的连通性探测会刷新它
     if (window.services) {
-      void window.services.dav.getCachedCapabilities({ ...state.server }).then((c) => {
+      void window.services.dav.getCachedCapabilities({ ...state.server }, state.prefs.probeRemoteDir || undefined).then((c) => {
         if (c && !state.capabilities) state.capabilities = c
       })
     }
@@ -968,6 +1231,19 @@ function applyDemo(scene: string) {
   }
   state.connected = true
   state.connChecked = true
+  // 演示能力档位：B 档让首页档位徽标（含悬浮图例）与设置页检测结果可见；真实数据来自探测
+  state.capabilities = {
+    tier: 'B',
+    probedAt: Date.now(),
+    writable: true,
+    etag: { present: true, weak: true, stable: true },
+    conditional: { ifMatch: true, ifNoneMatch: true },
+    depthInfinity: false,
+    etagPropagation: false,
+    mtimePrecision: 's',
+    collectionRedirect: false,
+    notes: [],
+  }
   const dirs: SyncDir[] = [
     {
       id: 'demo-1',
@@ -1011,11 +1287,16 @@ function applyDemo(scene: string) {
   ]
   if (scene === 'syncing') {
     dirs[0].status = 'syncing'
+    // 演示新进度形态：传输阶段按字节推进（分母 = 计划上传+下载字节），并携带当前任务
     dirs[0].progress = {
       filesDone: 128,
       filesTotal: 342,
       bytesDone: Math.round(12.8 * 1024 * 1024),
       bytesTotal: Math.round(34.6 * 1024 * 1024),
+      stage: 'transfer',
+      currentOp: 'upload',
+      currentFile: 'Assets/Banners/hero-banner-v2.png',
+      scanBytesTotal: Math.round(128 * 1024 * 1024),
     }
   } else if (scene === 'conflict') {
     dirs[0].status = 'conflict'
@@ -1036,6 +1317,69 @@ function applyDemo(scene: string) {
       if (choice === 'defer') return
       void applyManualConflict(dirs[0].id, state.activeConflict!, choice)
     })
+  } else if (scene === 'pending') {
+    // 待处理面板预览：① 删除确认目录树（批量删除快照，含已决策子树徽标）+
+    // ② 无快照的逐文件删除兜底列表 + ③ 冲突三选一列表；状态栏角标与目录行
+    // 提示条同源计数
+    dirs[0].pendingConflicts = [
+      { rel: 'Spec/接口约定.md', createdAt: todayAt(10, 12), local: { size: 4300, mtimeMs: todayAt(10, 12) }, remote: { size: 4710, mtimeMs: todayAt(10, 13) } },
+      { rel: 'Notes/会议记录.md', createdAt: todayAt(10, 15), local: { size: 2100, mtimeMs: todayAt(10, 15) }, remote: { size: 2100, mtimeMs: todayAt(10, 16) }, choice: 'local' },
+    ]
+    dirs[0].deleteBatch = {
+      at: Date.now() - 4 * 60000,
+      total: 1286,
+      bytes: Math.round(2.3 * 1024 * 1024 * 1024),
+      undecided: 86,
+      scopes: [{ prefix: 'Photos/2024/RAW', choice: 'keep', at: Date.now() - 2 * 60000, gen: Date.now() - 4 * 60000 }],
+      nodes: [
+        { rel: 'Photos', isDir: true, files: 1200, bytes: Math.round(2.2 * 1024 * 1024 * 1024) },
+        { rel: 'Photos/2024', isDir: true, files: 860, bytes: Math.round(1.6 * 1024 * 1024 * 1024) },
+        { rel: 'Photos/2024/RAW', isDir: true, files: 640, bytes: Math.round(1.4 * 1024 * 1024 * 1024) },
+        { rel: 'Photos/2024/精选', isDir: true, files: 220, bytes: Math.round(0.2 * 1024 * 1024 * 1024) },
+        { rel: 'Photos/2023', isDir: true, files: 340, bytes: Math.round(0.6 * 1024 * 1024 * 1024) },
+        { rel: 'Docs', isDir: true, files: 80, bytes: Math.round(96 * 1024 * 1024) },
+        { rel: 'Docs/合同', isDir: true, files: 60, bytes: Math.round(88 * 1024 * 1024) },
+        { rel: 'Docs/合同/外包协议.pdf', isDir: false, files: 1, bytes: Math.round(12 * 1024 * 1024) },
+        { rel: 'Docs/发票.xlsx', isDir: false, files: 1, bytes: Math.round(3 * 1024 * 1024) },
+        { rel: 'readme.txt', isDir: false, files: 1, bytes: 2048 },
+      ],
+    }
+    // ② 兜底形态：有逐文件删除记录但无快照（旧数据 / 未到阈值单文件挂起）
+    dirs[1].pendingConflicts = [
+      { rel: 'Assets/旧版海报.psd', createdAt: todayAt(9, 40), kind: 'delete', local: { size: 184000000, mtimeMs: todayAt(9, 40) }, remote: { size: 0, mtimeMs: 0, etag: '' } },
+      { rel: 'Assets/废弃Logo.ai', createdAt: todayAt(9, 41), kind: 'delete', local: { size: 42000000, mtimeMs: todayAt(9, 41) }, remote: { size: 0, mtimeMs: 0, etag: '' } },
+    ]
+  } else if (scene === 'decisions') {
+    // 决策记录页预览：① 部分决策（删除树已随范围决策一部分 + 冲突已选一部分）+
+    // ② 待决策（纯冲突）+ ③ 待决策（根丢失目录级决策，组内排最前），历史为静态样例
+    state.route = 'decisions'
+    dirs[0].pendingConflicts = [
+      { rel: 'Spec/接口约定.md', createdAt: todayAt(10, 12), local: { size: 4300, mtimeMs: todayAt(10, 12) }, remote: { size: 4710, mtimeMs: todayAt(10, 13) } },
+      { rel: 'Notes/会议记录.md', createdAt: todayAt(10, 15), local: { size: 2100, mtimeMs: todayAt(10, 15) }, remote: { size: 2100, mtimeMs: todayAt(10, 16) }, choice: 'local' },
+      { rel: 'Docs/评审纪要.md', createdAt: todayAt(10, 16), local: { size: 3600, mtimeMs: todayAt(10, 16) }, remote: { size: 3600, mtimeMs: todayAt(10, 17) }, choice: 'remote' },
+    ]
+    dirs[0].deleteBatch = {
+      at: Date.now() - 4 * 60000,
+      total: 1286,
+      bytes: Math.round(2.3 * 1024 * 1024 * 1024),
+      undecided: 86,
+      scopes: [{ prefix: 'Photos/2024/RAW', choice: 'keep', at: Date.now() - 2 * 60000, gen: Date.now() - 4 * 60000 }],
+      nodes: [
+        { rel: 'Photos', isDir: true, files: 1200, bytes: Math.round(2.2 * 1024 * 1024 * 1024) },
+        { rel: 'Photos/2024', isDir: true, files: 860, bytes: Math.round(1.6 * 1024 * 1024 * 1024) },
+        { rel: 'Photos/2024/RAW', isDir: true, files: 640, bytes: Math.round(1.4 * 1024 * 1024 * 1024) },
+        { rel: 'Docs', isDir: true, files: 80, bytes: Math.round(96 * 1024 * 1024) },
+        { rel: 'Docs/合同', isDir: true, files: 60, bytes: Math.round(88 * 1024 * 1024) },
+        { rel: 'readme.txt', isDir: false, files: 1, bytes: 2048 },
+      ],
+    }
+    dirs[1].pendingConflicts = [
+      { rel: 'Assets/横幅-v3.png', createdAt: todayAt(9, 40), local: { size: 821000, mtimeMs: todayAt(9, 40) }, remote: { size: 819000, mtimeMs: todayAt(9, 42) } },
+      { rel: 'Assets/图标集.sketch', createdAt: todayAt(9, 44), local: { size: 42000000, mtimeMs: todayAt(9, 44) }, remote: { size: 41000000, mtimeMs: todayAt(9, 45) } },
+    ]
+    dirs[2].pendingConflicts = [
+      { rel: '.', createdAt: todayAt(10, 30), kind: 'root-lost', local: { size: 342, mtimeMs: todayAt(10, 30) }, remote: { size: 0, mtimeMs: 0, etag: '' } },
+    ]
   } else if (scene === 'done') {
     dirs[0].lastSyncAt = Date.now() - 5000
     dirs[0].justCompleted = true
@@ -1086,6 +1430,7 @@ export function useStore() {
     init,
     testConnection,
     reprobe,
+    confirmProbeDir,
     syncDir,
     syncAll,
     cancelSync,
@@ -1101,10 +1446,17 @@ export function useStore() {
     resolveConflict,
     openConflictFor,
     pendingConflictTotal,
+    pendingCenterGroups,
+    decisionGroups,
+    openPendingCenter,
+    goPendingDir,
     refreshPendingConflicts,
     refreshAllPendingConflicts,
+    autoPromptRootLost,
     applyPendingChoices,
+    applyDeleteScope,
     ignorePendingConflict,
+    resolveRootLost,
     openGuide,
     outPlugin,
     persist,

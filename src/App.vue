@@ -2,18 +2,21 @@
 import { onMounted, ref, watch } from 'vue'
 import MainView from './views/MainView.vue'
 import SettingsView from './views/SettingsView.vue'
+import DecisionsView from './views/DecisionsView.vue'
 import ConflictModal from './components/ConflictModal.vue'
+import RootLostModal from './components/RootLostModal.vue'
+import PendingCenterModal from './components/PendingCenterModal.vue'
 import AppToasts from './components/ui/AppToasts.vue'
 import { useStore } from './composables/store'
 
 const store = useStore()
 
-/** 路由过渡方向：进设置自右滑入，返回主页自左滑入 */
+/** 路由过渡方向：进设置 / 决策记录自右滑入，返回主页自左滑入 */
 const routeAnim = ref('route-next')
 watch(
   () => store.state.route,
   (to) => {
-    routeAnim.value = to === 'settings' ? 'route-next' : 'route-prev'
+    routeAnim.value = to === 'main' ? 'route-prev' : 'route-next'
   }
 )
 
@@ -29,9 +32,12 @@ onMounted(async () => {
   <div class="app-shell">
     <Transition :name="routeAnim" mode="out-in">
       <MainView v-if="store.state.route === 'main'" />
+      <DecisionsView v-else-if="store.state.route === 'decisions'" />
       <SettingsView v-else />
     </Transition>
     <ConflictModal />
+    <RootLostModal />
+    <PendingCenterModal />
     <AppToasts />
   </div>
 </template>

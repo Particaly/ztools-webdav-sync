@@ -141,6 +141,11 @@ function onTriggerKeydown(e: KeyboardEvent) {
   font-size: 11px;
   font-weight: 500;
   color: var(--text-1);
+  transition: border-color 0.15s ease, background 0.15s ease;
+
+  &:hover:not(:disabled) {
+    border-color: #c9d0d7;
+  }
 
   &:disabled {
     cursor: default;
@@ -185,6 +190,7 @@ function onTriggerKeydown(e: KeyboardEvent) {
   color: var(--text-1);
   text-align: left;
   white-space: nowrap;
+  transition: background 0.1s ease;
 
   &.active {
     background: #f1f3f6;

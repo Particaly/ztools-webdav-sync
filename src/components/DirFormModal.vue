@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import RemoteDirModal from './RemoteDirModal.vue'
-import { AppButton, AppInput, AppModal, AppSegmented, AppSelect, AppSwitch } from './ui'
+import { AppButton, AppInput, AppModal, AppSegmented, AppSelect, AppSwitch, InfoTip } from './ui'
 import { useStore, suggestRemote } from '../composables/store'
 import { intervalOptions, strategyOptions } from '../composables/options'
 import { toast } from '../composables/toast'
@@ -258,32 +258,33 @@ function browseRemote() {
               <div v-show="advancedOpen" class="flex flex-col gap-[6px]">
                 <!-- 「单独设置这个文件夹」开关：位于冲突处理上方，说明同时涵盖开 / 关两种状态 -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                  <div class="flex flex-col gap-[2px] min-w-0">
+                  <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">单独设置这个文件夹</span>
-                    <span class="text-[11px] text-ink-4">开启后，下面的选项只对这个文件夹生效；关闭则使用「设置」里的通用选项</span>
+                    <InfoTip text="开启后，以下选项仅对此目录生效；关闭时跟随「设置」中的全局选项" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="overrideOn" />
                 </div>
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                  <div class="flex flex-col gap-[2px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">两边都改了怎么办</span>
-                    <span class="text-[11px] text-ink-4">同一个文件在电脑和云端都被修改时，怎么处理</span>
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">冲突处理</span>
+                    <InfoTip text="同一文件在本地与云端均被修改时的处理策略；「每次询问」会将冲突挂起，由你逐个确认" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSelect v-model="conflictStrategy" :options="strategyOptions" :width="104" :disabled="!overrideOn" />
                 </div>
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                  <div class="flex flex-col gap-[2px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">不同步隐藏文件和系统文件</span>
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">忽略隐藏文件</span>
+                    <InfoTip text="路径中以 . 开头的隐藏文件与目录不参与同步" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="ignoreHidden" :disabled="!overrideOn" />
                 </div>
                 <div class="flex items-center gap-3 pt-[4px] mb-[2px]">
-                  <div class="flex flex-col gap-[2px] min-w-0">
+                  <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">检查频率</span>
-                    <span class="text-[11px] text-ink-4">这个文件夹每隔多久检查一次云端有没有更新</span>
+                    <InfoTip text="此目录独立的轮询间隔（覆盖全局设置）" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSelect v-model="intervalMin" :options="intervalOptions" :width="104" :disabled="!overrideOn" />
@@ -320,19 +321,26 @@ function browseRemote() {
   background: var(--br-divider);
 }
 
-/* 高级设置折叠头：可点击整行展开 / 收起 */
+/* 高级设置折叠头：可点击整行展开 / 收起，悬停给底色反馈 */
 .adv-header {
   display: flex;
   align-items: center;
   gap: 6px;
   border: none;
   background: transparent;
-  padding: 0;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  border-radius: 6px;
   cursor: pointer;
+  transition: background 0.12s ease;
+
+  &:hover {
+    background: #f1f3f6;
+  }
 
   .adv-chev {
     color: var(--text-muted);
-    transition: transform 0.15s;
+    transition: transform 0.2s var(--ease-swift);
 
     &.open {
       transform: rotate(90deg);

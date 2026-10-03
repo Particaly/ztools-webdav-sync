@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import RemoteDirModal from '../components/RemoteDirModal.vue'
-import { AppButton, AppIconButton, AppInput, AppSelect, AppSwitch } from '../components/ui'
+import { AppButton, AppIconButton, AppInput, AppSelect, AppSwitch, InfoTip } from '../components/ui'
 import { useStore, defaultPrefs, tierLabel, tierHint } from '../composables/store'
 import { toast } from '../composables/toast'
 import { intervalOptions, strategyOptions } from '../composables/options'
@@ -12,8 +12,6 @@ const store = useStore()
 const s = store.state
 
 const showDirPicker = ref(false)
-/** 「技术详情」展开状态：能力探测的原始明细（etag / 条件请求 / mtime / 探测备注），默认收起 */
-const showTechDetail = ref(false)
 
 const concurrencyOptions = [1, 2, 3, 4, 6, 8].map((n) => ({ value: n, label: `${n}` }))
 
@@ -24,8 +22,8 @@ const testResultText = computed(() => {
 })
 
 /**
- * 服务器检测结果（面向用户一句话）：运行良好 / 基本可用 / 仅下载。
- * 技术明细（etag 强弱 / 条件请求 / mtime 精度 / 写权限 / 探测备注）收进「技术详情」。
+ * 服务器检测结果（面向用户一句话）：运行良好 / 基本可用 / 仅可下载。
+ * 技术明细（etag 强弱 / 条件请求 / mtime 精度 / 写权限 / 探测备注）收进结果旁的问号悬浮气泡。
  */
 const capabilityText = computed(() => {
   const c = s.capabilities
@@ -33,18 +31,18 @@ const capabilityText = computed(() => {
   return `服务器检测结果：${tierLabel(c.tier)}`
 })
 
-/** 技术详情内容：能力探测的原始摘要与备注，供反馈问题时复制 */
-const capabilityTechText = computed(() => {
+/** 技术详情（结果旁问号悬浮展示，逐行）：能力档位与探测原始明细，供反馈问题时对照 */
+const capabilityTechLines = computed<string[]>(() => {
   const c = s.capabilities
-  if (!c) return ''
-  const parts = [
-    `etag ${c.etag.present ? (c.etag.weak ? '弱' : '强') : '无'}`,
-    `条件请求 ${c.conditional.ifMatch && c.conditional.ifNoneMatch ? '可用' : '不可用'}`,
-    c.mtimePrecision === 's' ? 'mtime 秒级' : 'mtime 毫秒级',
-    c.writable ? '可写' : '只读',
+  if (!c) return []
+  return [
+    `能力档位：${tierLabel(c.tier)}`,
+    `ETag：${c.etag.present ? (c.etag.weak ? '弱' : '强') : '无'}`,
+    `条件请求：${c.conditional.ifMatch && c.conditional.ifNoneMatch ? '可用' : '不可用'}`,
+    `mtime 精度：${c.mtimePrecision === 's' ? '秒级' : '毫秒级'}`,
+    `写权限：${c.writable ? '可写' : '只读'}`,
+    ...(c.notes ?? []).map((n) => `备注：${n}`),
   ]
-  const notes = c.notes && c.notes.length ? `；备注：${c.notes.join('；')}` : ''
-  return `${tierLabel(c.tier)}（${parts.join(' · ')}）${notes}`
 })
 
 /** 检测结论提示行（B/C 档）；技术原因折叠进悬浮 title */
@@ -129,7 +127,7 @@ const ratePlaceholder = computed(() =>
 const rateHint = computed(() => {
   const p = serverProfile.value
   if (!p) return ''
-  return `检测到你在用${p.label}：该服务限制访问频率，已自动限制为每秒 ${p.netOpts.ratePerSec} 次，避免触发限流。如需取消限制，填 0`
+  return `已识别为${p.label}：该服务对请求频率有配额限制，已自动限速为每秒 ${p.netOpts.ratePerSec} 次请求；填 0 可解除`
 })
 
 /** 深度校验开关（prefs.deepVerify 可选布尔 → AppSwitch 必填 model 的适配） */
@@ -147,6 +145,33 @@ function browseDefaultDir() {
     return
   }
   showDirPicker.value = true
+}
+
+/**
+ * 确认默认云端文件夹（设置页浏览入口）。
+ * 写入 prefs.defaultRemoteDir（经 prefs 深度 watch 自动持久化）并关闭弹窗，
+ * 以成功提示回显所选路径；与当前值相同（未发生修改）时只关闭弹窗，不提示。
+ * @param path 远端目录选择器回传的绝对路径（以 / 开头；容错补齐缺省的起始斜杠）
+ */
+function confirmDefaultDir(path: string) {
+  showDirPicker.value = false
+  const p = String(path || '').trim()
+  if (!p || p === s.prefs.defaultRemoteDir) return
+  s.prefs.defaultRemoteDir = p.startsWith('/') ? p : '/' + p
+  toast.success('默认云端文件夹已更新', p)
+}
+
+/**
+ * 打开功能测试目录选择器（与默认云端文件夹的浏览入口同一形态）。
+ * 确认选择由 confirmProbeDir 落地：持久化并自动以新目录执行一次功能测试；
+ * 未填服务器地址时直接提示，避免必然失败的目录列表请求。
+ */
+function browseProbeDir() {
+  if (!s.server.serverUrl.trim()) {
+    toast.warning('请先填写服务器地址', '填写 WebDAV 地址后再选择测试目录')
+    return
+  }
+  s.showProbeDirPicker = true
 }
 
 function restoreDefaults() {
@@ -167,34 +192,45 @@ function save() {
   <div class="h-screen flex flex-col bg-white">
     <!-- 页头 -->
     <header class="flex items-center gap-3 h-14 px-5 border-b border-solid border-line-bar shrink-0">
-      <AppIconButton title="返回" :size="28" class="text-btn-text" @click="s.route = 'main'">
-        <AppIcon name="chevron-left" :size="12" />
+      <AppIconButton title="返回" variant="ghost" :size="28" class="text-btn-text" @click="s.route = 'main'">
+        <AppIcon name="chevron-left" :size="13" />
       </AppIconButton>
       <div class="flex flex-col gap-px">
         <div class="text-[14px] font-semibold text-ink-1 leading-[1.2]">设置</div>
         <div class="text-[11px] text-ink-3 leading-[1.2]">连接、同步与高级选项</div>
       </div>
       <span class="flex-spacer" />
-      <AppIconButton title="关闭" :size="28" class="text-btn-text" @click="store.outPlugin()">
-        <AppIcon name="close" :size="12" />
-      </AppIconButton>
+      <!-- 测试结果（连接 / 能力检测）挂在设置栏右侧：正文只留操作与配置；
+           过长时截断并以 title 提示全文 -->
+      <span v-if="s.testResult" class="inline-flex min-w-0 max-w-full items-center gap-[5px] text-[11px] text-ink-2" :title="testResultText">
+        <AppIcon v-if="s.testResult.ok" name="check-circle" :size="12" bg="var(--green-bg)" class="text-success shrink-0" />
+        <AppIcon v-else name="warn" :size="12" class="text-warning-icon shrink-0" />
+        <span class="truncate">{{ testResultText }}</span>
+      </span>
+      <span v-if="capabilityText" class="inline-flex min-w-0 max-w-full items-center gap-[5px] text-[11px] text-ink-2">
+        <AppIcon name="check-circle" :size="12" bg="var(--green-bg)" class="text-success shrink-0" />
+        <span class="truncate">{{ capabilityText }}</span>
+        <InfoTip v-if="capabilityTechLines.length" text="">
+          <div v-for="line in capabilityTechLines" :key="line">{{ line }}</div>
+        </InfoTip>
+      </span>
     </header>
 
-    <!-- 内容 -->
-    <main class="flex-1 min-h-0 overflow-y-auto px-4 py-[10px]">
-      <div class="flex gap-3 items-start">
+    <!-- 内容：md（≥768px）以上双栏，窄窗口（插件小窗）收成单栏避免挤压 -->
+    <main class="flex-1 min-h-0 overflow-y-auto px-4 py-3">
+      <div class="flex flex-col md:flex-row gap-3 md:items-start">
         <!-- 左栏 -->
         <div class="flex-1 min-w-0 flex flex-col gap-3">
           <!-- WebDAV 卡片 -->
           <section class="card">
-            <div class="flex items-center gap-2 px-[14px] py-[9px]">
-              <span class="text-[12px] font-semibold text-ink-1">WebDAV</span>
+            <div class="card-head flex items-center gap-2 px-[14px] py-[8px]">
+              <span class="card-title text-[12px] font-semibold text-ink-1">WebDAV</span>
               <span v-if="store.connStatus.value === 'connected'" class="inline-flex items-center gap-1 bg-success-bg rounded-[4px] pt-[2px] pr-[7px] pb-[2px] pl-[6px] text-[10px] font-medium text-success-deep">
                 <span class="w-[5px] h-[5px] rounded-full bg-success-dot" />
                 已连接
               </span>
             </div>
-            <div class="flex flex-col gap-2 px-[14px] pt-[2px] pb-[10px]">
+            <div class="flex flex-col gap-[10px] px-[14px] py-[11px]">
               <div class="flex flex-col gap-[6px]">
                 <span class="text-[11px] font-medium text-ink-2">服务器地址</span>
                 <AppInput
@@ -207,7 +243,7 @@ function save() {
                 <!-- http 明文连接警告：内网回环地址不打扰 -->
                 <div v-if="store.insecureHttp.value" class="flex items-start gap-[5px]">
                   <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
-                  <span class="text-[11px] text-warning-icon leading-[1.5]">当前地址以 http 开头，密码和文件在传输时没有加密，可能被他人截获。建议改用 https 开头的地址</span>
+                  <span class="text-[11px] text-warning-icon leading-[1.5]">当前地址使用 http 明文传输，账号密码与文件内容均未加密，存在被截取的风险，建议改用 https</span>
                 </div>
               </div>
               <div class="flex gap-[10px]">
@@ -221,7 +257,10 @@ function save() {
                 </div>
               </div>
               <div class="flex flex-col gap-[6px]">
-                <span class="text-[11px] font-medium text-ink-2">默认云端文件夹</span>
+                <div class="flex items-center gap-[3px]">
+                  <span class="text-[11px] font-medium text-ink-2">默认云端文件夹</span>
+                  <InfoTip text="添加同步目录时自动填入的云端位置；留空则以本地文件夹名作为云端目录名" />
+                </div>
                 <div class="flex gap-2">
                   <AppInput
                     v-model="s.prefs.defaultRemoteDir"
@@ -233,68 +272,70 @@ function save() {
                   />
                   <AppButton @click="browseDefaultDir">浏览…</AppButton>
                 </div>
-                <div class="text-[11px] text-ink-4">添加同步文件夹时会自动填入这个位置；不填则使用电脑上的文件夹名</div>
               </div>
-              <div class="flex items-center gap-[10px]">
+              <!-- 测试目录：功能测试写权限的实测目标（服务器各子树写权限可能不同，
+                   根目录不一定可写），形态与默认云端文件夹一致；留空时首次点击
+                   「功能测试」会先弹目录选择器 -->
+              <div class="flex flex-col gap-[6px]">
+                <div class="flex items-center gap-[3px]">
+                  <span class="text-[11px] font-medium text-ink-2">测试目录</span>
+                  <InfoTip text="功能测试会在该文件夹内实际创建并删除一个临时文件夹来检测服务器能力；WebDAV 服务器不一定所有目录都允许写入，请选择一个可写的文件夹" />
+                </div>
+                <div class="flex gap-2">
+                  <AppInput
+                    v-model="s.prefs.probeRemoteDir"
+                    icon="cloud"
+                    mono
+                    sm
+                    class="flex-1 min-w-0"
+                    placeholder="/Sync"
+                  />
+                  <AppButton @click="browseProbeDir">浏览…</AppButton>
+                </div>
+              </div>
+              <!-- 操作行：两个测试入口右对齐，结果统一在卡片标题右侧展示 -->
+              <div class="flex items-center justify-end gap-[10px]">
                 <AppButton variant="primary" :disabled="s.testing" @click="store.testConnection()">
                   <AppIcon name="refresh" :size="13" :class="{ spin: s.testing }" />
                   {{ s.testing ? '测试中…' : '测试连接' }}
                 </AppButton>
-                <span v-if="s.testResult" class="inline-flex items-center gap-[5px] text-[11px] text-ink-2">
-                  <AppIcon v-if="s.testResult.ok" name="check-circle" :size="12" bg="var(--green-bg)" class="text-success" />
-                  <AppIcon v-else name="warn" :size="12" class="text-warning-icon" />
-                  {{ testResultText }}
-                </span>
-              </div>
-              <!-- 服务器检测结果：一句话结论 + 技术详情折叠 + 重新检测入口 -->
-              <div class="flex items-center gap-[10px] pt-[2px]">
                 <AppButton :disabled="s.probing || !s.server.serverUrl.trim()" @click="store.reprobe()">
                   <AppIcon name="refresh" :size="13" :class="{ spin: s.probing }" />
-                  {{ s.probing ? '检测中…' : '重新检测服务器' }}
+                  {{ s.probing ? '测试中…' : '功能测试' }}
                 </AppButton>
-                <span v-if="capabilityText" class="inline-flex items-center gap-[5px] text-[11px] text-ink-2">
-                  <AppIcon name="check-circle" :size="12" bg="var(--green-bg)" class="text-success" />
-                  {{ capabilityText }}
-                </span>
-                <button v-if="capabilityTechText" type="button" class="tech-toggle" @click="showTechDetail = !showTechDetail">
-                  {{ showTechDetail ? '收起技术详情' : '查看技术详情' }}
-                </button>
               </div>
               <div v-if="capabilityHintText" class="text-[11px] text-warning-icon" :title="capabilityHintTitle">
                 {{ capabilityHintText }}
-              </div>
-              <div v-if="showTechDetail && capabilityTechText" class="rounded-[5px] bg-fill-seg px-[10px] py-[6px] font-mono text-[11px] text-ink-3 leading-[1.6] break-all">
-                {{ capabilityTechText }}
               </div>
             </div>
           </section>
 
           <!-- 同步卡片 -->
           <section class="card">
-            <div class="flex items-center gap-2 px-[14px] py-[9px]">
-              <span class="text-[12px] font-semibold text-ink-1">同步</span>
+            <div class="card-head flex items-center gap-2 px-[14px] py-[8px]">
+              <span class="card-title text-[12px] font-semibold text-ink-1">同步</span>
             </div>
-            <div class="flex flex-col gap-[6px] px-[14px] pt-[2px] pb-[10px]">
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
+            <div class="flex flex-col gap-[10px] px-[14px] py-[11px]">
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
                   <span class="text-[12px] font-medium text-ink-1">自动同步</span>
-                  <span class="text-[11px] text-ink-4">发现文件有改动时，自动同步</span>
+                  <InfoTip text="本地或云端文件发生变更时自动执行同步，无需手动触发" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSwitch v-model="s.prefs.autoSync" />
               </div>
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
                   <span class="text-[12px] font-medium text-ink-1">检查频率</span>
-                  <span class="text-[11px] text-ink-4">每隔多久检查一次云端有没有更新</span>
+                  <InfoTip text="轮询检查云端变更的时间间隔" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSelect v-model="s.prefs.intervalMin" :options="intervalOptions" :width="104" />
               </div>
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
                   <span class="text-[12px] font-medium text-ink-1">启动时自动同步</span>
-                  <span class="text-[11px] text-ink-4">打开 ZTools 时，先检查一次云端有没有更新</span>
+                  <InfoTip text="启动 ZTools 时先检查一次云端变更" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSwitch v-model="s.prefs.syncOnStartup" />
@@ -307,67 +348,71 @@ function save() {
         <div class="flex-1 min-w-0 flex flex-col gap-3">
           <!-- 高级卡片 -->
           <section class="card">
-            <div class="flex items-center gap-2 px-[14px] py-[9px]">
-              <span class="text-[12px] font-semibold text-ink-1">高级</span>
+            <div class="card-head flex items-center gap-2 px-[14px] py-[8px]">
+              <span class="card-title text-[12px] font-semibold text-ink-1">高级</span>
             </div>
-            <div class="flex flex-col gap-[6px] px-[14px] pt-[2px] pb-[10px]">
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">两边都改了怎么办</span>
-                  <span class="text-[11px] text-ink-4">同一个文件在电脑和云端都被修改时，默认怎么处理</span>
+            <div class="flex flex-col gap-[10px] px-[14px] py-[11px]">
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">冲突处理</span>
+                  <InfoTip text="同一文件在本地与云端均被修改时的处理策略；「每次询问」会将冲突挂起，由你逐个确认" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSelect v-model="s.prefs.conflictStrategy" :options="strategyOptions" :width="104" />
               </div>
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">不同步隐藏文件和系统文件</span>
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">忽略隐藏文件</span>
+                  <InfoTip text="路径中以 . 开头的隐藏文件与目录不参与同步" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSwitch v-model="s.prefs.ignoreHidden" />
               </div>
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">同时传输文件数</span>
-                  <span class="text-[11px] text-ink-4">数字越大越快，但可能被服务器限流</span>
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">并发传输数</span>
+                  <InfoTip text="同时上传 / 下载的文件数量上限；值越大同步越快，过高可能触发服务器限流" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSelect v-model="s.prefs.concurrency" :options="concurrencyOptions" :width="104" />
               </div>
               <!-- 请求限速：server.netOpts.ratePerSec；档案命中时给出默认值提示 -->
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">访问频率限制</span>
-                  <span class="text-[11px] text-ink-4">每秒最多向服务器发送多少次请求，0 表示不限制。一般保持默认即可</span>
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">请求频率限制</span>
+                  <InfoTip text="每秒向服务器发起的最大请求数，0 表示不限制；检测到坚果云等有频率配额的服务时会自动应用默认限速" />
                 </div>
                 <span class="flex-spacer" />
-                <AppInput v-model="ratePerSecInput" sm type="number" class="w-[104px]" :placeholder="ratePlaceholder" />
+                <AppInput v-model="ratePerSecInput" sm type="number" class="!w-[104px]" :placeholder="ratePlaceholder" />
               </div>
-              <div v-if="rateHint" class="flex items-start gap-[5px] -mt-[2px]">
+              <div v-if="rateHint" class="flex items-start gap-[5px]">
                 <AppIcon name="info" :size="11" class="text-ink-4 shrink-0 mt-[2px]" />
                 <span class="text-[11px] text-ink-4 leading-[1.5]">{{ rateHint }}</span>
               </div>
-              <!-- 防多设备同时同步（原「目录租约锁」）：改用人话表述，归入高级 -->
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">防止多台设备同时同步</span>
-                  <span class="text-[11px] text-ink-4">开启后，同一个文件夹同一时间只允许一台设备同步，更安全，但每次会慢约 1~2 秒。关闭后，多台设备同时同步时可能互相覆盖</span>
+              <!-- 防多设备同时同步（目录租约锁）：说明细节收进气泡 -->
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">多设备互斥同步</span>
+                  <InfoTip text="每轮同步前先获取远端目录租约锁，同一时刻仅允许一台设备执行同步，避免多设备并发写入互相覆盖；每次同步约增加 1~2 秒开销" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSwitch v-model="s.prefs.leaseLock" />
               </div>
-              <!-- 深度校验：定期核对文件内容（默认关；放在高级，文字说清代价） -->
-              <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
-                <div class="flex flex-col gap-[2px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">彻底检查</span>
-                  <span class="text-[11px] text-ink-4">定期逐个核对电脑上所有文件的内容，能发现「大小和时间都没变」的改动。文件很多时会明显变慢、占用硬盘</span>
+              <!-- 深度校验：定期重算 hash 比对基线（默认关） -->
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">深度校验</span>
+                  <InfoTip text="定期重新计算本地文件的内容校验值（hash）并与基线比对，可发现大小与修改时间均未变化的改动；文件较多时耗时与磁盘读取开销显著，默认关闭" />
                 </div>
                 <span class="flex-spacer" />
                 <AppSwitch v-model="deepVerifyModel" />
               </div>
               <!-- 用户排除规则：逐行 glob；内置 OS 垃圾规则不可关闭 -->
-              <div class="flex flex-col gap-[6px] pt-[4px] pb-[5px]">
-                <span class="text-[12px] font-medium text-ink-1">不同步的文件</span>
+              <div class="flex flex-col gap-[6px]">
+                <div class="flex items-center gap-[3px]">
+                  <span class="text-[12px] font-medium text-ink-1">排除规则</span>
+                  <InfoTip text="每行一条通配规则（glob），匹配的文件或目录不参与同步，如 *.iso、node_modules/；内置的系统临时文件规则始终生效" />
+                </div>
                 <textarea
                   v-model="excludeText"
                   rows="3"
@@ -375,26 +420,25 @@ function save() {
                   class="exclude-input font-mono"
                   placeholder="每行一条，如 *.iso&#10;node_modules/"
                 />
-                <span class="text-[11px] text-ink-4">每行写一个要跳过的文件或文件夹，例如 *.iso（所有 iso 文件）、node_modules/（这个文件夹）。临时文件和系统垃圾文件（如 .DS_Store、Thumbs.db）已自动跳过</span>
               </div>
             </div>
           </section>
 
           <!-- 同步状态卡片 -->
           <section class="card">
-            <div class="flex items-center gap-2 px-[14px] py-[9px]">
-              <span class="text-[12px] font-semibold text-ink-1">同步状态</span>
+            <div class="card-head flex items-center gap-2 px-[14px] py-[8px]">
+              <span class="card-title text-[12px] font-semibold text-ink-1">同步状态</span>
             </div>
-            <div class="px-[14px] pt-[6px] pb-[2px]">
-              <div class="flex items-center justify-between pt-[2px] pb-[6px]">
+            <div class="px-[14px] py-[10px]">
+              <div class="flex items-center justify-between py-[4px]">
                 <span class="text-[11px] text-ink-2">同步文件夹</span>
                 <span class="font-mono text-[11px] font-medium text-ink-1">{{ s.dirs.length }} 个</span>
               </div>
-              <div class="flex items-center justify-between pt-[2px] pb-[6px]">
+              <div class="flex items-center justify-between py-[4px]">
                 <span class="text-[11px] text-ink-2">上次同步</span>
                 <span class="font-mono text-[11px] font-medium text-ink-1">{{ lastSyncText }}</span>
               </div>
-              <div class="flex items-center justify-between pt-[2px] pb-[6px]">
+              <div class="flex items-center justify-between py-[4px]">
                 <span class="text-[11px] text-ink-2">云端占用</span>
                 <span class="font-mono text-[11px] font-medium text-ink-1">{{ cloudUsageText }}</span>
               </div>
@@ -419,27 +463,35 @@ function save() {
         v-if="showDirPicker"
         title="选择默认云端文件夹"
         :initial-path="s.prefs.defaultRemoteDir"
-        @pick="(p) => (s.prefs.defaultRemoteDir = p)"
+        @pick="confirmDefaultDir"
         @close="showDirPicker = false"
+      />
+    </Transition>
+
+    <!-- 弹窗：功能测试目录选择（首次功能测试的引导 + 「修改测试目录」入口共用；
+         确认后由 confirmProbeDir 持久化并自动以新目录执行一次功能测试） -->
+    <Transition name="modal-pop">
+      <RemoteDirModal
+        v-if="s.showProbeDirPicker"
+        title="选择功能测试目录"
+        subtitle="功能测试会在所选文件夹内创建并删除临时文件来检测服务器能力，请选择一个允许写入的文件夹"
+        :initial-path="s.prefs.probeRemoteDir"
+        @pick="store.confirmProbeDir"
+        @close="s.showProbeDirPicker = false"
       />
     </Transition>
   </div>
 </template>
 
 <style scoped lang="scss">
-/* 技术详情开关：弱化文字按钮，仅在有检测结果时出现 */
-.tech-toggle {
-  border: none;
-  background: transparent;
-  padding: 2px 0;
-  font-size: 11px;
-  color: var(--blue);
-  white-space: nowrap;
-  cursor: pointer;
+/* 卡片节标题：字距微调，与正文行标题拉开质感差 */
+.card-title {
+  letter-spacing: 0.02em;
+}
 
-  &:hover {
-    text-decoration: underline;
-  }
+/* 卡片节标题底部 ⇒ 分隔线：必须用单边 border（Uno 的 border-solid 会把未设宽度的其余三边按 medium 宽度画出） */
+.card-head {
+  border-bottom: 1px solid var(--br-bar);
 }
 
 /* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌），等宽字体便于编辑 glob */
@@ -455,13 +507,19 @@ function save() {
   font-size: 11px;
   line-height: 1.6;
   outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 
   &::placeholder {
     color: var(--text-muted);
   }
 
+  &:hover {
+    border-color: #c9d0d7;
+  }
+
   &:focus {
     border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.12);
   }
 }
 </style>

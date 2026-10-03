@@ -54,6 +54,15 @@ const model = defineModel<T>({ required: true })
   color: var(--text-2);
   transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
 
+  &:hover:not(.active) {
+    color: var(--text-1);
+  }
+
+  /* 选中态自带投影，键盘焦点环叠加而非覆盖 */
+  &.active:focus-visible {
+    box-shadow: var(--focus-ring), 0 1px 2px rgba(33, 41, 51, 0.08);
+  }
+
   &.active {
     background: #fff;
     color: var(--blue);

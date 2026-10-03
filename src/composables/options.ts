@@ -8,10 +8,10 @@ import type { Prefs } from '../env.d'
 /** 自动同步轮询间隔（分钟） */
 export const intervalOptions = [1, 5, 10, 15, 30, 60].map((m) => ({ value: m, label: `${m} 分钟` }))
 
-/** 冲突处理策略：同一个文件在电脑和云端都被修改时的默认行为 */
+/** 冲突处理策略：同一文件在本地与云端均被修改时的默认处理方式 */
 export const strategyOptions = [
-  { value: 'ask', label: '询问我' },
-  { value: 'local', label: '保留电脑版本' },
-  { value: 'remote', label: '保留云端版本' },
-  { value: 'both', label: '两个都留' },
+  { value: 'ask', label: '每次询问' },
+  { value: 'local', label: '保留本地' },
+  { value: 'remote', label: '保留云端' },
+  { value: 'both', label: '同时保留' },
 ] satisfies { value: Prefs['conflictStrategy']; label: string }[]

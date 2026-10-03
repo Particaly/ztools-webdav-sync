@@ -10,11 +10,13 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.preload.json && vue-tsc && vite build && npm run build:preload",
     "build:preload": "esbuild src-ztools/preload/services.mts --bundle --platform=node --format=cjs --target=node20 --sourcemap=linked --outfile=src-ztools/preload/dist/services.js",
-    "test:unit": "tsc -p tsconfig.preload.json && node test/store-unit.mjs",
-    "test:e2e": "node test/sync-e2e.mjs",
-    "test:e2e:fast": "node test/sync-e2e.mjs --fast",
-    "test:e2e:built": "npm run build:preload && node test/sync-e2e.mjs --built",
-    "test": "node test/store-unit.mjs && node test/sync-e2e.mjs && npm run test:e2e:built"
+    "test:unit": "tsc -p tsconfig.preload.json && vitest run test/unit",
+    "test:e2e": "vitest run test/shard",
+    "test:fast": "vitest run --tagsFilter \"!slow\"",
+    "test:slow": "vitest run --tagsFilter slow",
+    "test:seq": "vitest run --no-file-parallelism",
+    "test:e2e:built": "npm run build:preload && vitest run --config vitest.built.config.ts test/shard",
+    "test": "vitest run && npm run build:preload && vitest run --config vitest.built.config.ts test/shard"
   },
   "dependencies": {
     "saxes": "^6.0.0",
@@ -29,6 +31,7 @@
     "typescript": "^5.3.0",
     "unocss": "^66.10.5",
     "vite": "^6.0.11",
+    "vitest": "^5.0.3",
     "vue-tsc": "^2.0.0"
   }
 }

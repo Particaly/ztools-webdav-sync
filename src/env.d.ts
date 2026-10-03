@@ -24,6 +24,11 @@ export type {
   DavCapabilities,
   DavConfig,
   DavTier,
+  DecisionLogEntry,
+  DeleteBatch,
+  DeleteBatchNode,
+  DeleteBatchView,
+  DeleteScope,
   DirStatus,
   FailureRecord,
   LogOp,
@@ -84,7 +89,19 @@ export interface SyncDir {
    * 仅运行时展示与持久化，不参与同步逻辑。
    */
   errorDetail?: string | null
-  progress: { filesDone: number; filesTotal: number; bytesDone: number; bytesTotal: number; verifyDone?: number; verifyTotal?: number } | null
+  progress: {
+    phase?: 'scan' | 'plan' | 'transfer'
+    filesDone: number
+    filesTotal: number
+    bytesDone: number
+    bytesTotal: number
+    verifyDone?: number
+    verifyTotal?: number
+    stage?: 'scan' | 'plan' | 'verify' | 'lockwait' | 'lock' | 'transfer' | 'finalize'
+    currentOp?: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict'
+    currentFile?: string
+    scanBytesTotal?: number
+  } | null
   /** 是否启用同步：undefined / true 视为启用，false 时跳过自动与手动同步 */
   enabled?: boolean
   /** 目录级设置覆盖（冲突处理 / 忽略隐藏文件 / 同步间隔），null 表示全部跟随全局 */
@@ -103,10 +120,34 @@ export interface SyncDir {
   serverUrl?: string | null
   /**
    * 该目录的待处理挂起（后台轮 defer 挂起的冲突 + 批量删除超阈值登记的
-   * 「待确认删除」）；kind='delete' 为删除确认类（choice ∈ delete/keep），
+   * 「待确认删除」+ 远端根丢失的目录级决策）；kind='delete' 为删除确认类
+   * （choice ∈ delete/keep），kind='root-lost' 为根丢失决策类（choice ∈
+   * upload/remove-local，rel 恒为 '.'，local.size 携带受影响文件数），
    * 缺省为冲突类（choice ∈ local/remote/both）。主界面面板统一展示与处理。
    */
-  pendingConflicts?: Array<{ rel: string; createdAt: number; choice?: string; kind?: string }> | null
+  pendingConflicts?: Array<{
+    rel: string
+    createdAt: number
+    choice?: string
+    kind?: string
+    local?: { size?: number; mtimeMs?: number }
+    remote?: { size?: number; mtimeMs?: number; etag?: string }
+  }> | null
+  /**
+   * 渲染层标记：决策弹窗最近一次自动 / 直达展示时对应的「云端文件夹丢失」挂起
+   * createdAt（kind='root-lost' 的登记内 createdAt 稳定）。据此把自动弹窗从
+   * 「只依赖一次性 newlyNotified 事件」改为「数据到手且这条登记未弹过」——
+   * 事件在渲染层不在场时丢失后，回窗口 / 冷启动的兜底刷新仍能补弹；同一登记
+   * 已展示过则不再自动重复打扰。随目录配置一并持久化。
+   */
+  rootLostPromptedAt?: number | null
+  /**
+   * 批量删除快照（listDeleteBatch 拉取）：删除确认的目录树数据源 —— 逐文件挂起
+   * 表有 500 条上限，超限部分没有逐文件记录，树形展示与「全部 / 按目录」决策
+   * 全部走这份快照（scopes 携带已决策状态、undecided 为未决策文件数真值）。
+   * 运行时状态不持久化（sanitizeDirForPersist 置 null），打开面板 / 轮末兜底时刷新。
+   */
+  deleteBatch?: DeleteBatchView | null
 }
 
 declare global {

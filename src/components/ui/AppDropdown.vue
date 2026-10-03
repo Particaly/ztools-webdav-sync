@@ -65,8 +65,10 @@ function positionFixed() {
   const style: Record<string, string> = { position: 'fixed' }
   if (fitsBelow || rect.top - ph - props.offset < margin) {
     style.top = `${rect.bottom + props.offset}px`
+    style.transformOrigin = 'top ' + (props.placement.endsWith('end') ? 'right' : 'left')
   } else {
     style.bottom = `${window.innerHeight - rect.top + props.offset}px`
+    style.transformOrigin = 'bottom ' + (props.placement.endsWith('end') ? 'right' : 'left')
   }
   if (props.placement.endsWith('end')) {
     style.right = `${Math.max(margin, window.innerWidth - rect.right)}px`
@@ -100,11 +102,12 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', onViewportChange)
 })
 
-// 浮层定位：垂直方向由 placement 决定，水平对齐同侧（非 teleport 模式）
+// 浮层定位：垂直方向由 placement 决定，水平对齐同侧（非 teleport 模式）；
+// transform-origin 与弹出方向一致，缩放入场从触发器一侧生长
 const panelStyle = computed(() => ({
   ...(props.placement.startsWith('top')
-    ? { bottom: `calc(100% + ${props.offset}px)` }
-    : { top: `calc(100% + ${props.offset}px)` }),
+    ? { bottom: `calc(100% + ${props.offset}px)`, transformOrigin: props.placement.endsWith('end') ? 'bottom right' : 'bottom left' }
+    : { top: `calc(100% + ${props.offset}px)`, transformOrigin: props.placement.endsWith('end') ? 'top right' : 'top left' }),
   ...(props.placement.endsWith('end') ? { right: '0' } : { left: '0' }),
   ...(props.minWidth ? { minWidth: `${props.minWidth}px` } : {}),
 }))

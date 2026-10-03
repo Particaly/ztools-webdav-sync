@@ -38,7 +38,7 @@ const radius = computed(() => (props.size >= 28 ? 7 : 6))
   justify-content: center;
   flex-shrink: 0;
   padding: 0;
-  transition: background 0.12s, border-color 0.12s, transform 0.1s ease;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.1s ease;
 
   // 按压微反馈：轻微缩放
   &:active:not(:disabled) {
@@ -51,6 +51,7 @@ const radius = computed(() => (props.size >= 28 ? 7 : 6))
 
     &:hover:not(:disabled) {
       background: #f5f7f9;
+      border-color: #d3d9df;
     }
   }
 
@@ -59,7 +60,7 @@ const radius = computed(() => (props.size >= 28 ? 7 : 6))
     border: none;
 
     &:hover:not(:disabled) {
-      background: #f1f3f6;
+      background: #eef1f5;
     }
   }
 }

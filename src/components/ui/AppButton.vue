@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
-/** 按钮风格：primary 蓝底主按钮 / secondary 白底描边 / ghost 白底浅描边 */
-type Variant = 'primary' | 'secondary' | 'ghost'
+/** 按钮风格：primary 蓝底主按钮 / secondary 白底描边 / ghost 白底浅描边 / danger 红底危险操作 */
+type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
 
 /**
  * 尺寸：sm=28px / md=30px / lg=34px（lg 字号 13px），
@@ -57,7 +57,7 @@ const fontSize = computed(() => (typeof props.size === 'number' ? SIZE_MAP.md.fs
   color: var(--btn-text);
   white-space: nowrap;
   flex-shrink: 0;
-  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s, transform 0.1s ease;
+  transition: background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease, color 0.14s ease, transform 0.1s ease;
 
   // 按压微反馈：轻微缩放
   &:active:not(:disabled) {
@@ -68,6 +68,11 @@ const fontSize = computed(() => (typeof props.size === 'number' ? SIZE_MAP.md.fs
     cursor: default;
   }
 
+  // 主按钮自带蓝色投影，键盘焦点环需叠加而非覆盖
+  &.primary:focus-visible {
+    box-shadow: var(--focus-ring), var(--shadow-btn);
+  }
+
   &.primary {
     background: var(--blue);
     color: #fff;
@@ -75,10 +80,39 @@ const fontSize = computed(() => (typeof props.size === 'number' ? SIZE_MAP.md.fs
 
     &:hover:not(:disabled) {
       background: #1b66c8;
+      box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35);
+    }
+
+    &:active:not(:disabled) {
+      background: #185cb8;
     }
 
     &:disabled {
       background: var(--blue-disabled);
+      box-shadow: none;
+    }
+  }
+
+  // 危险操作（批量删除确认等）：与 primary 同权重、红色系 —— 最高危动作
+  // 不复用「前进」语义的蓝色主按钮，避免批量误触
+  &.danger {
+    background: var(--red);
+    color: #fff;
+    box-shadow: 0 1px 3px rgba(234, 67, 53, 0.35);
+
+    &:hover:not(:disabled) {
+      background: #d63a2c;
+      box-shadow: 0 2px 6px rgba(234, 67, 53, 0.4);
+    }
+
+    &:active:not(:disabled) {
+      background: #c2352a;
+      box-shadow: none;
+    }
+
+    &:disabled {
+      background: #f0a8a1;
+      box-shadow: none;
     }
   }
 
@@ -88,6 +122,11 @@ const fontSize = computed(() => (typeof props.size === 'number' ? SIZE_MAP.md.fs
 
     &:hover:not(:disabled) {
       background: #f5f7f9;
+      border-color: #c9d0d7;
+    }
+
+    &:active:not(:disabled) {
+      background: #eef1f4;
     }
   }
 

@@ -1142,10 +1142,12 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    * 异步等待目录锁（可取消，不阻塞 tick）：轮询 tryAcquireDirLock 直至获得 /
    * 取消 / leader 丢失 / 超时。等待期间放弃的条件与调用方上下文一致。
    * @param {string} h 锁键
-   * @param {object} ctx { slot, maxWaitMs }（leader 轮附加 ownerRef 中止条件）
+   * @param {object} ctx { slot, maxWaitMs, cancelOn?, cancelOnReason?, onPoll? }；
+   *        leader 轮附加 ownerRef 中止条件；onPoll 在每轮轮询间隙调用（锁等待进度的
+   *        外发钩子，经调用方的节流发射器限频）
    * @returns {Promise<{ok:boolean, reason?:string}>}
    */
-  async function acquireDirLockWaiting(h: string, ctx: { slot: DirSlot | null; maxWaitMs: number; cancelOn?: () => boolean; cancelOnReason?: string }): Promise<{ ok: boolean; reason?: string }> {
+  async function acquireDirLockWaiting(h: string, ctx: { slot: DirSlot | null; maxWaitMs: number; cancelOn?: () => boolean; cancelOnReason?: string; onPoll?: () => void }): Promise<{ ok: boolean; reason?: string }> {
     const t0 = now()
     for (;;) {
       if (destroyed) return { ok: false, reason: '调度器已销毁' }
@@ -1161,6 +1163,13 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         return { ok: true }
       }
       if (now() - t0 >= ctx.maxWaitMs) return { ok: false, reason: '等待目录锁超时' }
+      if (ctx.onPoll) {
+        try {
+          ctx.onPoll()
+        } catch (_) {
+          /* 进度外发失败不影响锁等待 */
+        }
+      }
       await realSleep(DIR_LOCK_POLL_MS)
     }
   }
@@ -1707,32 +1716,42 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         error: error ? error.message || String(error) : null,
         cancelled,
       })
-      // 挂起事件（UI 面板入口）+ 系统通知（同批只提醒一次：指纹 = 无
-      // choice 挂起的 rel 排序集；处理后再出现新集合才再提醒）。触发条件覆盖
-      // 冲突挂起（deferredConflicts）与删除确认挂起（deleteHeld —— 批量删除超
-      // 阈值整批转入待处理面板），通知文案按两类分别计数
+      // 挂起事件（UI 面板入口）+ 系统通知（同批只提醒一次：指纹 = 无 choice 的
+      // 逐条类挂起 rel 排序集 + 未决策删除总数；处理后再出现新集合才再提醒）。
+      // 触发条件覆盖冲突挂起（deferredConflicts）、删除确认挂起（deleteHeld ——
+      // 批量删除超阈值整批转入待处理面板；计数取 summary 真值而非逐条列表 ——
+      // 逐文件挂起表有 500 条上限，超限部分没有逐条记录，只有 summary 计数与
+      // 批量快照）与远端根丢失待决策（rootLostHeld —— 目录级决策，kind='root-lost'
+      // 挂起），通知文案按三类分别计数
       const deleteHeldCount = summary ? Number(summary.deleteHeld) || 0 : 0
-      if (summary && (Number(summary.deferredConflicts) > 0 || deleteHeldCount > 0) && typeof engine.listPendingConflicts === 'function') {
+      const rootLostCount = summary ? Number(summary.rootLostHeld) || 0 : 0
+      if (summary && (Number(summary.deferredConflicts) > 0 || deleteHeldCount > 0 || rootLostCount > 0) && typeof engine.listPendingConflicts === 'function') {
         engine
           .listPendingConflicts(slot.dir)
           .then((items) => {
-            const openItems = (items || []).filter((it) => it && !it.choice)
+            // 逐条类 = 冲突 + 根丢失（删除确认类走 deleteHeld 真值口径，不进逐条集合）
+            const openItems = (items || []).filter((it) => it && !it.choice && it.kind !== 'delete')
             const openRels = openItems.map((it) => it.rel).sort()
-            const fp = openRels.join('|')
+            const fp = `${openRels.join('|')}#${deleteHeldCount}`
             let newlyNotified = false
-            if (openRels.length && fp !== slot.lastNotifyFp) {
+            if ((openRels.length || deleteHeldCount > 0) && fp !== slot.lastNotifyFp) {
               slot.lastNotifyFp = fp
               newlyNotified = true
-              const nConflict = openItems.filter((it) => it.kind !== 'delete').length
-              const nDelete = openItems.length - nConflict
-      const parts: any[] = []
-      if (nConflict > 0) parts.push(`${nConflict} 个文件需要你选择保留哪一个`)
-      if (nDelete > 0) parts.push(`${nDelete} 项删除等你确认`)
-      notifyBestEffort(`WebDAV 同步：${parts.join('、')}，点击打开插件处理`)
-            } else if (!openRels.length) {
+            } else if (!openRels.length && !deleteHeldCount) {
               slot.lastNotifyFp = null
             }
+            // 事件先于系统通知发出：渲染层的挂起列表（处理入口的数据源）是关键
+            // 路径，通知只是尽力而为的增强 —— 任何后续异常都不能再影响事件送达
             emit({ type: 'pending-conflicts', dirId: slot.id, items: items || [], newlyNotified })
+            if (newlyNotified) {
+              const nRootLost = openItems.filter((it) => it.kind === 'root-lost').length
+              const nConflict = openItems.filter((it) => it.kind !== 'root-lost').length
+              const parts: any[] = []
+              if (nRootLost > 0) parts.push('云端的同步文件夹不见了，需要你确认怎么处理')
+              if (nConflict > 0) parts.push(`${nConflict} 个文件需要你选择保留哪一个`)
+              if (deleteHeldCount > 0) parts.push(`${deleteHeldCount} 项删除等你确认`)
+              notifyBestEffort(`WebDAV 同步：${parts.join('、')}，点击打开插件处理`)
+            }
           })
           .catch(() => {})
       }
@@ -1815,11 +1834,15 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     const isAuto =
       kind === 'interval' || kind === 'startup' || kind === 'watch' || kind === 'follow-up' || kind === 'yield-retry' || kind === 'backoff'
     const h = await dirLockHashFor(slot)
+    // 进度发射器提前到锁等待之前：等待目录锁（他机 / 他实例正在同步该目录）期间
+    // 发 lockwait 细分阶段 —— UI 显示「正在等待其他设备完成同步…」而不是无进度的空转
+    const progressAt = makeProgressEmitter(slot)
     const acq = await acquireDirLockWaiting(h, {
       slot,
       maxWaitMs: isAuto ? DIR_LOCK_AUTO_MAX_WAIT_MS : DIR_LOCK_MANUAL_MAX_WAIT_MS,
       cancelOn: () => slot.cancelRequested || !ownerRef.valid,
       cancelOnReason: slot.cancelRequested ? '已取消' : 'leader 丢失',
+      onPoll: () => progressAt({ phase: 'scan', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, stage: 'lockwait' }),
     })
     if (!acq.ok) {
       if (isAuto) {
@@ -1836,7 +1859,6 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       lockTimeout.detail = acq.reason
       return { error: lockTimeout }
     }
-    const progressAt = makeProgressEmitter(slot)
     try {
       // 轮次提示（引擎本地扫描形态的输入）：source = 轮次 kind。只有 watch 轮携带
       // 脏路径快照 —— 触发即来自已注册的 watcher，peek 时机在轮体之前，轮期间新到
@@ -1907,11 +1929,14 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    */
   async function fallbackRun(slot: DirSlot): Promise<RoundResolveValue> {
     const h = await dirLockHashFor(slot)
+    // 锁等待期间发 lockwait 进度（与 executeRound 同口径；节流由发射器承担）
+    const progressAt = makeProgressEmitter(slot)
     const acq = await acquireDirLockWaiting(h, {
       slot,
       maxWaitMs: DIR_LOCK_MANUAL_MAX_WAIT_MS,
       cancelOn: () => slot.cancelRequested,
       cancelOnReason: '已取消',
+      onPoll: () => progressAt({ phase: 'scan', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, stage: 'lockwait' }),
     })
     if (!acq.ok) {
       const lockFail: any = new Error('暂时无法开始同步，稍后会重试')
@@ -1920,7 +1945,6 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     }
     slot.state = 'running'
     emitSlot(slot, true)
-    const progressAt = makeProgressEmitter(slot)
     try {
       const summary = await engine.syncDirectory(cfgOf(slot), slot.dir, prefsOf(slot), {
         onProgress: progressAt,

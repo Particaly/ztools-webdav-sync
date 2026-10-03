@@ -117,7 +117,12 @@
  *                              （与 Depth:1 同应答）：模拟「服务器忽略 Depth 头」。
  *                              探测期命中 → depthInfinity 必须判 false（嵌套探测文件
  *                              验证）；同步期命中（缓存已先行落定）→ 引擎的浅响应
- *                              阀门必须把扫描判不完整（零删除）。
+ *                              阀门必须把扫描判不完整（零删除），并持久降级能力缓存
+ *                              使下一轮改用逐目录形态。
+ *   .wdsync-test-root404prop —— 缺失路径的 PROPFIND 改回「207 + 集合自身 404
+ *                              propstat」（不回 HTTP 404 状态）：模拟部分网关对缺失
+ *                              集合的应答形态。引擎的根探测归一与两种扫描形态都
+ *                              必须识别并路由到根丢失决策链。
  *   .wdsync-test-depthlog  —— 存在时把每个 PROPFIND 追加一行 `DEPTH inf|N urlPath`
  *                              到 .wdsync-test-depthlog.log（与 reqlog 同模式；单独
  *                              成日志是因为 reqlog 的既有断言按整行精确匹配请求行，
@@ -250,6 +255,9 @@ const casepairName = () => flagContent('.wdsync-test-casepair')
 const noInfinityOn = () => hasFlag('.wdsync-test-noinfinity')
 /** shallowinf：Depth:infinity 请求按 Depth:1 应答（模拟忽略 Depth 头、只回第一层） */
 const shallowInfOn = () => hasFlag('.wdsync-test-shallowinf')
+/** root404prop：缺失路径的 PROPFIND 不回 HTTP 404，改回 207 + 集合自身 404 propstat
+ *  （模拟部分网关对缺失集合的应答形态 —— 引擎的根探测归一与扫描层识别用例） */
+const root404PropOn = () => hasFlag('.wdsync-test-root404prop')
 /** depthlog：把每个 PROPFIND 的深度记入独立日志（inf | 数字） */
 const depthLogOn = () => hasFlag('.wdsync-test-depthlog')
 // ---- 集合 etag 深层传播标记 ----
@@ -544,6 +552,22 @@ async function propfind(absPath, urlPath, depth, res) {
   try {
     st = await fsp.stat(absPath)
   } catch {
+    // root404prop 档：缺失路径的 PROPFIND 改回「207 + 集合自身 404 propstat」——
+    // 真实抓包中部分网关对缺失集合就是这么应答的（HTTP 状态 207、唯一 response 的
+    // propstat 为 404）。引擎必须在根探测与扫描层都识别该形态并路由到根丢失决策，
+    // 绝不能解读成「远端为空」
+    if (root404PropOn()) {
+      const t = tagOf(flagContent('.wdsync-test-xmlstyle'))
+      const selfHref = `${urlPath.replace(/\/+$/, '')}/`
+      res.writeHead(207, { 'Content-Type': 'application/xml; charset=utf-8' })
+      res.end(
+        `<?xml version="1.0" encoding="utf-8"?>\n<${t('multistatus')} xmlns:D="DAV:">\n` +
+          `  <${t('response')}>\n    <${t('href')}>${escapeXml(selfHref)}</${t('href')}>\n` +
+          `    <${t('propstat')}><${t('prop')}/><${t('status')}>HTTP/1.1 404 Not Found</${t('status')}></${t('propstat')}>\n` +
+          `  </${t('response')}>\n</${t('multistatus')}>`
+      )
+      return
+    }
     res.writeHead(404).end()
     return
   }
@@ -1005,6 +1029,11 @@ const server = http.createServer(async (req, res) => {
     }
   }
 })
+
+// keep-alive 空闲超时对齐真实服务器（nginx 默认 75s / 常见网关 30s+），而非 Node 默认 5s：
+// 引擎端 keep-alive 池复用「恰好被服务器关闭」的 socket 时会收到 ECONNRESET（上传按
+// 保守语义当轮不重试）——5s 窗口在并行测试负载下会被随机命中，30s 使竞态 practically 消失
+server.keepAliveTimeout = 30000
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`mini-dav listening at http://127.0.0.1:${port}${HREF_ROOT} root=${ROOT}`)

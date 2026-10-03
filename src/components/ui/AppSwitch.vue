@@ -27,7 +27,8 @@ const model = defineModel<boolean>({ required: true })
   background: #d5d9de;
   border: none;
   padding: 0;
-  transition: background 0.15s;
+  /* 底色随状态渐变，缓动与滑块一致保证整体感 */
+  transition: background 0.2s var(--ease-swift);
   flex-shrink: 0;
 
   &.on {
@@ -43,11 +44,21 @@ const model = defineModel<boolean>({ required: true })
     border-radius: 8px;
     background: #fff;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
-    transition: left 0.15s;
+    /* swift 缓动：出手快、停得稳，比线性更接近物理直觉 */
+    transition: left 0.2s var(--ease-swift), width 0.15s var(--ease-swift);
   }
 
   &.on .knob {
     left: 16px;
+  }
+
+  /* 按压微反馈：滑块横向拉伸，松手回弹；开启态同步左移保持 2px 右边距 */
+  &:active:not(:disabled) .knob {
+    width: 18px;
+  }
+
+  &.on:active:not(:disabled) .knob {
+    left: 14px;
   }
 
   &:disabled {

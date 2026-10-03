@@ -64,11 +64,11 @@ function choose(choice: 'local' | 'remote' | 'both') {
     <div class="flex flex-col gap-3">
       <div class="flex gap-[10px]">
         <span class="w-[62px] shrink-0" />
-        <span class="flex-1 flex items-center justify-center gap-[6px] rounded-[5px] px-[10px] py-[5px] text-[11px] font-semibold bg-fill-badge text-primary">
+        <span class="flex-1 flex items-center justify-center gap-[6px] rounded-[5px] px-[10px] py-[5px] text-[11px] font-semibold bg-fill-badge text-primary border border-solid border-[#c6dcf9]">
           <AppIcon name="monitor" :size="12" />
           电脑上的版本
         </span>
-        <span class="flex-1 flex items-center justify-center gap-[6px] rounded-[5px] px-[10px] py-[5px] text-[11px] font-semibold bg-fill-seg text-btn-text">
+        <span class="flex-1 flex items-center justify-center gap-[6px] rounded-[5px] px-[10px] py-[5px] text-[11px] font-semibold bg-fill-seg text-btn-text border border-solid border-line-card-alt">
           <AppIcon name="cloud" :size="12" />
           云端的版本
         </span>
@@ -92,7 +92,7 @@ function choose(choice: 'local' | 'remote' | 'both') {
         两台设备的系统时间可能不一致，修改时间仅供参考，请结合文件大小和内容判断。
       </div>
       <label class="flex items-center gap-[6px] text-[11px] text-ink-2 select-none cursor-pointer">
-        <input v-model="applyAll" type="checkbox" class="accent-[#1a73e8] w-[13px] h-[13px] cursor-pointer" />
+        <input v-model="applyAll" type="checkbox" class="accent-[var(--blue)] w-[13px] h-[13px] cursor-pointer" />
         其余的冲突也都这样处理
       </label>
     </div>

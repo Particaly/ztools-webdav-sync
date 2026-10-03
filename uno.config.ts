@@ -58,8 +58,8 @@ export default defineConfig({
       },
     },
     fontFamily: {
-      ui: "'Inter', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif",
-      mono: "'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New', monospace",
+      ui: "-apple-system, 'Inter', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif",
+      mono: "ui-monospace, 'JetBrains Mono', 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Courier New', monospace",
     },
     boxShadow: {
       card: 'var(--shadow-card)',

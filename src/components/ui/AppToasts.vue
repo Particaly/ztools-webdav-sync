@@ -79,14 +79,14 @@ const APPEARANCE: Record<ToastType, { icon: string; iconClass: string; bg?: stri
   box-shadow: 0 8px 28px rgba(33, 41, 51, 0.16);
   overflow: hidden;
 
-  // 类型色条
+  // 类型色条（左侧竖条：比常规略宽，白底弹层上更醒目）
   &::before {
     content: '';
     position: absolute;
     left: 0;
     top: 0;
     bottom: 0;
-    width: 3px;
+    width: 6px;
   }
 
   &.success::before {

@@ -30,17 +30,23 @@ const store = useStore()
           </AppButton>
         </div>
 
-        <div class="relative bg-white border border-solid border-line-card-alt rounded-lg overflow-hidden">
+        <!-- 目录列表块：flex-1 撑满 main 剩余高度（min-h-0 允许收缩），行多时块内
+             部滚动，服务器卡片与标题行保持固定；外层 main 的滚动仅作极矮窗口兜底 -->
+        <div class="relative flex-1 min-h-0 bg-white border border-solid border-line-card-alt rounded-lg overflow-y-auto">
           <TransitionGroup name="list">
             <DirRow v-for="d in store.state.dirs" :key="d.id" :dir="d" />
           </TransitionGroup>
+          <!-- 已配置但还没有同步目录：flex-1 会把空块撑满高度，用占位说明避免一片空白 -->
+          <div v-if="!store.state.dirs.length" class="h-full flex items-center justify-center">
+            <span class="text-[12px] text-ink-4">还没有同步文件夹，点击右上角「添加文件夹」开始</span>
+          </div>
         </div>
       </template>
 
       <!-- 首次未配置：空状态 -->
       <div v-else class="flex-1 flex items-center justify-center">
-        <div class="rise-in flex flex-col items-center">
-          <div class="mb-[14px]">
+        <div class="flex flex-col items-center stagger">
+          <div class="empty-art mb-[14px]">
             <svg width="68" height="64" viewBox="0 0 68 64" fill="none">
               <!-- 云（蓝） -->
               <path
@@ -108,6 +114,54 @@ const store = useStore()
 
   &:hover {
     text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}
+
+/* ---------- 空状态 ---------- */
+
+/* 入场节奏：插画 → 标题 → 副题 → 按钮 → 脚注 依次浮起，视线自上而下引导 */
+.stagger > * {
+  opacity: 0;
+  animation: rise-in 0.55s var(--ease-swift) forwards;
+}
+
+.stagger > *:nth-child(1) { animation-delay: 0.02s; }
+.stagger > *:nth-child(2) { animation-delay: 0.1s; }
+.stagger > *:nth-child(3) { animation-delay: 0.16s; }
+.stagger > *:nth-child(5) { animation-delay: 0.22s; }
+.stagger > *:nth-child(7) { animation-delay: 0.3s; }
+
+/* 插画：背后一圈淡蓝晕光聚焦视线，云朵缓慢上下悬浮增添呼吸感 */
+.empty-art {
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    inset: -36px -52px;
+    background: radial-gradient(
+      closest-side,
+      rgba(26, 115, 232, 0.09),
+      rgba(26, 115, 232, 0.04) 55%,
+      transparent 78%
+    );
+  }
+
+  svg {
+    position: relative;
+    animation: float-y 4.6s ease-in-out infinite;
+  }
+}
+
+@keyframes float-y {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-3px);
   }
 }
 </style>

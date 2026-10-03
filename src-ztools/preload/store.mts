@@ -13,7 +13,8 @@
 //   baselines/<hash16>/log.jsonl             基线增量日志（append-only，每行带 CRC）
 //   baselines/<hash16>/wal.jsonl             意图日志（同机制，轮末清空）
 //   baselines/<hash16>/failures.json         持续失败退避表（整体原子写）
-//   baselines/<hash16>/pending-conflicts.json 冲突挂起表（整体原子写）
+//   baselines/<hash16>/pending-conflicts.json 冲突挂起表 + 批量删除快照 + 删除范围决策（整体原子写）
+//   baselines/<hash16>/decision-log.json      决策历史记录（整体原子写，环形上限）
 //   baselines/<hash16>/scan-cache.json        etag 跳过扫描缓存（整体原子写）
 //   servers/<hash16>/capabilities.json       服务器能力探测缓存（origin+username 粒度）
 //   servers/<hash16>/noise.json              指纹噪声标记（origin+username 粒度、跨目录共享）
@@ -63,6 +64,9 @@ import { getHostPorts } from './host.mts'
 import type {
   BaselineEntry,
   DavCapabilities,
+  DecisionLogEntry,
+  DeleteBatch,
+  DeleteScope,
   FailureRecord,
   LogOp,
   PendingListItem,
@@ -91,6 +95,11 @@ const FAILURES_V = 1
 // ---- 挂起记录（冲突类 + 删除确认类）----
 /** 挂起表（pending-conflicts.json）结构版本号 */
 const PENDINGS_V = 1
+// ---- 决策历史记录 ----
+/** 决策历史（decision-log.json）结构版本号 */
+const DECISION_LOG_V = 1
+/** 决策历史环形上限：超出后丢弃最旧条目（纯展示性信息，防膨胀优先于完整性） */
+const MAX_DECISION_LOG_ENTRIES = 200
 // ---- etag 跳过扫描缓存----
 /** 扫描缓存（scan-cache.json）结构版本号 */
 const SCAN_CACHE_V = 1
@@ -101,7 +110,7 @@ const MAX_PENDING_ENTRIES = 500
  * 三种动作一一对应；删除确认类挂起（kind='delete'）delete = 确认删除（下轮执行）、
  * keep = 保留两侧不删（持续抑制删除传播）。非法值一律按「未解决」处理。
  */
-const PENDING_CHOICES = new Set(['local', 'remote', 'both', 'delete', 'keep'])
+const PENDING_CHOICES = new Set(['local', 'remote', 'both', 'delete', 'keep', 'upload', 'remove-local'])
 /** 失败记录条目上限：超出后丢弃新条目并记 warning（防膨胀；旧条目到期重试成功后自然清除） */
 const MAX_FAILURE_ENTRIES = 1000
 /** 单条失败消息的截断长度（字符） */
@@ -481,6 +490,27 @@ class DirStateStore {
   pendings: Map<string, PendingRecord>
   /** 冲突挂起表自上次落盘后是否有变更（引擎轮末据此决定是否 savePendings） */
   pendingsDirty: boolean
+  /**
+   * 批量删除快照（deleteBatch）：触发批量删除阈值拦截的轮对「全部未决策删除候选」
+   * 的目录聚合快照 —— 逐文件挂起表有 500 条上限，超出部分没有逐文件记录，快照是
+   * UI 树形展示与「全部 / 按目录」批量决策的完整事实源。与 pendings 同属决策辅助
+   * 状态：丢失 / 损坏的最坏后果是 UI 树缺失（下一轮触发拦截时重建），不影响同步安全。
+   */
+  deleteBatch: DeleteBatch | null
+  /**
+   * 删除范围决策（deleteScopes）：用户在目录树节点（含空前缀 = 整目录）做出的
+   * 批量选择，按前缀匹配消费（最具体者胜）。与 pendings 同生命周期语义：
+   * 消费轮按选择执行 / 抑制，扫描完整且零匹配的轮由引擎剪枝。
+   */
+  deleteScopes: DeleteScope[]
+  /**
+   * 决策历史记录（decision-log.json，最新在尾）：用户对待处理挂起的每次选择 /
+   * 忽略各占一条。纯展示性审计状态，不参与 WAL / 基线 / 挂起语义 —— 丢失或损坏
+   * 的最坏后果是「最近处理记录」列表变短。
+   */
+  decisionLog: DecisionLogEntry[]
+  /** 决策历史自上次落盘后是否有变更（门面层追加后立即落盘，不积压到轮末） */
+  decisionLogDirty: boolean
   /** scan-cache.json 损坏降级提示是否已记过（getScanCache 每轮重读磁盘，防长驻进程跨轮刷屏） */
   scanCacheWarned: boolean
   /** 元数据（meta.json）：lastDeepVerifyAt 等（噪声标记已迁至服务器粒度存储，见 ServerStateStore） */
@@ -505,6 +535,10 @@ class DirStateStore {
     this.failuresDirty = false
     this.pendings = new Map<any, any>()
     this.pendingsDirty = false
+    this.deleteBatch = null
+    this.deleteScopes = []
+    this.decisionLog = []
+    this.decisionLogDirty = false
     this.scanCacheWarned = false
     this.meta = { v: SCHEMA_V, ...keyInfo }
     this.chain = Promise.resolve()
@@ -604,22 +638,76 @@ class DirStateStore {
       if (parsed && parsed.v === PENDINGS_V && parsed.pendings && typeof parsed.pendings === 'object') {
         for (const k of Object.keys(parsed.pendings)) {
           const p = parsed.pendings[k]
-          // 逐条轻校验：createdAt 必须是数字、两侧指纹必须是对象；choice 只认合法值，
-          // 其余（含畸形 / 手改的任意串）按「未解决」降级保留条目 —— 畸形条目不连累整表。
-          // kind='delete'（删除确认类）原样保留；其余值按冲突类（无 kind）处理
-          if (p && typeof p === 'object' && typeof p.createdAt === 'number' && p.local && typeof p.local === 'object' && p.remote && typeof p.remote === 'object') {
-            const rec: PendingRecord = {
-              local: { size: Number(p.local.size) || 0, mtimeMs: Number(p.local.mtimeMs) || 0 },
-              remote: { size: Number(p.remote.size) || 0, mtimeMs: Number(p.remote.mtimeMs) || 0, etag: String(p.remote.etag || '') },
-              createdAt: p.createdAt,
+            // 逐条轻校验：createdAt 必须是数字、两侧指纹必须是对象；choice 只认合法值，
+            // 其余（含畸形 / 手改的任意串）按「未解决」降级保留条目 —— 畸形条目不连累整表。
+            // kind='delete'（删除确认类）/ 'root-lost'（根丢失决策类）原样保留；其余值按冲突类（无 kind）处理
+            if (p && typeof p === 'object' && typeof p.createdAt === 'number' && p.local && typeof p.local === 'object' && p.remote && typeof p.remote === 'object') {
+              const rec: PendingRecord = {
+                local: { size: Number(p.local.size) || 0, mtimeMs: Number(p.local.mtimeMs) || 0 },
+                remote: { size: Number(p.remote.size) || 0, mtimeMs: Number(p.remote.mtimeMs) || 0, etag: String(p.remote.etag || '') },
+                createdAt: p.createdAt,
+              }
+              if (p.kind === 'delete' || p.kind === 'root-lost') rec.kind = p.kind
+              if (p.choice != null && PENDING_CHOICES.has(p.choice)) rec.choice = p.choice
+              // 范围决策盖章的来源标记（scope 前缀 + 代际）：仅删除确认类可能携带；
+              // 畸形（缺代际 / 非串前缀）按无来源处理 —— 退化为普通逐文件选择，安全侧
+              if (rec.kind === 'delete' && typeof p.scope === 'string' && typeof p.scopeGen === 'number') {
+                rec.scope = p.scope
+                rec.scopeGen = p.scopeGen
+              }
+              this.pendings.set(nfc(k), rec)
             }
-            if (p.kind === 'delete') rec.kind = 'delete'
-            if (p.choice != null && PENDING_CHOICES.has(p.choice)) rec.choice = p.choice
-            this.pendings.set(nfc(k), rec)
-          }
         }
       } else {
         this.warnings.push('pending-conflicts.json 损坏或版本不识别：冲突挂起记录按空处理')
+      }
+      // 附加载荷（同文件，向后兼容：旧版本文件没有这两个字段 → 按缺省空值处理）：
+      // deleteBatch 批量删除快照 / deleteScopes 删除范围决策。畸形一律按「无」降级 ——
+      // 快照缺失时引擎在下一轮触发拦截时重建，scope 丢失只是回到「重新询问」的安全侧。
+      const b = parsed && parsed.deleteBatch
+      if (b && typeof b === 'object' && typeof b.at === 'number' && typeof b.total === 'number' && typeof b.bytes === 'number' && Array.isArray(b.nodes)) {
+        const nodes = b.nodes
+          .filter((nd: any) => nd && typeof nd.rel === 'string' && typeof nd.files === 'number' && typeof nd.bytes === 'number')
+          .map((nd: any) => ({ rel: nfc(nd.rel), isDir: !!nd.isDir, files: Math.max(0, nd.files), bytes: Math.max(0, nd.bytes) }))
+        if (nodes.length) this.deleteBatch = { at: b.at, total: Math.max(0, b.total), bytes: Math.max(0, b.bytes), nodes }
+      }
+      const sc = parsed && parsed.deleteScopes
+      if (Array.isArray(sc)) {
+        for (const s of sc) {
+          // 逐条轻校验：prefix 非空串（'' = 整目录，合法）、choice 只认 delete/keep；
+          // gen 缺失按 0（扁平代际）处理
+          if (s && typeof s === 'object' && typeof s.prefix === 'string' && (s.choice === 'delete' || s.choice === 'keep')) {
+            this.deleteScopes.push({ prefix: nfc(s.prefix), choice: s.choice, at: Number(s.at) || Date.now(), gen: Number(s.gen) || 0 })
+          }
+        }
+      }
+    }
+    // decision-log（决策历史）：损坏 / 版本不识别一律按空处理并记 warning —— 纯展示性
+    // 审计信息，绝不影响同步安全；与 failures / pendings 同样放在快照加载之前。
+    let dlogRaw: any = null
+    try {
+      dlogRaw = await fsp.readFile(this.decisionLogPath(), 'utf-8')
+    } catch (e: any) {
+      if (e && e.code !== 'ENOENT') this.warnings.push('decision-log.json 不可读：决策历史按空处理')
+    }
+    if (dlogRaw !== null) {
+      let parsed: any = null
+      try {
+        parsed = JSON.parse(dlogRaw)
+      } catch (_) {
+        /* 损坏 → 按空处理 */
+      }
+      if (parsed && parsed.v === DECISION_LOG_V && Array.isArray(parsed.entries)) {
+        for (const en of parsed.entries) {
+          // 逐条轻校验：at 必须是数字、rel/kind/choice 必须是非空串；畸形条目直接丢弃
+          if (en && typeof en === 'object' && typeof en.at === 'number' && typeof en.rel === 'string' && en.rel && typeof en.kind === 'string' && en.kind && typeof en.choice === 'string' && en.choice) {
+            const rec: DecisionLogEntry = { at: en.at, rel: en.rel, kind: en.kind as DecisionLogEntry['kind'], choice: en.choice }
+            if (typeof en.affected === 'number' && en.affected > 0) rec.affected = en.affected
+            this.decisionLog.push(rec)
+          }
+        }
+      } else {
+        this.warnings.push('decision-log.json 损坏或版本不识别：决策历史按空处理')
       }
     }
     // snapshot：不存在 = 合法首轮；存在但不可解析 = 损坏 → 无基线保护
@@ -695,6 +783,9 @@ class DirStateStore {
   }
   pendingPath(): string {
     return path.join(this.dirPath, 'pending-conflicts.json')
+  }
+  decisionLogPath(): string {
+    return path.join(this.dirPath, 'decision-log.json')
   }
   scanCachePath(): string {
     return path.join(this.dirPath, 'scan-cache.json')
@@ -906,6 +997,9 @@ class DirStateStore {
   // 删除确认类（kind='delete'）：单轮待删超过安全阈值时由引擎整批登记（无 choice），
   // 用户经同一面板确认（delete，下一轮执行删除）或保留（keep，持续抑制该文件的
   // 删除传播直至状态变化）；确认删除落地成功后由引擎清除。
+  // 根丢失决策类（kind='root-lost'，rel 恒为 '.'）：远端同步根 404 且基线非空时登记
+  //（无 choice），用户在决策弹窗选择 upload（重建云端并重新上传）或 remove-local
+  // （跟随云端删除移除本地已同步内容）；下一轮根探测消费该选择后清除。
   // 生命周期：决策时登记（setPending）→ 规划期消费（引擎读 getPending）→ 冲突解决
   // 动作成功提交后清除（clearPending）→ 失败保留（什么都不做）。纯内存读写，轮末由
   // 引擎在 pendingsDirty 时统一落盘（与基线 / WAL / failures 共用 chain 串行，内部不并发）。
@@ -974,7 +1068,7 @@ class DirStateStore {
       },
       createdAt: Number(info.createdAt) || Date.now(),
     }
-    if (info.kind === 'delete') rec.kind = 'delete'
+    if (info.kind === 'delete' || info.kind === 'root-lost') rec.kind = info.kind
     if (info.choice != null && PENDING_CHOICES.has(info.choice)) rec.choice = info.choice as PendingRecord['choice']
     this.pendings.set(k, rec)
     this.pendingsDirty = true
@@ -992,11 +1086,190 @@ class DirStateStore {
     return true
   }
 
-  /** 轮末落盘冲突挂起表（引擎仅在 pendingsDirty 时调用；经 chain 与基线/WAL/失败表写入串行） */
+  // ---- 批量删除快照 + 删除范围决策 ----
+  //
+  // 语义：逐文件挂起表（上方 pendings）有 MAX_PENDING_ENTRIES 上限，「大量文件被删
+  // 触发批量删除闸」时超出上限的候选没有逐文件记录 —— 用户在目录树上做的「保留 /
+  // 删除」决策若只落逐文件记录，永远盖不住装不下的部分（历史缺陷：确认过「全部不删」
+  // 后每轮仍重新询问）。本节补两个结构：
+  //   deleteBatch  —— 拦截轮对全部未决策候选的目录聚合快照（UI 树形展示 + 「全部」
+  //                  类决策的完整事实源）；全部候选被消费后由引擎清除。
+  //   deleteScopes —— 前缀范围决策（'' = 整目录）：规划期按前缀匹配消费（最具体者
+  //                  胜），天然覆盖装不下的候选；扫描完整且零匹配的轮自动剪枝。
+  // 二者与 pendings 同为「决策辅助状态」：不参与 WAL / 基线语义，丢失 / 损坏的
+  // 最坏后果是 UI 树缺失（下轮触发拦截时重建）或回到「重新询问」的安全侧。
+  // 持久化与 pendings 同文件同脏标记（savePendings 一并写入）。
+
+  /** 读取批量删除快照（无则 null；返回内部引用 —— 引擎只写不改读出对象） */
+  getDeleteBatch(): DeleteBatch | null {
+    return this.deleteBatch
+  }
+
+  /** 写入（整体替换）批量删除快照；引擎在触发拦截的轮构建后调用 */
+  setDeleteBatch(batch: DeleteBatch): void {
+    this.deleteBatch = batch
+    this.pendingsDirty = true
+  }
+
+  /**
+   * 清除批量删除快照（全部候选已消费 / 情形已消失时由引擎调用）。
+   * @returns {boolean} 是否确实清除了快照（无快照时 no-op 返回 false）
+   */
+  clearDeleteBatch(): boolean {
+    if (!this.deleteBatch) return false
+    this.deleteBatch = null
+    this.pendingsDirty = true
+    return true
+  }
+
+  /**
+   * 落一条（或覆盖同前缀槽位的）删除范围决策。prefix 已 nfc 归一（调用方保证）；
+   * 同前缀重复决策按「最后一次为准」覆盖；gen 为决策代际（快照 at，扁平为 0）——
+   * 只影响盖章改写边界（见 stampDeleteScopeChoices），不参与匹配。
+   */
+  setDeleteScope(prefix: string, choice: 'delete' | 'keep', gen: number): void {
+    const p = nfc(prefix)
+    const existing = this.deleteScopes.find((s) => s.prefix === p)
+    if (existing) {
+      existing.choice = choice
+      existing.at = Date.now()
+      existing.gen = gen
+    } else {
+      this.deleteScopes.push({ prefix: p, choice, at: Date.now(), gen })
+    }
+    this.pendingsDirty = true
+  }
+
+  /** 当前全部删除范围决策（返回深拷贝副本，调用方改写不会污染内部状态） */
+  listDeleteScopes(): DeleteScope[] {
+    return this.deleteScopes.map((s) => ({ ...s }))
+  }
+
+  /**
+   * 匹配某 rel 的删除范围决策：rel === prefix（文件级 / 目录级精确）或 rel 在
+   * prefix 目录之下（prefix='photos' 匹配 'photos/a.jpg' 与 'photos/sub/b.jpg'；
+   * prefix='' 匹配全部）。多 scope 命中时取最具体（最长前缀）者 —— 用户先保了
+   * 大目录、后单独确认了其中一个文件时，以更具体的决定为准。
+   * @returns {DeleteScope | null} 命中的决策；无命中返回 null
+   */
+  matchDeleteScope(rel: string): DeleteScope | null {
+    const k = nfc(rel)
+    let best: DeleteScope | null = null
+    for (const s of this.deleteScopes) {
+      const hit = s.prefix === '' || s.prefix === k || k.startsWith(s.prefix === '' ? '' : s.prefix + '/')
+      if (hit && (!best || s.prefix.length > best.prefix.length)) best = s
+    }
+    return best
+  }
+
+  /**
+   * 剪枝失效的范围决策：引擎传入「本轮实际匹配过的前缀集合」，未出现在集合中的
+   * scope 视为其覆盖情形已消失（文件恢复 / 已全部处理 / 基线变化），自动移除 ——
+   * 否则陈旧 keep 会永远压制未来的新删除事件（用户删除云端后本应重新询问）。
+   * 仅在扫描完整轮调用（扫描不完整时「零匹配」不可信，见引擎调用点注释）。
+   * @param matchedPrefixes 本轮至少匹配过一个删除候选的前缀集合
+   * @returns {number} 剪枝掉的决策条数（0 = 无变化，引擎无需落盘）
+   */
+  pruneDeleteScopes(matchedPrefixes: Set<string>): number {
+    if (!this.deleteScopes.length) return 0
+    const kept = this.deleteScopes.filter((s) => matchedPrefixes.has(s.prefix))
+    if (kept.length === this.deleteScopes.length) return 0
+    const pruned = this.deleteScopes.length - kept.length
+    this.deleteScopes = kept
+    this.pendingsDirty = true
+    return pruned
+  }
+
+  /** 是否存在未决策（无 choice）的删除确认类挂起（引擎轮末判定快照可否清除） */
+  hasUndecidedDeletes(): boolean {
+    for (const p of this.pendings.values()) {
+      if (p.kind === 'delete' && !p.choice) return true
+    }
+    return false
+  }
+
+  /**
+   * 把某前缀下既有删除确认类挂起的 choice 对齐为用户在目录树上做的范围决策
+   *（setDeleteScope 的配套：决策同时盖章既有逐文件记录，保证「挂起表逐条判定」
+   * 与「scope 匹配判定」两条消费路径语义一致，且 UI 列表不再把这些条目当未决策
+   * 展示）。改写边界（防翻案）：
+   *   - 无 choice 的记录 → 盖章（本就是待决策项，范围决策覆盖它们是本意）；
+   *   - 已有 choice 且来自同代范围决策（scopeGen === gen）且旧前缀被新前缀覆盖
+   *     → 改写（同代内更具体 / 更新的范围决策覆盖旧的盖章，如子树保留后单独
+   *       确认其中一文件）；
+   *   - 其余（用户逐文件显式选择，或跨代的盖章）→ 不动（范围决策不翻案逐文件
+   *     决策与旧代决定 —— 「全部」只作用于当前树里未决策的部分）。
+   * @returns {number} 盖章（含改写）的记录条数
+   */
+  stampDeleteScopeChoices(prefix: string, choice: 'delete' | 'keep', gen: number): number {
+    const p = nfc(prefix)
+    let n = 0
+    for (const [k, rec] of this.pendings) {
+      if (rec.kind !== 'delete') continue
+      const hit = p === '' || p === k || k.startsWith(p === '' ? '' : p + '/')
+      if (!hit) continue
+      // 改写仅限「同代且新前缀落在旧盖章前缀之内 / 相等」（更具体的后点决策细化
+      // 旧的盖章）；更宽的新决策不动旧盖章（引擎按最具体 scope 匹配，行为不受影响）
+      const withinOld = rec.scope != null && (rec.scope === '' || p === rec.scope || p.startsWith(rec.scope + '/'))
+      const restamp = !rec.choice || (rec.scopeGen === gen && withinOld)
+      if (!restamp) continue
+      rec.choice = choice
+      rec.scope = p
+      rec.scopeGen = gen
+      n++
+    }
+    if (n > 0) this.pendingsDirty = true
+    return n
+  }
+
+  /** 轮末落盘冲突挂起表（引擎仅在 pendingsDirty 时调用；经 chain 与基线/WAL/失败表写入串行）。
+   *  同文件附加写入批量删除快照（deleteBatch）与删除范围决策（deleteScopes）——
+   *  二者与挂起表同为「决策辅助状态」，共用 pendingsDirty 脏标记与落盘时机。 */
   async savePendings(): Promise<void> {
     return this._chain(async () => {
-      await atomicWriteJson(this.pendingPath(), { v: PENDINGS_V, pendings: Object.fromEntries(this.pendings) })
+      await atomicWriteJson(this.pendingPath(), {
+        v: PENDINGS_V,
+        pendings: Object.fromEntries(this.pendings),
+        deleteBatch: this.deleteBatch,
+        deleteScopes: this.deleteScopes,
+      })
       this.pendingsDirty = false
+    })
+  }
+
+  // ---- 决策历史记录 ----
+  //
+  // 语义：decision-log.json（整体原子写）保存用户对待处理挂起的每次选择 / 忽略
+  //（appendDecision 追加，最新在尾，环形上限 MAX_DECISION_LOG_ENTRIES 条 —— 超限
+  // 丢弃最旧）。与 pendings 同为「决策辅助 / 展示」性质：不承载任何数据事实，
+  // 删除本文件不影响同步正确性，只影响「最近处理记录」可回看的范围。
+
+  /**
+   * 追加一条决策历史（用户经 setPendingChoice 落选择 / 经 clearPendingConflict
+   * 忽略挂起时由门面层调用）。环形上限：超出后丢弃最旧条目。
+   * @param entry 决策条目（at / rel / kind / choice；root-lost 类带 affected）
+   */
+  appendDecision(entry: DecisionLogEntry): void {
+    this.decisionLog.push(entry)
+    if (this.decisionLog.length > MAX_DECISION_LOG_ENTRIES) {
+      this.decisionLog.splice(0, this.decisionLog.length - MAX_DECISION_LOG_ENTRIES)
+    }
+    this.decisionLogDirty = true
+  }
+
+  /**
+   * 全部决策历史（按时间倒序，最新在前）——「最近处理记录」面板与测试断言共用；
+   * 返回浅拷贝副本（条目对象视为只读不再深拷贝），调用方改写不会污染内部顺序。
+   */
+  listDecisionLog(): DecisionLogEntry[] {
+    return [...this.decisionLog].reverse()
+  }
+
+  /** 落盘决策历史（门面层追加后立即调用，不积压；经 chain 与其他表写入串行） */
+  async saveDecisionLog(): Promise<void> {
+    return this._chain(async () => {
+      await atomicWriteJson(this.decisionLogPath(), { v: DECISION_LOG_V, entries: this.decisionLog })
+      this.decisionLogDirty = false
     })
   }
 

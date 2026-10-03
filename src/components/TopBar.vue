@@ -15,7 +15,7 @@ const statusText = computed(() =>
 <template>
   <header class="topbar">
     <div class="logo">
-      <AppIcon name="cloud-sync" :size="18" />
+      <AppIcon name="cloud-sync" :size="17" />
     </div>
     <div class="flex flex-col gap-px">
       <div class="app-name">WebDAV 同步</div>
@@ -25,13 +25,18 @@ const statusText = computed(() =>
       </div>
     </div>
     <span class="flex-spacer" />
-    <AppIconButton title="设置" class="text-icon-dark" @click="store.state.route = 'settings'">
-      <AppIcon name="gear" :size="14" />
+    <!-- 决策记录入口：有待决策事项时图标角标红点提示 -->
+    <AppIconButton title="决策记录" variant="ghost" class="text-icon-dark dec-entry" @click="store.state.route = 'decisions'">
+      <AppIcon name="history" :size="15" />
+      <span v-if="store.pendingConflictTotal.value > 0" class="badge-dot" />
+    </AppIconButton>
+    <AppIconButton title="设置" variant="ghost" class="text-icon-dark" @click="store.state.route = 'settings'">
+      <AppIcon name="gear" :size="15" />
     </AppIconButton>
     <AppDropdown placement="bottom-end" :min-width="128">
       <template #trigger="{ toggle }">
-        <AppIconButton title="更多" class="text-icon-dark" @click="toggle">
-          <AppIcon name="dots-v" :size="14" />
+        <AppIconButton title="更多" variant="ghost" class="text-icon-dark" @click="toggle">
+          <AppIcon name="dots-v" :size="15" />
         </AppIconButton>
       </template>
       <template #default="{ close }">
@@ -54,10 +59,12 @@ const statusText = computed(() =>
 }
 
 .logo {
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
-  background: var(--bg-badge);
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  /* 顶部提亮的单色渐变 + 内描边：小面积立体感，不抢主体 */
+  background: linear-gradient(180deg, #eaf3fe 0%, #dcebfd 100%);
+  box-shadow: inset 0 0 0 1px rgba(26, 115, 232, 0.14);
   color: var(--blue);
   display: flex;
   align-items: center;
@@ -67,6 +74,7 @@ const statusText = computed(() =>
 .app-name {
   font-size: 14px;
   font-weight: 600;
+  letter-spacing: 0.01em;
   color: var(--text-1);
   line-height: 1.2;
 }
@@ -76,14 +84,33 @@ const statusText = computed(() =>
   height: 6px;
   border-radius: 3px;
   background: var(--text-muted);
-  transition: background-color 0.3s ease;
+  transition: background-color 0.3s ease, box-shadow 0.3s ease;
 
   &.connected {
     background: var(--green-dot);
+    /* 连接态光晕：小面积低饱和，让状态「活」而不噪 */
+    box-shadow: 0 0 0 3px rgba(30, 158, 74, 0.14);
   }
 
   &.disconnected {
     background: #d97706;
+    box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.14);
+  }
+}
+
+/* 决策记录入口的待决策角标：图标右上角红点（描白边避免与图标粘连） */
+.dec-entry {
+  position: relative;
+
+  .badge-dot {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--red, #d93025);
+    box-shadow: 0 0 0 1.5px #fff;
   }
 }
 
@@ -97,6 +124,7 @@ const statusText = computed(() =>
   border-radius: 5px;
   font-size: 12px;
   color: var(--text-1);
+  transition: background 0.12s ease;
 
   &:hover {
     background: #f1f3f6;
