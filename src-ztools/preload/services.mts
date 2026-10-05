@@ -17,7 +17,7 @@
 //   远端不再存放任何状态文件；旧的 manifest / pending 日志逻辑已整体删除。
 import http from 'node:http'
 import https from 'node:https'
-import fs from 'node:fs'
+import nodeFs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import nodeTimers from 'node:timers'
@@ -28,6 +28,8 @@ import * as storage from './store.mts'
 import { createScheduler, sweepSchedulerTimers } from './scheduler.mts'
 import type { SchedulerFacade } from './scheduler.mts'
 import { getHostPorts, setHostPorts, HOST_TRASH_MISSING_MESSAGE } from './host.mts'
+import { describeZtoolsPluginsSync } from './ztools-plugins.mts'
+import { getRegistryReconcileState, reconcilePluginRegistry } from './ztools-registry.mts'
 import type {
   BaselineEntry,
   ConflictChoice,
@@ -40,11 +42,36 @@ import type {
   DeleteScope,
   NetOpts,
   Prefs,
+  RegistryReconcileResult,
+  SyncLogEntry,
+  SyncLogOp,
   SyncMode,
   SyncProgress,
   SyncSummary,
   ZToolsApi,
+  ZtoolsPluginsSyncDesc,
 } from './types.mts'
+
+/**
+ * 本地文件 IO 必须绕过 Electron 的 asar 补丁。ZTools 宿主（Electron）默认给 fs
+ * 打上 asar 补丁：以 `.asar` 结尾的路径被当作「档案内路径」—— stat 返回 0 字节
+ * 的虚拟条目（mtime 为该进程内首次访问该档案的时刻，随宿主重启变化）、
+ * createReadStream 按目录语义打开直接失败。ZTools 插件实体恰是 .asar 文件，同步
+ * 引擎必须按真实文件读写：优先 require Electron 暴露的未打补丁 original-fs
+ *（esbuild 打包时标记 external，运行时由宿主解析）；非 Electron 环境（vitest
+ * 直载源码 / 通用 Node）require 不可用，回落 node:fs —— 两者 API 完全同形。
+ * 本模块所有本地文件 IO（fsp 承载的 stat / 扫描 / 落盘，以及上传读流 / 下载写流）
+ * 一律经此处解析出的 fs：任何漏网走 asar 视图的调用都会把 0 字节指纹写进基线。
+ */
+const fs: typeof nodeFs = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const original: any = require('original-fs')
+    return original && typeof original.statSync === 'function' && original.promises ? original : nodeFs
+  } catch (_) {
+    return nodeFs
+  }
+})()
 
 const fsp = fs.promises
 
@@ -129,8 +156,16 @@ interface SyncHandlers {
    * 本地扫描换成「基线合成 + 脏路径核对」的快速形态；其余来源是周期性全量
    * 对账的组成部分，必须全量本地扫描。watcherKey 为该目录 watcher 的注册 id
    *（调度器形态 `${instanceId}:${dirId}`），扫描成功后引擎用它清理脏集。
+   * op 为一次单向操作（渲染层手动入口注入；显示名与 op 值的映射）：
+   *   'pull' = 「云端补齐本地」：云端新增 / 有变化的下载，本地缺失的恢复；本地
+   *   多出的保留、本地改过的不覆盖，双侧都改走冲突流程；'push' = 「本地补齐
+   *   云端」：按对称语义向云端收敛。'pull-full' = 「云端覆盖本地」/ 'push-full' =
+   *   「本地覆盖云端」：以选定侧为准把对侧完全恢复成它的样子 —— 缺失恢复 /
+   *   不一致覆盖（不做询问）/ 多余删除。四种都只沿选定方向传输；无基线差异不
+   *   产生删除；覆盖档的删除与常规删除同走删除安全闸（批量超阈值挂起等确认）。
+   *   仅对本轮生效，不落配置。
    */
-  hints?: { source: string; dirtyPaths?: string[]; watcherKey?: string }
+  hints?: { source: string; dirtyPaths?: string[]; watcherKey?: string; op?: 'pull' | 'push' | 'pull-full' | 'push-full' }
 }
 
 /** 网络请求可选项（singleRequest / davRequest 的 opts） */
@@ -1062,9 +1097,15 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
       if (opts.sinkFile && !opts.bodyFile) {
         // 下载：res → 可选 hash Transform → 写文件（pipeline 处理 backpressure / 错误传播）
         const sink = fs.createWriteStream(opts.sinkFile)
-        let sinkFailed = false
+        // 与上传读流同理（见 bodyFile 分支注释）：请求侧（res）失败时 pipeline 的
+        // 拆除会把同一错误传播进写流，若只看「sink 是否报过错」，网络中断会被误判
+        // 成「文件写不进去」。以首个报错的来源区分发起方：sink 先报 = 真写失败。
+        let firstErrFrom: '' | 'res' | 'sink' = ''
         sink.on('error', () => {
-          sinkFailed = true
+          if (!firstErrFrom) firstErrFrom = 'sink'
+        })
+        res.on('error', () => {
+          if (!firstErrFrom) firstErrFrom = 'res'
         })
         const chain = [res]
         if (h) chain.push(hashTransform(h))
@@ -1072,7 +1113,7 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
         pipeline(chain, (err) => {
           if (err) {
             // 取消销毁引出的错误一律以 ABORTED 收场（abortErr 非空 = 取消已发生）
-            const mapped = abortErr || (sinkFailed ? mapLocalWriteError(err, opts.sinkFile) : normalizeNetError(err, url))
+            const mapped = abortErr || (firstErrFrom === 'sink' ? mapLocalWriteError(err, opts.sinkFile) : normalizeNetError(err, url))
             req.destroy(mapped)
             finish(reject, mapped)
             return
@@ -1150,9 +1191,22 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
     if (opts.bodyFile) {
       // 上传：读流 → 可选 hash → req（pipeline：读流错误会销毁 req，不会悬挂）
       const rs = fs.createReadStream(opts.bodyFile)
-      let readFailed = false
-      rs.on('error', () => {
-        readFailed = true
+      // 只有读流**自身**报错才按本地 IO 归类。请求侧失败（stall 看门狗 / 空闲超时 /
+      // 连接被重置等 req.destroy(err)）时，pipeline 的拆除会把同一错误传播进读流
+      //（destroy(err, rs) → rs 的 'error' 再冒一次）—— 若只看「rs 是否报过错」，网络
+      // 卡顿会被误判成「文件暂时读不出来」并标记 permanent（不再重试）。因此以
+      // **首个报错的来源**区分发起方：rs 先报 = 真读不出来；req 先报 = 网络故障，
+      // 读流其后冒出的同一错误只是拆除回声，按 NETWORK 归类交给既有重试 / 退避。
+      let firstErrFrom: '' | 'rs' | 'req' = ''
+      let rsErr: any = null
+      rs.on('error', (e) => {
+        if (!firstErrFrom) {
+          firstErrFrom = 'rs'
+          rsErr = e
+        }
+      })
+      req.on('error', () => {
+        if (!firstErrFrom) firstErrFrom = 'req'
       })
       const chain: any[] = [rs]
       if (h) chain.push(hashTransform(h))
@@ -1164,13 +1218,13 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
           finish(reject, abortErr)
           return
         }
-        if (readFailed) {
+        if (firstErrFrom === 'rs') {
           const e2: any = new Error(`「${path.basename(opts.bodyFile || '')}」未上传：文件暂时读不出来`)
           e2.status = 0
           e2.code = 'LOCAL_IO'
           e2.permanent = true
           e2.source = 'body-read' // 上传读流失败 —— 已发出的字节服务器可能已收，意图须保持开放
-          e2.detail = `${(err && err.code) || (err && err.message) || err} ${opts.bodyFile || ''}`
+          e2.detail = `${(rsErr && rsErr.code) || (rsErr && rsErr.message) || err} ${opts.bodyFile || ''}`
           req.destroy(e2)
           finish(reject, e2)
           return
@@ -2162,6 +2216,9 @@ async function openServerNoiseSafe(cfg: EngineCfg): Promise<any> {
     return await storage.openServerState(originOf(cfg), (cfg && cfg.username) || '')
   } catch (_) {
     return {
+      // 与 ServerStateStore 同形的内存空实现：B 档提醒标记只进内存（每进程至多一次），
+      // saveNoise 为 no-op —— 存储层异常时降级，不阻断同步
+      noise: { fingerprintUnstable: false, noiseFiles: {}, concurrencyWarned: false },
       fingerprintUnstable: false,
       noteFingerprintNoise: () => false,
       resetFingerprintNoise: () => false,
@@ -2661,7 +2718,7 @@ function joinRemote(base: string, name: string): string {
 // ---------- 同步状态机辅助 ----------
 
 /** stat 一个本地路径，不存在 / 不可访问时返回 null（调用方必须把 null 当「无法确认」处理） */
-async function statOrNull(abs: string): Promise<fs.Stats | null> {
+async function statOrNull(abs: string): Promise<nodeFs.Stats | null> {
   try {
     return await fsp.stat(abs)
   } catch (_) {
@@ -2784,6 +2841,9 @@ async function computeLocalChanged(l: any, m: any, tolMs: number, forceHash = fa
  * flags（由规划层经 hash 消歧后注入的事实；未提供时按 size+mtime 容差自行推导）：
  *   lChanged / rChanged —— 本地 / 远端相对基线是否已变化
  *   newBoth             —— 无基线且两侧都在时的比对结论：'adopt'（已收敛，规划层已写基线）| 'conflict'
+ *   oneshot             —— 一次单向操作（「补齐」× 双向 / 「覆盖」× 双向四档）：
+ *                          'pull' / 'pull-full'（只下载）/ 'push' / 'push-full'
+ *                         （只上传），未提供 = 常规轮
  *
  * 有基线真值表（沿用既有语义，三种模式不变；lCh/rCh 为注入或推导的 lChanged/rChanged）：
  * ┌──────┬──────┬────┬─────┬─────┬───────────────┬───────────────┬───────────────┐
@@ -2814,8 +2874,27 @@ async function computeLocalChanged(l: any, m: any, tolMs: number, forceHash = fa
  *   - download 模式忽略「本地被删除」（远端未变时重新下载恢复本地），远端删除仍传播 delete-local；
  *   - 冲突解决是显式的「双向收敛」动作：任意模式选 local 都 PUT、选 remote 都覆盖本地；
  *   - 冲突副本（*.conflict.*）本地未修改时永远 keep，不做删除传播。
+ *
+ * 一次性单向操作语义（oneshot='pull' | 'push' 补齐档 / 'pull-full' | 'push-full'
+ * 覆盖档；凌驾于 dir.mode 之上）：
+ *   - 补齐档：把对端的内容带过来 —— 对端新增 / 有变化的文件沿方向传输，本端缺失
+ *     的文件恢复（pull 重新下载 / push 重新上传）；本端多出的文件保留（绝不删除），
+ *     本端改过的内容不覆盖（pull 对本端改动 keep，push 对对端改动 keep）；双侧都
+ *     改 → 冲突流程（用户裁决，解决动作是显式「双向收敛」，不受方向限制）；
+ *   - 覆盖档（镜像）：以选定侧为准，把本端完全恢复成对端的样子 —— 本端缺失的
+ *     恢复、内容不一致的以对侧覆盖（不做询问）、本端多出的删除（delete-local /
+ *     delete-remote，与常规删除同走删除安全闸：批量超阈值挂起等确认）；跨方向
+ *     差异（pull 的本端改动 / push 的对端改动）同样被覆盖；
+ *   - 无基线保护两档一致：仅一侧存在视为新增（沿方向传输），绝不产生 delete-*；
+ *     两侧都在且内容可收敛 → adopt；不可收敛时补齐档 conflict、覆盖档按镜像覆盖；
+ *   - 守卫不受档位影响：覆盖 / 删除前的 If-Match / 复查 / 下载守卫全部以扫描期
+ *     状态为基准，与本轮决策无关的「扫描后突变」照常拦截（落回冲突 / 重试）。
  */
 function decideAction(rel: string, l: any, r: any, m: any, mode: SyncMode, flags: any = {}): any {
+  // 一次性单向：方向（pull = 只下载 / push = 只上传）与档位（full = 覆盖档，以
+  // 选定侧为准镜像对侧）；未知值按常规轮处理
+  const oneshot = flags.oneshot === 'pull' || flags.oneshot === 'pull-full' ? 'pull' : flags.oneshot === 'push' || flags.oneshot === 'push-full' ? 'push' : null
+  const oneshotFull = flags.oneshot === 'pull-full' || flags.oneshot === 'push-full'
   const lExists = !!l
   const rExists = !!(r && !r.isDir)
   const deriveL = () => lExists && (flags.lChanged !== undefined ? !!flags.lChanged : !localFpMatch(l, m, 2000))
@@ -2825,14 +2904,25 @@ function decideAction(rel: string, l: any, r: any, m: any, mode: SyncMode, flags
   }
   if (!m) {
     if (!lExists && !rExists) return { act: 'skip' }
-    if (lExists && !rExists) return { act: 'upload' }
-    if (!lExists && rExists) return { act: 'download' }
-    return flags.newBoth === 'adopt' ? { act: 'keep', adopted: true } : { act: 'conflict' }
+    // 无基线差异按方向收敛（覆盖档同样不产生删除 —— 无基线保护的底线）：
+    // pull 不上传本地独有新文件，push 不下载远端独有新文件
+    if (lExists && !rExists) return oneshot === 'pull' ? { act: 'keep' } : { act: 'upload' }
+    if (!lExists && rExists) return oneshot === 'push' ? { act: 'keep' } : { act: 'download' }
+    // 两侧都在：内容可收敛 → adopt（规划层已写基线）；补齐档交冲突流程裁决，
+    // 覆盖档按镜像语义直接以选定侧覆盖对侧（不询问）
+    if (flags.newBoth === 'adopt') return { act: 'keep', adopted: true }
+    if (oneshotFull) return oneshot === 'pull' ? { act: 'download' } : { act: 'upload' }
+    return { act: 'conflict' }
   }
   const lChanged = deriveL()
   const rChanged = rExists && (flags.rChanged !== undefined ? !!flags.rChanged : remoteChangedVs(r, m))
   if (!lExists && !rExists) return { act: 'clean' }
   if (lExists && !rExists) {
+    // 一次性单向：pull 增量 keep（绝不删本地）、pull 全量 delete-local（以云端为
+    // 准，与常规删除同走删除安全闸）；push 两档都 upload 恢复远端缺失的文件。
+    // 常规轮沿用既有语义：本地未变按删除传播（upload 模式改判恢复上传），变过按上传
+    if (oneshot === 'pull') return oneshotFull ? { act: 'delete-local' } : { act: 'keep' }
+    if (oneshot === 'push') return { act: 'upload' }
     if (!lChanged) {
       if (mode === 'upload') return { act: 'upload' }
       return { act: 'delete-local' }
@@ -2840,6 +2930,12 @@ function decideAction(rel: string, l: any, r: any, m: any, mode: SyncMode, flags
     return { act: 'upload' }
   }
   if (!lExists && rExists) {
+    // 一次性单向：push 增量 keep（绝不删远端）、push 全量 delete-remote（以本地
+    // 为准，同走删除安全闸）；pull 两档都 download 恢复本地（「本地没有的从云端
+    // 恢复」）。常规轮沿用既有语义：远端未变按删除传播（download 模式改判恢复
+    // 下载），变过按下载
+    if (oneshot === 'push') return oneshotFull ? { act: 'delete-remote' } : { act: 'keep' }
+    if (oneshot === 'pull') return { act: 'download' }
     if (!rChanged) {
       if (mode === 'download') return { act: 'download' }
       return { act: 'delete-remote' }
@@ -2847,8 +2943,21 @@ function decideAction(rel: string, l: any, r: any, m: any, mode: SyncMode, flags
     return { act: 'download' }
   }
   if (!lChanged && !rChanged) return { act: 'keep' }
-  if (lChanged && !rChanged) return { act: mode === 'download' ? 'conflict' : 'upload' }
-  if (!lChanged && rChanged) return { act: mode === 'upload' ? 'conflict' : 'download' }
+  if (lChanged && !rChanged) {
+    // 本端改过：pull 增量 keep（不覆盖本地改动）、pull 全量 download（以云端为准
+    // 覆盖）；push 两档都 upload
+    if (oneshot === 'pull') return oneshotFull ? { act: 'download' } : { act: 'keep' }
+    return { act: mode === 'download' ? 'conflict' : 'upload' }
+  }
+  if (!lChanged && rChanged) {
+    // 对端改过：push 增量 keep（不覆盖云端改动）、push 全量 upload（以本地为准
+    // 覆盖）；pull 两档都 download
+    if (oneshot === 'push') return oneshotFull ? { act: 'upload' } : { act: 'keep' }
+    return { act: mode === 'upload' ? 'conflict' : 'download' }
+  }
+  // 双侧都改：补齐档走冲突流程（用户裁决，不受方向限制）；覆盖档直接以选定侧
+  // 为准覆盖对侧（镜像语义不做询问）
+  if (oneshotFull) return oneshot === 'pull' ? { act: 'download' } : { act: 'upload' }
   return { act: 'conflict' }
 }
 
@@ -3749,9 +3858,16 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
     }
   }
   ROUND_IN_FLIGHT.set(mutexKey, true)
+  // 同步记录（sync-log.json）的轮次起止：开始时刻在进入轮体前定格 —— 锁等待 /
+  // 队列耗时属于「这次同步」的一部分，记录的是用户感知的起止窗口
+  const roundStartAt = Date.now()
+  let roundSummary: any = null
+  let roundError: any = null
   try {
-    return await runSyncRound(cfg, dir, prefs, handlers)
+    roundSummary = await runSyncRound(cfg, dir, prefs, handlers)
+    return roundSummary
   } catch (e: any) {
+    roundError = e
     // 轮内已收尾的错误（执行期失败 / 取消 / 熔断 / 崩溃注入）都带
     // err.summary（含 failureClass）。这里只兜「轮次体直接抛出、未经轮末收尾」的路径
     //（扫描期网络异常 / CIRCUIT_OPEN 快速失败 / 意外 bug）：补一个零计数的最小 summary
@@ -3781,7 +3897,79 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
     // 正常 / 异常 / 取消 / 崩溃注入（同进程内注入不是真死）一律放行后续轮次 ——
     // 崩溃注入只模拟「进程死亡」的收尾语义，真实场景进程已不存在、Map 随之消失
     ROUND_IN_FLIGHT.delete(mutexKey)
+    // 同步记录落盘（best-effort，任何异常都不影响轮次结果的上抛）：
+    // 崩溃注入路径跳过 —— 模拟进程死亡不做任何收尾，记录同样不写；
+    // 并发让位轮（concurrent）在上方提前 return，不经过本 finally
+    if (!(roundError && roundError.__wdsyncCrash)) {
+      try {
+        const cancelled = !!(roundError && (roundError.code === 'ABORTED' || (typeof handlers?.shouldAbort === 'function' && handlers.shouldAbort())))
+        const st = await storage.openDirStore({ localPath: dir && dir.localPath, remotePath: dir && dir.remotePath })
+        st.appendSyncLog(buildSyncLogEntry({ handlers, at: roundStartAt, summary: roundSummary || (roundError && roundError.summary) || null, error: roundError, cancelled }))
+        await st.saveSyncLog().catch(() => {})
+      } catch (_) {
+        /* 同步记录写入失败无害：纯展示性审计信息 */
+      }
+    }
+    // 摘要离开引擎前剥离内部采集器引用：__syncOps 只服务于同步记录落盘，
+    // 不得随 round-end 事件进渲染层、更不能被渲染层持久化进配置（非展示字段）
+    if (roundSummary) delete roundSummary.__syncOps
+    if (roundError && roundError.summary) delete roundError.summary.__syncOps
   }
+}
+
+/**
+ * 组装一条同步记录（syncDirectory 轮末收尾专用；纯函数，不落盘）。
+ * 触发方式取 hints.source（调度器轮次 kind / 渲染层直调的 'manual'；
+ * 'manual-delegated' 是多实例委托代跑的手动轮，展示口径并入 'manual'），
+ * 一次性单向操作取 hints.op。status 判定顺序：用户取消 → 让出（零传输）→
+ * 失败 → 部分完成（有挂起冲突 / 待确认删除等用户待处理项）→ 成功。
+ * 逐文件操作明细读 summary.__syncOps（引擎轮内同一数组引用贯穿全部
+ * 退出路径 —— 成功轮 / 执行期错误轮 err.summary / 扫描期错误轮的 spread 副本
+ * 都携带同一引用；轮次体直接抛出、未经轮末收尾的失败轮没有该字段 → 空明细）。
+ * @param opts.handlers 引擎回调句柄（取 hints.source / hints.op / shouldAbort）
+ * @param opts.at 轮次开始时刻（毫秒）
+ * @param opts.summary 轮次摘要（成功轮为返回值；失败轮取 err.summary；缺失按零计数）
+ * @param opts.error 失败轮的错误（成功轮为 null）
+ * @param opts.cancelled 是否以取消语义收场（shouldAbort 仍为真 / ABORTED 错误码）
+ */
+function buildSyncLogEntry(opts: { handlers: any; at: number; summary: any; error: any; cancelled: boolean }): SyncLogEntry {
+  const handlers = opts.handlers || {}
+  const hints = handlers.hints || {}
+  const rawTrigger = typeof hints.source === 'string' && hints.source ? hints.source : 'manual'
+  const summary = opts.summary || {}
+  const errors: string[] = Array.isArray(summary.errors) ? summary.errors.map((s: any) => String(s)) : []
+  const entry: SyncLogEntry = {
+    at: opts.at,
+    endAt: Date.now(),
+    trigger: rawTrigger === 'manual-delegated' ? 'manual' : rawTrigger,
+    status: 'ok',
+    uploaded: Number(summary.uploaded) || 0,
+    downloaded: Number(summary.downloaded) || 0,
+    deleted: Number(summary.deleted) || 0,
+    conflicts: Number(summary.conflicts) || 0,
+    adopted: Number(summary.adopted) || 0,
+    deferredConflicts: Number(summary.deferredConflicts) || 0,
+    deleteHeld: Number(summary.deleteHeld) || 0,
+    bytesUp: Number(summary.bytesUp) || 0,
+    bytesDown: Number(summary.bytesDown) || 0,
+    totalFiles: Number(summary.totalFiles) || 0,
+    ops: Array.isArray(summary.__syncOps) ? summary.__syncOps : [],
+    errors: errors.slice(0, 200),
+  }
+  if (Number(summary.errorsDropped) > 0) entry.errorsDropped = Number(summary.errorsDropped)
+  if (hints.op === 'pull' || hints.op === 'push' || hints.op === 'pull-full' || hints.op === 'push-full') entry.op = hints.op
+  if (opts.cancelled) {
+    entry.status = 'cancelled'
+  } else if (summary.yielded) {
+    entry.status = 'yielded'
+  } else if (opts.error) {
+    entry.status = 'error'
+    const msg = opts.error && opts.error.message ? String(opts.error.message) : String(opts.error)
+    entry.error = msg.slice(0, 500)
+  } else if (entry.deferredConflicts > 0 || entry.deleteHeld > 0) {
+    entry.status = 'partial'
+  }
+  return entry
 }
 
 /**
@@ -3847,6 +4035,11 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   cfg = { ...cfg, __wdsyncBreaker: roundBreaker, __wdsyncAbort: shouldAbort }
   const tmpDir = dir.localPath
   const mode = dir.mode || 'two-way'
+  // 一次单向操作（「云端补齐本地 / 云端覆盖本地 / 本地补齐云端 / 本地覆盖云端」）：
+  // 经 handlers.hints.op 注入，仅对本轮规划生效（decideAction 的 oneshot 分支
+  // 凌驾于 dir.mode 之上）；非法值按常规轮处理
+  const rawOp = handlers && handlers.hints ? handlers.hints.op : undefined
+  const opHint = rawOp === 'pull' || rawOp === 'push' || rawOp === 'pull-full' || rawOp === 'push-full' ? rawOp : null
   const verifyMaxBytes = Number(prefs.verifyMaxBytes) > 0 ? Number(prefs.verifyMaxBytes) : DEFAULT_VERIFY_MAX_BYTES
   // 采纳内容确认的单轮总字节预算，默认 verifyMaxBytes × 4（见
   // ADOPT_VERIFY_BUDGET_FACTOR 的依据注释）；prefs.adoptVerifyBudgetBytes > 0 时覆盖
@@ -3883,6 +4076,19 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     /** 空目录清理：本地 / 远端移除的空目录数（仅清理因本轮同步删除而变空的目录） */
     dirsPrunedLocal: 0,
     dirsPrunedRemote: 0,
+  }
+  /**
+   * 逐文件操作明细的采集器（同步记录详尽视图的数据源，syncDirectory 轮末经
+   * summary.__syncOps 读取 —— 同一数组引用贯穿全部退出路径）。只记录
+   * 「已落地成功」的操作：上传在批量校验提交点、下载 / 删除在各自完成点、
+   * 冲突在用户选择落地时；失败不在此列 —— 经轮末 errors 清单回看，且避免
+   * 瞬时重试（当轮先败后成）造成同一文件的双记噪声。全量记录不截断：
+   * 大轮次的展示完整性由渲染层虚拟滚动承担，计数摘要始终是全量真值。
+   */
+  const syncOps: SyncLogOp[] = []
+  summary.__syncOps = syncOps
+  const recordSyncOp = (op: SyncLogOp) => {
+    syncOps.push(op)
   }
   const pushWarning = (w: any) => {
     if (summary.warnings.length < 200) summary.warnings.push(w)
@@ -4368,15 +4574,24 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //     并行获取（见步骤 2 —— 远端扫描形态依赖它，提前到此），此处只消费结论。
     //     探测请求计入轮次开销但不计入传输进度（bytes 字段只反映用户文件）。
     //     探测绝不抛出（失败降级 B 档）。
+    // 指纹噪声存储（origin+username 粒度、跨目录共享），异常时降级为空实现；
+    // B 档并发安全提示的「已提醒」标记同住这里（随 noise.json 跨轮持久）。
+    const serverNoise = await openServerNoiseSafe(cfg)
     summary.tier = caps.tier
+    let tierBNoticePending = false
     if (caps.tier === 'B') {
-      // 每轮至多一条，不随文件数刷屏
-      pushWarning('这个服务器无法保证多台设备同时修改时的安全。覆盖或删除云端文件前会先确认，但仍有极小概率覆盖其他设备刚做的修改')
+      // B 档并发安全提示每个服务器只携带一轮：渲染层对每轮 summary.warnings 弹
+      // toast，逐轮携带会每次自动同步都弹一次。是否已提醒记入 noise.concurrencyWarned
+      //（noise.json 持久化）；本轮名额只在干净收场时消耗（见轮末收口 —— 出错 / 取消 /
+      // 熔断轮渲染层不弹警告 toast，弹不到就不算「弹过」）。探测降级轮（degraded，
+      // 服务器真实档位未知）不携带也不消耗。
+      if (!caps.degraded && !serverNoise.noise.concurrencyWarned) {
+        tierBNoticePending = true
+        pushWarning('这个服务器无法保证多台设备同时修改时的安全。覆盖或删除云端文件前会先确认，但仍有极小概率覆盖其他设备刚做的修改')
+      }
     } else if (caps.tier === 'C') {
       pushWarning(`服务器不允许上传，本次只会下载文件${caps.writeReason ? `（${caps.writeReason}）` : ''}`)
     }
-    // 指纹噪声存储（origin+username 粒度、跨目录共享），异常时降级为空实现
-    const serverNoise = await openServerNoiseSafe(cfg)
     let noiseDirty = false
     let roSkipped = 0 // C 档跳过的上传 / 删除 / 冲突动作数（轮末汇总一条 warning）
 
@@ -4619,7 +4834,17 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             intentOpen = true
           },
         })
-        pendingUploads.push({ rel: it.rel, local: up.local, hash: up.hash, intentId: id, origName: origName || undefined, conflict: fromConflict === true })
+        // added：扫描期远端没有该文件（含根重建保护 / 「不删除」恢复的复活上传）=
+        // 云端新增；随批量校验提交点写进同步记录的操作明细
+        pendingUploads.push({
+          rel: it.rel,
+          local: up.local,
+          hash: up.hash,
+          intentId: id,
+          origName: origName || undefined,
+          conflict: fromConflict === true,
+          added: !(it.r && !it.r.isDir),
+        })
         return true
       } catch (e: any) {
         // 崩溃注入 / 服务器可能已收字节（NETWORK / ABORTED / 上传读流 LOCAL_IO）：不写 abort，
@@ -5085,8 +5310,10 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       // 对端再改则按 412 / REMOTE_CHANGED 落回冲突。download 模式不强制（该模式下上传意图
       // 只可能来自历史冲突解决，交由正常冲突流程裁决）。
       // 大小写冲突文件不做强制重传（caseSkip 优先 —— 覆盖谁都是静默数据丢失）。
-      const forcedUpload = forceUploads.has(it.rel) && !!l && mode !== 'download' && !caseSkip.has(it.rel)
-      const act = forcedUpload ? 'upload' : resolvedKeep ? 'keep' : decideAction(it.rel, l, r, m, mode, flags).act
+      // 一次性拉取（增量/全量）不强制（该方向不做任何上传）。
+      const forcedUpload =
+        forceUploads.has(it.rel) && !!l && opHint !== 'pull' && opHint !== 'pull-full' && mode !== 'download' && !caseSkip.has(it.rel)
+      const act = forcedUpload ? 'upload' : resolvedKeep ? 'keep' : decideAction(it.rel, l, r, m, mode, { ...flags, oneshot: opHint }).act
 
       // 大小写冲突（4.5）：涉及的文件跳过一切传输 / 冲突 / 收敛动作；删除传播放行
       //（用户删除其一正是消除冲突的手段）；错误已在 4.5 逐组上报，此处静默跳过。
@@ -5095,9 +5322,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       // 删除挂起标记失效清理：该 rel 不再规划为删除（状态已变化：文件重新出现 /
       // 被上传收敛 / 两侧皆无），确认与保留都失去对象 → 清除标记，面板不再滞留。
       // 覆盖包括 clean / skip / keep 在内的全部早退分支，故放在一切闸门之前。
+      // 一次性单向轮（增量/全量）除外：op 轮的删除差异是否真的收敛要等常规轮
+      // 确认（补齐档恢复 / 冻结，覆盖档的删除还要过删除安全闸），挂起原样保留
+      // —— 清掉会让等确认的删除悄悄失效；恢复 / 删除落地路径自会消费挂起。
       {
         const dm = store.getPending(it.rel)
-        if (dm && dm.kind === 'delete' && act !== 'delete-local' && act !== 'delete-remote') store.clearPending(it.rel)
+        if (dm && dm.kind === 'delete' && !opHint && act !== 'delete-local' && act !== 'delete-remote') store.clearPending(it.rel)
       }
 
       // 无基线保护兜底：基线不可信的轮次绝不执行删除
@@ -5159,6 +5389,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               await crashHook({ rel: it.rel, act: 'download' })
               await commitSet(entryFrom({ size: dl.size, mtimeMs: dl.mtimeMs }, it.r, dl.hash, { origName: it.r.origName }))
               summary.downloaded++
+              // 同步记录：本地侧落地成功（扫描期本地没有该文件 = 本地新增）
+              recordSyncOp({ op: 'download', rel: it.rel, bytes: it.r.size, added: !it.l })
               summary.bytesDown += it.r.size
               bytesDoneAcc += it.r.size
             }),
@@ -5234,6 +5466,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             }, true)
             summary.downloaded++
           }
+          // 同步记录：冲突已按选择落地（本地 / 云端 / 副本下载与覆盖上传的
+          // 落地动作不再单记 —— 冲突条目本身即两侧改动的完整描述）
+          recordSyncOp({ op: 'conflict', rel: it.rel, choice })
           summary.conflicts++
           return uploadPending ? UPLOADED_PENDING : undefined
         },
@@ -5298,6 +5533,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               const pd = store.getPending(it.rel)
               if (pd && pd.kind === 'delete') store.clearPending(it.rel)
               summary.deleted++
+              // 同步记录：电脑侧删除落地成功
+              recordSyncOp({ op: 'delete-local', rel: it.rel })
               localDeletedRels.add(it.rel) // 空目录清理候选（本地侧祖先目录）
             }),
           'delete-local'
@@ -5333,6 +5570,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               const pd = store.getPending(it.rel)
               if (pd && pd.kind === 'delete') store.clearPending(it.rel)
               summary.deleted++
+              // 同步记录：云端侧删除落地成功
+              recordSyncOp({ op: 'delete-remote', rel: it.rel })
               remoteDeletedRels.add(it.rel) // 空目录清理候选（远端侧祖先目录）
             }),
           'delete-remote'
@@ -5772,6 +6011,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           //（决策已完成；普通上传不带 conflict 标记、不受影响 —— 挂起只随冲突路径清除）
           if (p.conflict) store.clearPending(p.rel)
           summary.uploaded++
+          // 同步记录：云端侧落地成功（含冲突 / 半截重传来源的上传 —— 冲突条目
+          // 另记一条「选了什么」，两者分别描述云端改动与用户决策，互不替代）
+          recordSyncOp({ op: 'upload', rel: p.rel, bytes: p.local.size, added: !!p.added })
           summary.bytesUp += p.local.size
         }
       }
@@ -5933,6 +6175,15 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       crashErr.summary = summary
       crashErr.errors = summary.errors
       throw crashErr
+    }
+
+    // B 档并发安全提示的「已提醒」落盘（名额消耗，见步骤 3.5）：只在本轮干净收场
+    //（无文件级错误且未取消 —— 恰为步骤 9 不抛错的补集，渲染层只对这种轮次弹警告
+    // toast）时置位，随下方 persistPlannedLocalState 的 noiseDirty 通道一并保存；
+    // 弹不到用户的轮次不消耗名额，下一轮继续携带，直到用户真正看到过一次。
+    if (tierBNoticePending && !aborted && summary.errors.length === 0) {
+      serverNoise.noise.concurrencyWarned = true
+      noiseDirty = true
     }
 
     // 8. 轮末收尾：fsync → 压缩 → 保存元数据 → 清空已了结的 WAL（与让出路径
@@ -6241,6 +6492,17 @@ const services = {
       return st.listDecisionLog()
     },
     /**
+     * 列出某目录的同步记录（UI「同步记录」页数据源）。
+     * @param d 目录配置（格式同 syncDirectory 的 dir 参数）
+     * @returns [{ at, endAt, trigger, status, uploaded, ..., ops[], errors[] }]
+     *          按时间倒序（最新在前）；每轮一条，含触发方式 / 起止时间 / 计数摘要 /
+     *          逐文件操作明细 / 错误清单 —— 简略行与详尽视图共用同一份数据
+     */
+    async listSyncLog(d: any) {
+      const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
+      return st.listSyncLog()
+    },
+    /**
      * 读取某目录的批量删除快照（UI 待处理面板「删除确认目录树」的数据源）。
      * 返回 DeleteBatchView：快照本体 + 当前生效的范围决策（scopes）+ 引擎算好的
      * 未决策文件数（undecided，按树精确去重扣除 scope 覆盖部分）。
@@ -6315,6 +6577,8 @@ const services = {
     _internals: {
       decideAction,
       davRequest,
+      /** 本模块实际使用的本地 fs（宿主内应为未打补丁的 original-fs；Node 测试环境回落 node:fs） */
+      localFs: fs,
       scanDirSafe,
       listRemoteSafe,
       /** 批量删除快照聚合（纯函数直检：目录树构建 / 折叠 / 截断） */
@@ -6446,6 +6710,29 @@ const services = {
   secure: {
     sealSecret: (plain: any) => storage.sealSecret(plain),
     openSecret: (sealed: any) => storage.openSecret(sealed),
+  },
+  /**
+   * 实验功能「ZTools 插件同步」的自动发现结果（渲染层虚拟行的数据源；渲染层
+   * 无 Node 能力，不能自行发现 ~/.ztools/plugins）。发现逻辑与调度器 loadConfig
+   * 的目录合成共用 ztools-plugins.mts 同一实现 —— 两侧行为天然一致。
+   * @param remoteBase 用户所选的云端父目录（prefs.ztoolsPluginSyncRemoteDir；
+   *        缺省 = 云端根），决定远端根的父目录段
+   */
+  ztoolsPlugins: {
+    describe: (remoteBase?: string): ZtoolsPluginsSyncDesc => describeZtoolsPluginsSync(remoteBase),
+    /**
+     * 插件注册表对账的最近状态（实验功能「无感同步」第二段的观测口）：渲染层
+     * 虚拟行据此提示降级形态（未授权 / 旧宿主）。null = 本会话尚未对账过。
+     * 状态在 preload 侧模块内维护，进程重启归零、下一轮 round-end 重建。
+     */
+    registryState: (): (RegistryReconcileResult & { at: number }) | null => getRegistryReconcileState(),
+    /**
+     * 手动触发一次注册表对账（渲染层 / 测试入口；调度器轮末对账走同一实现，
+     * 模块内串行化）：把 manifest 合并进宿主注册表 / 重写导出。未授权时返回
+     * denied 结果，不做任何写入。
+     * @returns 对账结果（status / adopted / removed / wroteManifest / error）
+     */
+    reconcileRegistry: (): Promise<RegistryReconcileResult> => reconcilePluginRegistry(),
   },
   /**
    * 插件退出时清理监听与自建网络资源（keep-alive 连接池 / 限速器）。

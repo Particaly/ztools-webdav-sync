@@ -33,6 +33,8 @@ export const ICONS: Record<string, string> = {
   plus: `<path d="M12 5.5v13M5.5 12h13"/>`,
   // 文件夹
   folder: `<path d="M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2h8A1.5 1.5 0 0 1 20.5 9v8A1.5 1.5 0 0 1 19 18.5H5A1.5 1.5 0 0 1 3.5 17V7Z"/>`,
+  // 立方体（实验：ZTools 插件同步行）
+  box: `<path d="M12 3.2 20 7.4v9.2L12 20.8 4 16.6V7.4L12 3.2Z"/><path d="M4 7.4l8 4.2 8-4.2"/><path d="M12 11.6v9.2"/>`,
   // 对勾 / 带底圆的对勾
   check: `<path d="m5 12.5 4.5 4.5L19 7.5"/>`,
   'check-circle': `<circle cx="12" cy="12" r="10" fill="__BG__" stroke="none"/><path d="m7.5 12.5 3 3 6-6.5" stroke-width="2.2"/>`,

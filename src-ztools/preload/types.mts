@@ -171,7 +171,6 @@ export interface SyncSummary {
 export interface Prefs {
   autoSync: boolean
   intervalMin: number
-  syncOnStartup: boolean
   conflictStrategy: 'ask' | 'local' | 'remote' | 'both'
   ignoreHidden: boolean
   concurrency: number
@@ -214,6 +213,102 @@ export interface Prefs {
    * ignoreHidden 独立。默认空数组。
    */
   excludePatterns?: string[]
+  /**
+   * 实验功能（默认关）：ZTools 插件目录同步。开启后同步列表出现一条固定 id
+   *（'ztools-plugins'）的虚拟记录：本地目录自动发现（~/.ztools/plugins，用户
+   * 不可修改）、远端按平台隔离（<父目录>/ztools-plugins/<platformKey>，防止
+   * 不同平台的设备互相同步不兼容的插件）。该记录不可修改文件夹设置，也不可
+   * 移除 —— 只能关本开关；发现逻辑见 ztools-plugins.mts（单一事实源）。
+   */
+  ztoolsPluginSync?: boolean
+  /** 插件同步虚拟记录的行级暂停（true = 该记录停用，自动与手动同步都跳过；缺省 false） */
+  ztoolsPluginSyncPaused?: boolean
+  /**
+   * 【实验：ZTools 插件同步】云端存储位置的父目录（用户可选；'' / 缺省 = 云端根）。
+   * 实际同步根 = <该目录>/ztools-plugins/<platformKey> —— ztools-plugins 与平台段
+   * 固定追加、不随选择改变，多台设备各选同一个父目录即可互通（组装与规范化见
+   * ztools-plugins.mts 的 ztoolsPluginsRemotePath）。更换父目录后远端基线随
+   * remotePath 键更换：首轮把本机插件重新上传到新位置，旧位置内容不迁移不删除。
+   */
+  ztoolsPluginSyncRemoteDir?: string
+
+  // ---------- 持久警告的「不再显示」标记（渲染层 UI 关注，引擎不消费） ----------
+  //
+  // 长时间展示的黄色警告由用户关闭后不再出现；多数记录「关闭时的情境指纹」，
+  // 情境变化（换服务器 / 档位或状态改变 / 有新挂起）时自动重新提示，避免错过新情况。
+
+  /**
+   * 明文 http 连接警告「不再显示」：记录关闭时的服务器地址。主界面服务器卡片与
+   * 设置页共用同一条警告（共用本标记）；换成另一个 http 地址后重新提示。
+   */
+  insecureHttpDismissedFor?: string
+  /**
+   * 设置页「服务器检测结果」结论提示行（B / C 档说明）不再显示：记录关闭时的档位
+   *（'B' / 'C'）。档位变化后（服务器变更或重新检测出不同结论）重新提示。
+   */
+  tierHintDismissed?: string
+  /** 插件同步行「本机插件目录尚未发现」提示条不再显示（永久；目录出现后提示条本就会消失） */
+  pluginUnavailableDismissed?: boolean
+  /**
+   * 插件同步行「注册表对账降级」提示条不再显示：记录关闭时的对账状态
+   *（'pending' / 'denied' / 'unavailable'）。状态变化（如批准授权、宿主升级）后重新提示。
+   */
+  registrySyncDismissed?: string
+  /**
+   * 同步记录页顶部「待处理横幅」不再显示：记录关闭时的全局待处理信号时间戳
+   *（各目录未决策挂起的最新时间，见 store.dirPendingSignal）。有更新的挂起时重新提示。
+   */
+  pendingBarMutedAt?: number
+}
+
+/**
+ * 「ZTools 插件同步」（实验）的自动发现结果（services.ztoolsPlugins.describe 的
+ * 返回形状；发现逻辑见 ztools-plugins.mts）。渲染层虚拟行与调度器合成配置共用。
+ */
+export interface ZtoolsPluginsSyncDesc {
+  /** 虚拟记录固定 id（渲染层行与调度器 slot 以此对齐） */
+  id: 'ztools-plugins'
+  /** 本机插件实体目录绝对路径（ZTOOLS_DATA_ROOT 覆盖时跟随；自动发现、不可修改） */
+  pluginsDir: string
+  /** 平台目录名（mac / windows / linux；未知平台原样使用 platform 值，保持隔离语义） */
+  platformKey: string
+  /** 平台隔离的远端同步根（<可选父目录>/ztools-plugins/<platformKey>；父目录缺省为云端根） */
+  remotePath: string
+  /** 插件目录当前是否可用（存在且为目录） */
+  available: boolean
+  /** 不可用原因（面向用户的一句话；available=true 时缺省） */
+  reason?: string
+  /**
+   * 注册表对账（无感同步第二段）的降级形态（渲染层异步注入：describe 不填，
+   * 经 services.ztoolsPlugins.registryState() 刷新后合并进虚拟行；缺省 undefined
+   * = 尚未探测，UI 不提示）：'ok' = 已授权正常；'pending' = 已向宿主提交高级
+   * API 授权申请，等用户在设置页批准（批准后实时生效，无需重开插件）；
+   * 'denied' = 宿主无申请通道（旧版宿主），实体同步但插件不会自动登记；
+   * 'unavailable' = 宿主未注入 internal 命名空间（更旧），同样不登记
+   */
+  registrySync?: 'ok' | 'pending' | 'denied' | 'unavailable'
+}
+
+/**
+ * 插件注册表对账一次执行的结果（services.ztoolsPlugins.reconcileRegistry 的
+ * 返回与 registryState 的最近状态共用形状；对账逻辑见 ztools-registry.mts）。
+ */
+export interface RegistryReconcileResult {
+  /**
+   * ok = 有产出（可能含变更）；noop = 无任何变化；pending = 权限申请已提交
+   * 等待审批；denied / unavailable = 降级；error = 异常
+   */
+  status: 'ok' | 'noop' | 'pending' | 'denied' | 'unavailable' | 'error'
+  /** 本轮从 manifest / 孤儿实体新登记的插件名列表 */
+  adopted: string[]
+  /** 本轮经两轮幽灵核验后移除注册记录的插件名列表 */
+  removed: string[]
+  /** 本轮是否改写了 manifest 文件（改写会触发 watcher → 下一轮上传） */
+  wroteManifest: boolean
+  /** 本轮提交 / 确认过的高级 API 申请通道名（仅 status='pending' 时存在） */
+  requested?: string[]
+  /** 降级 / 异常原因（denied 携带宿主的鉴权拒绝文案；UI 诊断用） */
+  error?: string
 }
 
 /** 冲突信息（渲染层弹窗展示用） */
@@ -353,8 +448,14 @@ export interface SchedulerApi {
   /** 订阅事件；返回退订函数 */
   subscribe(fn: (ev: SchedulerEvent) => void): () => void
   getSnapshot(): SchedulerSnapshot
-  /** 手动同步（直插队首；省略 dirId = 全部启用目录）。未就绪时抛出明确错误 */
-  syncNow(dirId?: string): Promise<SyncNowResult | { ok: boolean; perDir: Array<{ dirId: string; ok: boolean; error?: string }> }>
+  /** 手动同步（直插队首；省略 dirId = 全部启用目录）。未就绪时抛出明确错误。
+   *  opts.op 携带一次单向操作（'pull' = 「云端补齐本地」/ 'pull-full' = 「云端
+   *  覆盖本地」/ 'push' = 「本地补齐云端」/ 'push-full' = 「本地覆盖云端」，经
+   *  引擎 hints.op 注入本轮规划：补齐档恢复本端缺失、保留本端多出与改动，双侧
+   *  都改走冲突流程；覆盖档以选定侧为准镜像对侧（缺失恢复 / 不一致覆盖 / 多余
+   *  删除）。目录忙时明确拒绝 —— 忙时重排轮无法携带 op，放行会退化成常规轮，
+   *  违背按钮语义） */
+  syncNow(dirId?: string, opts?: { op?: 'pull' | 'push' | 'pull-full' | 'push-full' }): Promise<SyncNowResult | { ok: boolean; perDir: Array<{ dirId: string; ok: boolean; error?: string }> }>
   /** 请求取消（接引擎 shouldAbort 通道；在飞轮在文件边界以取消语义收场） */
   cancel(dirId?: string): void
   /** 挂起自动调度（幂等；手动仍可用）。reason：'pref' = 用户偏好隐藏时挂起，'api' = 程序化挂起 */
@@ -545,6 +646,84 @@ export interface DecisionLogEntry {
   affected?: number
 }
 
+// ---- 同步记录（sync-log.json：每次同步轮一条，简略 / 详尽两种视图共用数据源）----
+
+/**
+ * 单次同步中单个文件操作的记录（同步记录详尽视图的数据源）。
+ * 两侧动作口径：upload / delete-remote 是对云端（线上）的操作，
+ * download / delete-local 是对电脑（线下）的操作；conflict 为冲突处理
+ *（其落地动作 —— 覆盖上传 / 下载 / 副本下载 —— 不再单记，避免一条改动两条记录）。
+ */
+export interface SyncLogOp {
+  /** 操作类型（两侧口径见接口注释） */
+  op: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict'
+  /** 文件相对路径（nfc 归一） */
+  rel: string
+  /** 是否成功落地；缺省 true（失败条目仅来自批量校验提交失败等「明确失败」路径） */
+  ok?: boolean
+  /** 失败原因（ok=false 时的一句话，已截断） */
+  err?: string
+  /** 传输字节（upload = 本地大小、download = 远端大小；删除 / 冲突不计） */
+  bytes?: number
+  /** 对侧此前没有该文件 = 新增（upload → 云端新增 / download → 本地新增）；更新缺省 */
+  added?: boolean
+  /** 冲突处理的选择（op='conflict' 时）：local 保留电脑版本 / remote 保留云端版本 / both 两个都留 */
+  choice?: 'local' | 'remote' | 'both'
+}
+
+/**
+ * 单次同步轮的完整记录（sync-log.json 的条目形态）。每次引擎轮（成功 / 失败 /
+ * 取消 / 让出）在轮末追加一条，供「同步记录」页回看当次同步的触发方式、时间与
+ * 两侧改动明细。纯展示性审计信息 —— 丢失 / 损坏的最坏后果是记录列表变短，
+ * 不影响同步正确性。
+ */
+export interface SyncLogEntry {
+  /** 轮次开始时刻（毫秒） */
+  at: number
+  /** 轮次结束时刻（毫秒） */
+  endAt: number
+  /**
+   * 触发方式：manual 手动同步 / manual-delegated 手动同步（多实例委托代跑，
+   * 展示口径与 manual 合并）/ interval 定时自动 / watch 文件变化自动 /
+   * startup 插件启动 / backoff 失败退避重试 / follow-up 开放意图后续轮 /
+   * yield-retry 让出后重试
+   */
+  trigger: string
+  /** 一次性单向操作（手动「云端补齐 / 覆盖本地」等四个按钮）；常规轮缺省 */
+  op?: 'pull' | 'push' | 'pull-full' | 'push-full'
+  /**
+   * 轮次结果：ok 成功 / partial 部分完成（有挂起冲突或待确认删除，等用户处理）/
+   * error 失败（error 携带首条人话原因）/ cancelled 用户取消 /
+   * yielded 他机正在同步，本轮让出（零传输）
+   */
+  status: 'ok' | 'partial' | 'error' | 'cancelled' | 'yielded'
+  /** 失败原因（status='error' 时的首条人话消息） */
+  error?: string
+  /** 计数摘要（SyncSummary 的展示子集；与简略行 / 详尽视图的头部共用） */
+  uploaded: number
+  downloaded: number
+  deleted: number
+  conflicts: number
+  /** 规划期直接收敛（无传输）的文件数 */
+  adopted: number
+  /** 本轮挂起等用户处理的冲突数（后台轮 defer） */
+  deferredConflicts: number
+  /** 登记待确认删除的文件数（确认前零删除） */
+  deleteHeld: number
+  /** 上传字节合计 */
+  bytesUp: number
+  /** 下载字节合计 */
+  bytesDown: number
+  /** 本轮扫描到的文件总数（两侧并集） */
+  totalFiles: number
+  /** 逐文件操作明细（全量记录，不截断 —— 大轮次的详尽视图经渲染层虚拟滚动呈现） */
+  ops: SyncLogOp[]
+  /** 本轮错误清单（与 summary.errors 同源，上限 200 条） */
+  errors: string[]
+  /** 被截断未记录的错误数 */
+  errorsDropped?: number
+}
+
 /** 基线 / WAL 日志行负载（{t:'set'|'del'|'clear'|'intent'|'done'|'abort', ...}） */
 export interface LogOp {
   t: string
@@ -552,6 +731,38 @@ export interface LogOp {
   e?: BaselineEntry
   id?: string
   [k: string]: unknown
+}
+
+/**
+ * 插件自身的 internal 高级 API 授权状态（ztools.getInternalApiPermissions 的
+ * 返回形状；宿主按通道细粒度授权，通道名形如 internal:db-get）。
+ */
+export interface InternalApiPermissionStatus {
+  /** 完全授权（内置名单 / 手动全量名单）——放行所有 internal 通道 */
+  fullAccess: boolean
+  /** 已授权给本插件的通道名列表 */
+  granted: string[]
+  /** 已提交、等待用户在设置页「高级权限」审批的通道名列表 */
+  pending: string[]
+}
+
+/**
+ * ZTools 内部 API（window.ztools.internal）——本插件用到的子集。宿主
+ * resources/preload.js 对所有插件注入该命名空间，但每次调用在主进程按
+ * canUseInternalApi 鉴权：完全授权（内置 / 手动全量名单）放行一切；按通道
+ * 授权模式下放行「已授权通道」。授权数据每次 IPC 现读 —— 设置页批准后立即
+ * 生效，无需重开插件。授权入口与申请流程见 design/host-api-requirements.md。
+ */
+export interface ZToolsInternalApi {
+  /** 读取 ZTOOLS/ 命名空间文档（如 'plugins' 注册表）；未授权时 reject */
+  dbGet(key: string): Promise<any>
+  /** 覆盖写 ZTOOLS/ 命名空间文档；未授权时 reject */
+  dbPut(key: string, value: unknown): Promise<unknown>
+  /**
+   * 通知宿主刷新已安装插件列表与指令索引：登记后调用使列表即时刷新；
+   * 调用失败静默吞掉 —— 通知是增强不是关键路径，绝不回滚已生效的登记
+   */
+  notifyPluginsChanged?(): Promise<unknown>
 }
 
 /** ZTools 宿主 API（本插件用到的子集；preload 侧访问 window.ztools 的类型） */
@@ -575,6 +786,25 @@ export interface ZToolsApi {
     setItem(key: string, value: unknown): void
   }
   getPath(name: string): string
+  /**
+   * 查询自身的高级 API 授权状态（fullAccess / granted / pending）。宿主支持
+   * 「按通道授权 + 主动申请」体系时存在；旧宿主缺失 —— 访问前特性检测，缺失时
+   * 退回「直接调用并按拒绝降级」的探测路径
+   */
+  getInternalApiPermissions?(): Promise<InternalApiPermissionStatus>
+  /**
+   * 主动申请高级 API 权限（附通道名列表与用途说明，宿主写入待审申请供设置页
+   * 审批）。返回 { success, status: 'granted' | 'pending', ... }；旧宿主缺失
+   * 该方法 —— 缺失或失败时退回降级路径
+   */
+  requestInternalApiPermissions?(apis: string[], reason?: string): Promise<any>
+  /**
+   * 内部 API（window.ztools.internal）：ZTOOLS 注册表读写与列表刷新通知的
+   * 通道。可选 —— 旧宿主未注入该命名空间时为 undefined，调用方据此降级为
+   * 纯实体同步（不做注册表写入）；授权与否由宿主按调用鉴权，探测见
+   * ztools-registry.mts。
+   */
+  internal?: ZToolsInternalApi
   /** 系统通知（挂起冲突提醒；preload 调度器使用，尽力而为） */
   showNotification?(body: string): void
 }

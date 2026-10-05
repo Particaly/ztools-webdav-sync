@@ -11,7 +11,8 @@ type Placement = 'bottom-start' | 'bottom-end' | 'top-start' | 'top-end'
  * 默认插槽会收到 close()，供选中 / 点击菜单项后收起。
  *
  * teleport 模式：面板渲染到 body 并用 fixed 定位（坐标取自触发器视口位置，
- * 下方空间不足自动翻转向上），用于父级有 overflow 裁剪的容器内（如目录列表行）。
+ * 下方空间不足自动翻转向上；上下都放不下时收拢到视口内并内部滚动兜底），
+ * 用于父级有 overflow 裁剪的容器内（如目录列表行），矮窗口下也不会被遮挡。
  * 传送期间滚动 / 缩放窗口直接收起，避免面板与触发器错位。
  */
 const props = withDefaults(
@@ -54,18 +55,25 @@ function onDocMousedown(e: MouseEvent) {
 }
 
 // teleport 模式：打开时先按触发器位置出第一帧（过渡首帧透明，无闪烁），
-// 面板渲染后按实际高度修正——下方放不下则翻转到触发器上方
+// 面板渲染后按实际高度修正——下方放不下则翻转到触发器上方；上下都放不下时
+// 收拢到视口内（极端矮窗口再限制面板高度、面板内部滚动），保证不被遮挡
 function positionFixed() {
   const trig = rootRef.value?.firstElementChild as HTMLElement | null
   const rect = trig?.getBoundingClientRect()
   if (!rect) return
   const ph = panelRef.value?.offsetHeight ?? 0
   const margin = 8
-  const fitsBelow = rect.bottom + props.offset + ph <= window.innerHeight - margin
+  const spaceBelow = window.innerHeight - margin - (rect.bottom + props.offset)
+  const spaceAbove = rect.top - props.offset - margin
   const style: Record<string, string> = { position: 'fixed' }
-  if (fitsBelow || rect.top - ph - props.offset < margin) {
-    style.top = `${rect.bottom + props.offset}px`
+  if (ph <= spaceBelow || ph > spaceAbove) {
+    // 下方放得下 → 原位向下；上下都放不下 → 贴视口底边收拢
+    style.top = `${ph > spaceBelow ? Math.max(margin, window.innerHeight - margin - ph) : rect.bottom + props.offset}px`
     style.transformOrigin = 'top ' + (props.placement.endsWith('end') ? 'right' : 'left')
+    if (ph > window.innerHeight - margin * 2) {
+      style.maxHeight = `${window.innerHeight - margin * 2}px`
+      style.overflowY = 'auto'
+    }
   } else {
     style.bottom = `${window.innerHeight - rect.top + props.offset}px`
     style.transformOrigin = 'bottom ' + (props.placement.endsWith('end') ? 'right' : 'left')

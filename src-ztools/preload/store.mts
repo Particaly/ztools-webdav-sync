@@ -15,6 +15,7 @@
 //   baselines/<hash16>/failures.json         持续失败退避表（整体原子写）
 //   baselines/<hash16>/pending-conflicts.json 冲突挂起表 + 批量删除快照 + 删除范围决策（整体原子写）
 //   baselines/<hash16>/decision-log.json      决策历史记录（整体原子写，环形上限）
+//   baselines/<hash16>/sync-log.json          同步记录（每轮一条，整体原子写，环形上限）
 //   baselines/<hash16>/scan-cache.json        etag 跳过扫描缓存（整体原子写）
 //   servers/<hash16>/capabilities.json       服务器能力探测缓存（origin+username 粒度）
 //   servers/<hash16>/noise.json              指纹噪声标记（origin+username 粒度、跨目录共享）
@@ -71,6 +72,7 @@ import type {
   LogOp,
   PendingListItem,
   PendingRecord,
+  SyncLogEntry,
   WalIntent,
 } from './types.mts'
 
@@ -100,6 +102,11 @@ const PENDINGS_V = 1
 const DECISION_LOG_V = 1
 /** 决策历史环形上限：超出后丢弃最旧条目（纯展示性信息，防膨胀优先于完整性） */
 const MAX_DECISION_LOG_ENTRIES = 200
+// ---- 同步记录 ----
+/** 同步记录（sync-log.json）结构版本号 */
+const SYNC_LOG_V = 1
+/** 同步记录环形上限（轮数）：超出后丢弃最旧轮次（纯展示性信息，防膨胀优先于完整性） */
+const MAX_SYNC_LOG_ROUNDS = 200
 // ---- etag 跳过扫描缓存----
 /** 扫描缓存（scan-cache.json）结构版本号 */
 const SCAN_CACHE_V = 1
@@ -511,6 +518,14 @@ class DirStateStore {
   decisionLog: DecisionLogEntry[]
   /** 决策历史自上次落盘后是否有变更（门面层追加后立即落盘，不积压到轮末） */
   decisionLogDirty: boolean
+  /**
+   * 同步记录（sync-log.json，最新在尾）：每次引擎轮（成功 / 失败 / 取消 / 让出）
+   * 一条，携带触发方式、起止时间、计数摘要与逐文件操作明细。纯展示性审计状态，
+   * 不参与 WAL / 基线 / 挂起语义 —— 丢失或损坏的最坏后果是「同步记录」列表变短。
+   */
+  syncLog: SyncLogEntry[]
+  /** 同步记录自上次落盘后是否有变更（引擎轮末追加后立即落盘，不积压） */
+  syncLogDirty: boolean
   /** scan-cache.json 损坏降级提示是否已记过（getScanCache 每轮重读磁盘，防长驻进程跨轮刷屏） */
   scanCacheWarned: boolean
   /** 元数据（meta.json）：lastDeepVerifyAt 等（噪声标记已迁至服务器粒度存储，见 ServerStateStore） */
@@ -539,6 +554,8 @@ class DirStateStore {
     this.deleteScopes = []
     this.decisionLog = []
     this.decisionLogDirty = false
+    this.syncLog = []
+    this.syncLogDirty = false
     this.scanCacheWarned = false
     this.meta = { v: SCHEMA_V, ...keyInfo }
     this.chain = Promise.resolve()
@@ -710,6 +727,69 @@ class DirStateStore {
         this.warnings.push('decision-log.json 损坏或版本不识别：决策历史按空处理')
       }
     }
+    // sync-log（同步记录）：损坏 / 版本不识别一律按空处理并记 warning —— 纯展示性
+    // 审计信息，绝不影响同步安全；与 failures / pendings 同样放在快照加载之前。
+    let slogRaw: any = null
+    try {
+      slogRaw = await fsp.readFile(this.syncLogPath(), 'utf-8')
+    } catch (e: any) {
+      if (e && e.code !== 'ENOENT') this.warnings.push('sync-log.json 不可读：同步记录按空处理')
+    }
+    if (slogRaw !== null) {
+      let parsed: any = null
+      try {
+        parsed = JSON.parse(slogRaw)
+      } catch (_) {
+        /* 损坏 → 按空处理 */
+      }
+      if (parsed && parsed.v === SYNC_LOG_V && Array.isArray(parsed.rounds)) {
+        for (const rd of parsed.rounds) {
+          // 逐条轻校验：起止时刻必须是数字、trigger / status 必须是非空串；畸形条目
+          // 直接丢弃不连累整表（与 decision-log 同款容错）。计数缺省 0（旧版本 /
+          // 手改文件的宽容读取），操作明细逐条校验并做防御性截断。
+          if (rd && typeof rd === 'object' && typeof rd.at === 'number' && typeof rd.endAt === 'number' && typeof rd.trigger === 'string' && rd.trigger && typeof rd.status === 'string' && rd.status) {
+            const ops: any[] = []
+            if (Array.isArray(rd.ops)) {
+              for (const op of rd.ops) {
+                if (op && typeof op === 'object' && typeof op.op === 'string' && typeof op.rel === 'string' && op.rel) {
+                  const rec: any = { op: op.op, rel: op.rel }
+                  if (op.ok === false) rec.ok = false
+                  if (typeof op.err === 'string' && op.err) rec.err = String(op.err).slice(0, 500)
+                  if (typeof op.bytes === 'number' && op.bytes > 0) rec.bytes = op.bytes
+                  if (op.added === true) rec.added = true
+                  if (op.choice === 'local' || op.choice === 'remote' || op.choice === 'both') rec.choice = op.choice
+                  ops.push(rec)
+                }
+              }
+            }
+            const rec: SyncLogEntry = {
+              at: rd.at,
+              endAt: rd.endAt,
+              trigger: rd.trigger,
+              status: rd.status as SyncLogEntry['status'],
+              uploaded: Number(rd.uploaded) || 0,
+              downloaded: Number(rd.downloaded) || 0,
+              deleted: Number(rd.deleted) || 0,
+              conflicts: Number(rd.conflicts) || 0,
+              adopted: Number(rd.adopted) || 0,
+              deferredConflicts: Number(rd.deferredConflicts) || 0,
+              deleteHeld: Number(rd.deleteHeld) || 0,
+              bytesUp: Number(rd.bytesUp) || 0,
+              bytesDown: Number(rd.bytesDown) || 0,
+              totalFiles: Number(rd.totalFiles) || 0,
+              ops,
+              errors: Array.isArray(rd.errors) ? rd.errors.filter((s: any) => typeof s === 'string' && s).slice(0, 200) : [],
+            }
+            if (rd.op === 'pull' || rd.op === 'push' || rd.op === 'pull-full' || rd.op === 'push-full') rec.op = rd.op
+            if (typeof rd.error === 'string' && rd.error) rec.error = String(rd.error).slice(0, 500)
+            if (typeof rd.errorsDropped === 'number' && rd.errorsDropped > 0) rec.errorsDropped = rd.errorsDropped
+            this.syncLog.push(rec)
+          }
+        }
+      } else {
+        this.warnings.push('sync-log.json 损坏或版本不识别：同步记录按空处理')
+      }
+    }
     // snapshot：不存在 = 合法首轮；存在但不可解析 = 损坏 → 无基线保护
     const snapPath = path.join(this.dirPath, 'snapshot.json')
     let raw: any = null
@@ -786,6 +866,9 @@ class DirStateStore {
   }
   decisionLogPath(): string {
     return path.join(this.dirPath, 'decision-log.json')
+  }
+  syncLogPath(): string {
+    return path.join(this.dirPath, 'sync-log.json')
   }
   scanCachePath(): string {
     return path.join(this.dirPath, 'scan-cache.json')
@@ -1273,6 +1356,43 @@ class DirStateStore {
     })
   }
 
+  // ---- 同步记录 ----
+  //
+  // 语义：sync-log.json（整体原子写）保存每次引擎轮一条的同步审计记录（引擎
+  // syncDirectory 收尾处 appendSyncLog，最新在尾，环形上限 MAX_SYNC_LOG_ROUNDS
+  // 轮 —— 超限丢弃最旧）。与 decision-log 同为「展示 / 审计」性质：不承载任何
+  // 数据事实，删除本文件不影响同步正确性，只影响「同步记录」页可回看的范围。
+
+  /**
+   * 追加一条同步记录（引擎 syncDirectory 轮末收尾时调用）。环形上限：超出后
+   * 丢弃最旧轮次。单轮操作明细全量记录（截断语义已移除，展示完整性由渲染层
+   * 虚拟滚动承担）。
+   * @param entry 同步记录条目（at / endAt / trigger / status / 计数 / ops / errors）
+   */
+  appendSyncLog(entry: SyncLogEntry): void {
+    this.syncLog.push(entry)
+    if (this.syncLog.length > MAX_SYNC_LOG_ROUNDS) {
+      this.syncLog.splice(0, this.syncLog.length - MAX_SYNC_LOG_ROUNDS)
+    }
+    this.syncLogDirty = true
+  }
+
+  /**
+   * 全部同步记录（按时间倒序，最新在前）——「同步记录」页与测试断言共用；
+   * 返回浅拷贝副本（条目对象视为只读不再深拷贝），调用方改写不会污染内部顺序。
+   */
+  listSyncLog(): SyncLogEntry[] {
+    return [...this.syncLog].reverse()
+  }
+
+  /** 落盘同步记录（引擎轮末追加后立即调用，不积压；经 chain 与其他表写入串行） */
+  async saveSyncLog(): Promise<void> {
+    return this._chain(async () => {
+      await atomicWriteJson(this.syncLogPath(), { v: SYNC_LOG_V, rounds: this.syncLog })
+      this.syncLogDirty = false
+    })
+  }
+
   // ---- etag 跳过扫描缓存----
   //
   // 语义：远端子集合 etag 跳过扫描的缓存（scan-cache.json，整体原子写）。形状：
@@ -1471,8 +1591,13 @@ class ServerStateStore {
   keyInfo: { origin: string; username: string }
   /** 最近一次成功探测的结果（null = 从未探测 / 缓存不可用） */
   capabilities: any
-  /** 指纹噪声状态：{ fingerprintUnstable, noiseFiles } */
-  noise: { fingerprintUnstable: boolean; noiseFiles: Record<string, number> }
+  /**
+   * 指纹噪声状态：{ fingerprintUnstable, noiseFiles, concurrencyWarned }。
+   * concurrencyWarned：B 档并发安全提示是否已在本服务器（origin+username）提醒过 ——
+   * 渲染层对每轮 summary.warnings 弹 toast，引擎据此不在后续轮次再携带该提示
+   *（置位与落盘时机见 services 同步轮的步骤 3.5 与轮末收口处）。
+   */
+  noise: { fingerprintUnstable: boolean; noiseFiles: Record<string, number>; concurrencyWarned: boolean }
   warnings: string[]
 
   /** @param dirPath 状态存储目录 @param keyInfo { origin, username }（写回文件备查） */
@@ -1480,7 +1605,7 @@ class ServerStateStore {
     this.dirPath = dirPath
     this.keyInfo = keyInfo
     this.capabilities = null
-    this.noise = { fingerprintUnstable: false, noiseFiles: {} }
+    this.noise = { fingerprintUnstable: false, noiseFiles: {}, concurrencyWarned: false }
     this.warnings = []
   }
 
@@ -1519,6 +1644,7 @@ class ServerStateStore {
         this.noise = {
           fingerprintUnstable: !!parsed.fingerprintUnstable,
           noiseFiles: parsed.noiseFiles && typeof parsed.noiseFiles === 'object' ? parsed.noiseFiles : {},
+          concurrencyWarned: !!parsed.concurrencyWarned,
         }
       } else if (parsed) {
         this.warnings.push('noise.json 版本不识别：噪声计数重新累计')

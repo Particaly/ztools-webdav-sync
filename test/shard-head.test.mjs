@@ -177,6 +177,168 @@ let SAFE_LOCAL = null
 
   })
 
+  // ============================================================
+  // OW：一次性单向补齐档（「云端补齐本地 / 本地补齐云端」）
+  // hints.op='pull' / 'push'：把对端的内容带过来 —— 本端缺失的恢复（pull 重新
+  // 下载 / push 重新上传），本端多出的保留（绝不删除），本端改过的不覆盖；
+  // 冲突（双侧都改）照常走既有冲突流程，解决是显式双向收敛、不受方向限制。
+  // 镜像语义（删除 / 覆盖差异）是覆盖档的行为，见 OW-F。
+  // ============================================================
+
+  await section('OW：一次性单向补齐档（云端补齐本地 / 本地补齐云端，恢复缺失不覆盖）', async () => {
+  await freshStore('oneway')
+  const OW_LOCAL = await tmpLocal('oneway')
+  const owDir = () => ({ id: 'ow', localPath: OW_LOCAL, remotePath: '/oneway', mode: 'two-way' })
+  const rd = (rel) => path.join(ROOT, 'oneway', rel)
+  const lf = (rel) => path.join(OW_LOCAL, rel)
+  const owHints = (op) => ({ hints: { source: 'manual', op } })
+  try {
+    // 基线：本地 3 文件全量上传（建立可信基线，删除传播的前提）
+    await fsp.writeFile(lf('a.txt'), 'ow-a')
+    await fsp.writeFile(lf('b.txt'), 'ow-b')
+    await fsp.writeFile(lf('c.txt'), 'ow-c')
+    const s0 = await services.sync.syncDirectory(cfg, owDir(), SP, {})
+    check('OW baseline uploads 3', s0.uploaded === 3, JSON.stringify(s0))
+
+    // pull：远端新增 + 远端修改 → 下载；本地新增 / 本地修改 → 不上传；远端删除 → 不删本地
+    await fsp.writeFile(rd('rn.txt'), 'ow-rn')
+    await fsp.writeFile(rd('b.txt'), 'ow-b-remote')
+    await fsp.writeFile(lf('ln.txt'), 'ow-ln')
+    await fsp.writeFile(lf('a.txt'), 'ow-a-local')
+    await fsp.unlink(rd('c.txt'))
+    const p1 = await services.sync.syncDirectory(cfg, owDir(), SP, owHints('pull'))
+    check('OW pull downloads 2 / uploads 0 / deletes 0', p1.downloaded === 2 && p1.uploaded === 0 && p1.deleted === 0, JSON.stringify(p1))
+    check('OW pull brings remote new file down', fs.existsSync(lf('rn.txt')) && fs.readFileSync(lf('rn.txt'), 'utf-8') === 'ow-rn')
+    check('OW pull applies remote edit', fs.readFileSync(lf('b.txt'), 'utf-8') === 'ow-b-remote')
+    check('OW pull ignores remote deletion (local kept)', fs.existsSync(lf('c.txt')))
+    check('OW pull never uploads (local new stays local)', !fs.existsSync(rd('ln.txt')))
+    check('OW pull never uploads (local edit unpushed)', fs.readFileSync(rd('a.txt'), 'utf-8') === 'ow-a')
+
+    // push：本地新增 / 本地修改 → 上传；远端独有 → 不下载；远端删除 → 恢复上传；本地删除 → 不删远端
+    const p2 = await services.sync.syncDirectory(cfg, owDir(), SP, owHints('push'))
+    // a.txt（本地改过）+ ln.txt（本地新增）上传；c.txt（远端已删）恢复上传 → uploaded === 3
+    check('OW push uploads 3 / downloads 0 / deletes 0', p2.uploaded === 3 && p2.downloaded === 0 && p2.deleted === 0, JSON.stringify(p2))
+    check('OW push applies local edit', fs.readFileSync(rd('a.txt'), 'utf-8') === 'ow-a-local')
+    check('OW push uploads local new file', fs.existsSync(rd('ln.txt')) && fs.readFileSync(rd('ln.txt'), 'utf-8') === 'ow-ln')
+    check('OW push restores remotely deleted file', fs.existsSync(rd('c.txt')) && fs.readFileSync(rd('c.txt'), 'utf-8') === 'ow-c')
+
+    // push：本地删除不传播（远端副本保留）
+    await fsp.unlink(lf('b.txt'))
+    const p3 = await services.sync.syncDirectory(cfg, owDir(), SP, owHints('push'))
+    check('OW push ignores local deletion (remote kept)', p3.deleted === 0 && p3.uploaded === 0 && p3.downloaded === 0 && fs.existsSync(rd('b.txt')), JSON.stringify(p3))
+
+    // pull：本地删除 → 从云端恢复下载（补齐档同样恢复缺失；不产生删除）
+    const p4 = await services.sync.syncDirectory(cfg, owDir(), SP, owHints('pull'))
+    check(
+      'OW pull restores locally deleted file (no deletion)',
+      p4.downloaded === 1 && p4.uploaded === 0 && p4.deleted === 0 && fs.readFileSync(lf('b.txt'), 'utf-8') === 'ow-b-remote',
+      JSON.stringify(p4)
+    )
+
+    // 冲突照常走既有流程：双侧都改 → 冲突解决不受方向限制（pull + 策略 local → PUT 本地版）
+    await fsp.writeFile(lf('a.txt'), 'ow-a-both-local')
+    await fsp.writeFile(rd('a.txt'), 'ow-a-both-remote')
+    const p5 = await services.sync.syncDirectory(cfg, owDir(), { ...SP, conflictStrategy: 'local' }, owHints('pull'))
+    check(
+      'OW pull conflict still converges both-changed',
+      p5.conflicts === 1 && p5.uploaded === 1 && fs.readFileSync(rd('a.txt'), 'utf-8') === 'ow-a-both-local',
+      JSON.stringify(p5)
+    )
+
+    // decideAction 直检：补齐档 —— 本端缺失恢复、本端多出保留、改动不覆盖、双侧
+    // 都改走冲突；覆盖档 —— 缺失恢复、本端多出删除、双侧都改以选定侧覆盖（镜像）
+    const DOW = services.sync._internals.decideAction
+    const OL = { abs: 'x', size: 1, mtimeMs: 1000 }
+    const OR = { isDir: false, size: 1, mtimeMs: 1000, etag: 'e' }
+    const OM = { lsize: 1, lmtimeMs: 1000, lhash: 'h', rsize: 1, rmtimeMs: 1000, retag: 'e' }
+    const OL2 = { ...OL, size: 2 }
+    const OR2 = { ...OR, size: 2 }
+    check(
+      'OW decideAction one-way truth table',
+      // 补齐档
+      DOW('f', null, OR, OM, 'two-way', { oneshot: 'pull' }).act === 'download' &&
+        DOW('f', OL, null, OM, 'two-way', { oneshot: 'push' }).act === 'upload' &&
+        DOW('f', OL, null, OM, 'two-way', { oneshot: 'pull' }).act === 'keep' &&
+        DOW('f', null, OR, OM, 'two-way', { oneshot: 'push' }).act === 'keep' &&
+        DOW('f', OL2, OR, OM, 'two-way', { oneshot: 'pull' }).act === 'keep' &&
+        DOW('f', OL, OR2, OM, 'two-way', { oneshot: 'push' }).act === 'keep' &&
+        DOW('f', OL2, OR2, OM, 'two-way', { oneshot: 'pull' }).act === 'conflict' &&
+        // 覆盖档
+        DOW('f', null, OR, OM, 'two-way', { oneshot: 'pull-full' }).act === 'download' &&
+        DOW('f', OL, null, OM, 'two-way', { oneshot: 'push-full' }).act === 'upload' &&
+        DOW('f', OL, null, OM, 'two-way', { oneshot: 'pull-full' }).act === 'delete-local' &&
+        DOW('f', null, OR, OM, 'two-way', { oneshot: 'push-full' }).act === 'delete-remote' &&
+        DOW('f', OL2, OR, OM, 'two-way', { oneshot: 'pull-full' }).act === 'download' &&
+        DOW('f', OL, OR2, OM, 'two-way', { oneshot: 'push-full' }).act === 'upload' &&
+        DOW('f', OL2, OR2, OM, 'two-way', { oneshot: 'pull-full' }).act === 'download' &&
+        DOW('f', OL2, OR2, OM, 'two-way', { oneshot: 'push-full' }).act === 'upload'
+    )
+  } finally {
+    await fsp.rm(OW_LOCAL, { recursive: true, force: true }).catch(() => {})
+    await services.dav.remove(cfg, '/oneway').catch(() => {})
+  }
+  })
+
+  // ============================================================
+  // OW-F：一次性单向覆盖档（「云端覆盖本地 / 本地覆盖云端」，镜像）
+  // hints.op='pull-full' / 'push-full'：以选定侧为准，把对侧完全恢复成它的样子
+  // —— 缺失恢复 / 不一致覆盖（不做询问）/ 多余删除；删除与常规轮同走删除安全闸。
+  // ============================================================
+
+  await section('OW-F：一次性单向覆盖档（云端覆盖本地 / 本地覆盖云端，以选定侧为准镜像）', async () => {
+  await freshStore('onewayfull')
+  const OF_LOCAL = await tmpLocal('onewayfull')
+  const ofDir = () => ({ id: 'of', localPath: OF_LOCAL, remotePath: '/onewayfull', mode: 'two-way' })
+  const rfd = (rel) => path.join(ROOT, 'onewayfull', rel)
+  const lff = (rel) => path.join(OF_LOCAL, rel)
+  const ofHints = (op) => ({ hints: { source: 'manual', op } })
+  try {
+    // 基线：本地 3 文件全量上传
+    await fsp.writeFile(lff('a.txt'), 'of-a')
+    await fsp.writeFile(lff('b.txt'), 'of-b')
+    await fsp.writeFile(lff('c.txt'), 'of-c')
+    const s0 = await services.sync.syncDirectory(cfg, ofDir(), SP, {})
+    check('OW-F baseline uploads 3', s0.uploaded === 3, JSON.stringify(s0))
+
+    // 云端覆盖本地（以云端为准镜像本地）：本地缺 b → 恢复下载；远端新增 rn → 下载；
+    // a 双侧都改 → 以云端版本覆盖（不询问、无冲突）；本地独有的 c（远端已删）→ 删除本地
+    await fsp.unlink(lff('b.txt'))
+    await fsp.writeFile(lff('a.txt'), 'of-a-local-edit')
+    await fsp.writeFile(rfd('a.txt'), 'of-a-remote-edit')
+    await fsp.writeFile(rfd('rn.txt'), 'of-rn')
+    await fsp.unlink(rfd('c.txt'))
+    const f1 = await services.sync.syncDirectory(cfg, ofDir(), SP, ofHints('pull-full'))
+    check('OW-F pull-full downloads 3 (restore + overwrite + new) / deletes 1 / uploads 0', f1.downloaded === 3 && f1.uploaded === 0 && f1.deleted === 1 && f1.conflicts === 0, JSON.stringify(f1))
+    check('OW-F pull-full restores locally deleted file', fs.readFileSync(lff('b.txt'), 'utf-8') === 'of-b')
+    check('OW-F pull-full overwrites local edit with cloud version without asking', fs.readFileSync(lff('a.txt'), 'utf-8') === 'of-a-remote-edit')
+    check('OW-F pull-full brings remote new file down', fs.readFileSync(lff('rn.txt'), 'utf-8') === 'of-rn')
+    check('OW-F pull-full deletes local-only file (cloud authoritative)', !fs.existsSync(lff('c.txt')))
+
+    // 本地覆盖云端（以本地为准镜像云端）：本地改 a → 以本地版本覆盖云端；本地新增 ln →
+    // 上传；本地缺 rn → 删除云端
+    await fsp.writeFile(lff('a.txt'), 'of-a-local-v2')
+    await fsp.writeFile(lff('ln.txt'), 'of-ln')
+    await fsp.unlink(lff('rn.txt'))
+    const f2 = await services.sync.syncDirectory(cfg, ofDir(), SP, ofHints('push-full'))
+    check('OW-F push-full uploads 2 / deletes 1 / downloads 0', f2.uploaded === 2 && f2.downloaded === 0 && f2.deleted === 1 && f2.conflicts === 0, JSON.stringify(f2))
+    check('OW-F push-full overwrites cloud with local version without asking', fs.readFileSync(rfd('a.txt'), 'utf-8') === 'of-a-local-v2')
+    check('OW-F push-full uploads local new file', fs.readFileSync(rfd('ln.txt'), 'utf-8') === 'of-ln')
+    check('OW-F push-full deletes remotely-only file (local authoritative)', !fs.existsSync(rfd('rn.txt')))
+
+    // 镜像完成后的收敛：连续全量轮全零（删除落地时基线同步清理，不再重传 / 重删）
+    const f3 = await services.sync.syncDirectory(cfg, ofDir(), SP, ofHints('pull-full'))
+    const f4 = await services.sync.syncDirectory(cfg, ofDir(), SP, ofHints('push-full'))
+    check(
+      'OW-F converged full rounds are no-ops',
+      f3.uploaded === 0 && f3.downloaded === 0 && f3.deleted === 0 && f4.uploaded === 0 && f4.downloaded === 0 && f4.deleted === 0,
+      `${JSON.stringify(f3)} ${JSON.stringify(f4)}`
+    )
+  } finally {
+    await fsp.rm(OF_LOCAL, { recursive: true, force: true }).catch(() => {})
+    await services.dav.remove(cfg, '/onewayfull').catch(() => {})
+  }
+  })
+
   // 12. 目录监听触发回调（独立成节：去抖静置 ~2.2s，可被 --fast 跳过）
 
   // [慢组登记原因] watcher 去抖需 2×~2s 真实静置，用例价值密度低

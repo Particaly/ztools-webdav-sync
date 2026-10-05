@@ -1,8 +1,9 @@
 import type { DecisionLogEntry, SyncDir } from '../env.d'
 
 /**
- * 决策记录的共享逻辑（决策历史拉取 + 文案渲染）：全局待处理中心「最近处理记录」
- * 与决策记录页共用，两处口径（排序 / 截断 / 动作文案）由本模块单点维护。
+ * 决策历史的共享逻辑（决策历史拉取 + 文案渲染）：全局待处理中心「最近处理记录」
+ * 与同步记录页（用户决策行）共用，两处口径（排序 / 截断 / 动作文案）由本模块
+ * 单点维护。同步轮记录的拉取与渲染见 synclog.ts（本模块只负责决策类记录）。
  */
 
 /** 决策历史行 = 决策条目 + 所属目录名（目录可能随后被移除，名字在拉取时固化） */
@@ -60,20 +61,4 @@ export function decisionActionText(h: DecisionHistoryRow): string {
   if (h.choice === 'remote') return '冲突：保留云端版本'
   if (h.choice === 'both') return '冲突：两个都保留'
   return h.choice
-}
-
-/**
- * 演示场景（?demo=decisions）的决策历史样例：真实日志在磁盘侧（preload），
- * 浏览器预览读不到 —— 预览页面布局用的静态样例，随演示目录的挂起数据同构图。
- */
-export function demoDecisionRows(): DecisionHistoryRow[] {
-  const at = (minAgo: number) => Date.now() - minAgo * 60000
-  return [
-    { at: at(4), rel: '.', kind: 'delete', choice: 'keep', affected: 1200, dirName: '项目文档' },
-    { at: at(26), rel: 'Photos/2024/RAW', kind: 'delete', choice: 'keep', affected: 640, dirName: '项目文档' },
-    { at: at(58), rel: 'Spec/接口约定.md', kind: 'conflict', choice: 'local', dirName: '设计资源库' },
-    { at: at(60 * 5), rel: 'Assets/旧版海报.psd', kind: 'delete', choice: 'delete', dirName: '设计资源库' },
-    { at: at(60 * 26), rel: '.', kind: 'root-lost', choice: 'upload', affected: 342, dirName: '归档记录' },
-    { at: at(60 * 27), rel: 'Notes/会议记录.md', kind: 'ignore', choice: 'ignore', dirName: '归档记录' },
-  ]
 }

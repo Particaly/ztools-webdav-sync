@@ -17,13 +17,49 @@
 // lifecycle 时序：宿主 onPluginEnter / onPluginOut 是单回调槽位，由 services.mts
 // 在挂载期（import 时一次性）经端口注册并持有 —— 端口化不改变该时序，注入只对
 // 「尚未发生的注册」生效（生产路径注册发生在模块加载期，先于任何注入机会）。
-import type { ZToolsApi } from './types.mts'
+import type { InternalApiPermissionStatus, ZToolsApi, ZToolsInternalApi } from './types.mts'
 
 /**
  * preload 运行环境中的 window（宿主注入 ztools API；Node 直跑测试时不存在，
  * 访问前必须判空 —— 与 store / scheduler 原直连形态一致，只是收敛到了本层）。
  */
 declare const window: { ztools?: Partial<ZToolsApi> } | undefined
+
+/**
+ * 内部 API 端口（ZTOOLS 注册表读写 + 列表变更通知的通道）：宿主未注入
+ * internal 命名空间（旧版宿主）时为 null —— 调用方据此整体降级为纯实体同步
+ * （不做注册表写入）。注意端口只承载「通道」：授权与否由宿主在每次调用时鉴权，
+ * 未授权的调用会 reject，授权探测在 ztools-registry.mts 统一处理。
+ */
+export interface InternalRegistryPort {
+  /** 读取 ZTOOLS/ 命名空间文档（未授权时 reject，调用方按降级处理） */
+  dbGet(key: string): Promise<any>
+  /** 覆盖写 ZTOOLS/ 命名空间文档（未授权时 reject） */
+  dbPut(key: string, value: unknown): Promise<unknown>
+  /**
+   * 通知宿主刷新插件列表与指令索引（宿主需求清单新增项）：宿主未提供该方法
+   * 或通知失败时 no-op —— 登记仍生效，列表延迟到宿主下一次触发或重启才刷新
+   */
+  notifyChanged(): Promise<void>
+}
+
+/**
+ * 高级 API 权限申请端口（window.ztools 顶层能力，不走 internal 鉴权）：
+ * 查询自身授权状态 + 提交授权申请。宿主支持「按通道授权 + 主动申请」体系时
+ * 存在；旧宿主缺失时为 null —— 对账层退回「直接调用并按拒绝降级」的探测路径。
+ */
+export interface InternalPermissionPort {
+  /**
+   * 查询自身授权状态：{ fullAccess, granted, pending }；查询失败 reject / 返回
+   * 非对象时由调用方按「旧宿主」降级
+   */
+  getStatus(): Promise<InternalApiPermissionStatus>
+  /**
+   * 提交授权申请（宿主对同插件多次申请做通道并集）。resolve 值形如
+   * { success, status: 'granted' | 'pending', ... }；失败时 { success: false, error }
+   */
+  request(apis: string[], reason?: string): Promise<any>
+}
 
 /**
  * 宿主端口：引擎对 ZTools 宿主全部运行期依赖的显式形态。
@@ -41,6 +77,18 @@ export interface HostPorts {
   config: NonNullable<ZToolsApi['dbStorage']> | null
   /** 宿主生命周期钩子（单回调槽位，由 preload 先注册持有）；null = 宿主未注入 */
   lifecycle: Pick<ZToolsApi, 'onPluginEnter' | 'onPluginOut'> | null
+  /**
+   * 内部 API 通道（window.ztools.internal 的端口化）：null = 旧宿主未注入或
+   * 方法缺失 —— 注册表对账整体跳过（ztools-registry.mts 据此降级）。与 config /
+   * lifecycle 相同的「现取不缓存」语义：宿主注入 / 移除即时生效。
+   */
+  internal: InternalRegistryPort | null
+  /**
+   * 高级 API 权限申请通道（查询自身状态 + 提交申请）：null = 旧宿主缺失这两个
+   * 顶层方法 —— 对账层退回「直接调用并按拒绝降级」的探测路径。与 config /
+   * lifecycle 相同的「现取不缓存」语义。
+   */
+  permissions: InternalPermissionPort | null
 }
 
 /**
@@ -95,6 +143,57 @@ function lifecycleNow(): HostPorts['lifecycle'] {
 }
 
 /**
+ * 现取内部 API 通道（window.ztools.internal 端口化）：宿主未注入 / internal
+ * 命名空间缺失 / dbGet 或 dbPut 不是函数一律返回 null（ztools-registry.mts
+ * 据此整体降级为纯实体同步）。notifyChanged 对宿主缺失的 notifyPluginsChanged
+ * 与通知失败静默吞掉 —— 通知是增强不是关键路径，绝不回滚已生效的登记。
+ */
+function internalNow(): InternalRegistryPort | null {
+  try {
+    const zt = ztOrNull()
+    const it: Partial<ZToolsInternalApi> | undefined = zt ? zt.internal : undefined
+    if (!it || typeof it.dbGet !== 'function' || typeof it.dbPut !== 'function') return null
+    return {
+      dbGet: (key: string) => it.dbGet!(key),
+      dbPut: (key: string, value: unknown) => it.dbPut!(key, value),
+      notifyChanged: async () => {
+        try {
+          if (typeof it.notifyPluginsChanged === 'function') await it.notifyPluginsChanged()
+        } catch (_) {
+          /* 通知失败不回滚登记 */
+        }
+      },
+    }
+  } catch (_) {
+    return null
+  }
+}
+
+/**
+ * 现取权限申请通道（window.ztools 顶层的 getInternalApiPermissions /
+ * requestInternalApiPermissions 端口化）：任一方法缺失或访问异常返回 null ——
+ * 对账层据此退回「直接调用 internal 并按拒绝降级」的旧宿主探测路径。
+ */
+function permissionsNow(): InternalPermissionPort | null {
+  try {
+    const zt = ztOrNull()
+    if (
+      !zt ||
+      typeof zt.getInternalApiPermissions !== 'function' ||
+      typeof zt.requestInternalApiPermissions !== 'function'
+    ) {
+      return null
+    }
+    return {
+      getStatus: () => zt.getInternalApiPermissions!(),
+      request: (apis: string[], reason?: string) => zt.requestInternalApiPermissions!(apis, reason),
+    }
+  } catch (_) {
+    return null
+  }
+}
+
+/**
  * 构造绑定 window.ztools 的默认端口。现取不缓存：函数 / 属性在构造或调用时
  * 现读宿主对象，绝不持有旧引用 —— 「宿主注入晚于 preload 加载」与「注入被移除」
  * 两种时序下行为都正确（getHostPorts 未覆盖时每次调用本函数，动态性由此保证）。
@@ -133,6 +232,8 @@ export function defaultHostPorts(): HostPorts {
     },
     config: configNow(),
     lifecycle: lifecycleNow(),
+    internal: internalNow(),
+    permissions: permissionsNow(),
   }
 }
 

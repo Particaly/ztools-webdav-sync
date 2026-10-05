@@ -8,13 +8,16 @@ import type {
   DirOverrides,
   DirStatus,
   Prefs,
+  RegistryReconcileResult,
   SchedulerEvent,
   SchedulerSlotView,
   SyncDir,
   SyncMode,
   SyncSummary,
+  ZtoolsPluginsSyncDesc,
 } from '../env.d'
 import { toast } from './toast'
+import { MIN_INTERVAL_MIN } from './options'
 
 const STORAGE_KEY = 'webdav-sync:data'
 const GUIDE_URL = 'https://help.jianguoyun.com/?p=2064'
@@ -24,12 +27,25 @@ function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
 
+/**
+ * 【实验：ZTools 插件同步】虚拟行的固定 id —— 镜像 preload 侧
+ * ztools-plugins.mts 的 ZTOOLS_PLUGINS_DIR_ID（渲染层无 Node 能力，不能运行时
+ * 导入该模块；两处字面量必须一起改）。调度器按同一 id 合成 slot，行内状态 /
+ * 冲突 / 待处理经既有事件通道（按 id 匹配）自动流转。
+ */
+const PLUGIN_SYNC_DIR_ID = 'ztools-plugins'
+
+/** 是否「ZTools 插件同步」虚拟行（自动发现目录、配置不可修改、不持久化） */
+export function isPluginSyncDir(d: SyncDir): boolean {
+  return d.id === PLUGIN_SYNC_DIR_ID
+}
+
 /** 默认偏好设置 */
 export function defaultPrefs(): Prefs {
   return {
     autoSync: true,
-    intervalMin: 15,
-    syncOnStartup: true,
+    // 检查频率默认 1 小时（选项里最常用的中低频档；用户显式选过的值不受影响）
+    intervalMin: 60,
     conflictStrategy: 'ask',
     ignoreHidden: true,
     concurrency: 4,
@@ -45,6 +61,19 @@ export function defaultPrefs(): Prefs {
     backgroundRunning: true,
     // 用户排除规则：默认空；内置 OS 垃圾规则（.DS_Store 等）不可关闭
     excludePatterns: [],
+    // 实验功能：ZTools 插件目录同步（默认关）；发现与平台隔离见 preload 侧
+    // ztools-plugins.mts —— 渲染层只持有开关与行级暂停两个 prefs 字段
+    ztoolsPluginSync: false,
+    ztoolsPluginSyncPaused: false,
+    // 云端存储位置的父目录（'' = 默认云端根；实际同步根 = <该目录>/ztools-plugins/<平台>）
+    ztoolsPluginSyncRemoteDir: '',
+    // 持久黄色警告的「不再显示」标记（字段语义见 types.mts Prefs 注释）：
+    // 情境指纹类关闭后条件变化会重新提示，时间戳类有新挂起会重新提示
+    insecureHttpDismissedFor: '',
+    tierHintDismissed: '',
+    pluginUnavailableDismissed: false,
+    registrySyncDismissed: '',
+    pendingBarMutedAt: 0,
   }
 }
 
@@ -178,8 +207,10 @@ function persist() {
         if (sec && typeof sv.password === 'string') sv.password = sec.sealSecret(sv.password)
         return sv
       })(),
-      // 进度等运行时字段不入库；入库字段显式限长（见 sanitizeDirForPersist）
-      dirs: state.dirs.map(sanitizeDirForPersist),
+      // 进度等运行时字段不入库；入库字段显式限长（见 sanitizeDirForPersist）。
+      // 【实验：ZTools 插件同步】虚拟行不持久化（dirs 里过滤）—— 调度器每次
+      // reload 都按 prefs 开关现场合成同 id 的目录，配置权威只有 prefs
+      dirs: state.dirs.filter((d) => !isPluginSyncDir(d)).map(sanitizeDirForPersist),
       prefs: state.prefs,
     })
   )
@@ -360,24 +391,48 @@ export function dirEnabled(d: SyncDir): boolean {
   return d.enabled !== false
 }
 
-/** 目录生效的自动同步间隔：目录级覆盖优先，否则跟随全局偏好 */
+/** 目录生效的自动同步开关：目录级覆盖优先，否则跟随全局偏好。关闭后该目录只手动同步 */
+export function dirAutoSyncOn(d: SyncDir): boolean {
+  return d.overrides?.autoSync ?? state.prefs.autoSync
+}
+
+/** 目录生效的同步间隔：目录级覆盖优先，否则跟随全局偏好 */
 export function dirIntervalMin(d: SyncDir): number {
   return d.overrides?.intervalMin ?? state.prefs.intervalMin
 }
 
-/** 目录生效的同步参数（冲突处理 / 忽略隐藏文件 / 消歧与深度校验 / 采纳预算 / 租约锁 / 排除规则），供引擎调用与界面展示 */
+/**
+ * 目录生效的同步参数（供引擎调用与界面展示）：目录级覆盖（overrides）优先，
+ * 未覆盖的项回落全局偏好。口径必须与 preload 调度器 prefsOf 保持一致 ——
+ * 两处分别服务「无调度器直调引擎」与「调度器自动轮」两条路径。
+ * 限速（ratePerSec）不在其中：它属于网络层参数，经 dirEngineCfg 注入 netOpts。
+ */
 export function dirSyncPrefs(d: SyncDir) {
+  const o = d.overrides
   return {
-    ignoreHidden: d.overrides?.ignoreHidden ?? state.prefs.ignoreHidden,
-    concurrency: state.prefs.concurrency,
-    conflictStrategy: d.overrides?.conflictStrategy ?? state.prefs.conflictStrategy,
+    ignoreHidden: o?.ignoreHidden ?? state.prefs.ignoreHidden,
+    concurrency: o?.concurrency ?? state.prefs.concurrency,
+    conflictStrategy: o?.conflictStrategy ?? state.prefs.conflictStrategy,
     verifyMaxBytes: state.prefs.verifyMaxBytes,
-    deepVerify: state.prefs.deepVerify,
+    deepVerify: o?.deepVerify ?? state.prefs.deepVerify,
     deepVerifyDays: state.prefs.deepVerifyDays,
     adoptVerifyBudgetBytes: state.prefs.adoptVerifyBudgetBytes,
-    leaseLock: state.prefs.leaseLock,
-    excludePatterns: state.prefs.excludePatterns,
+    leaseLock: o?.leaseLock ?? state.prefs.leaseLock,
+    excludePatterns: o?.excludePatterns ?? state.prefs.excludePatterns,
   }
+}
+
+/**
+ * 目录生效的引擎连接配置：全局 server 之上应用目录级网络层覆盖
+ *（当前仅 ratePerSec 限速；显式数值直接覆盖全局 netOpts 与档案默认的分层口径，
+ * 未设置时保持全局原样 —— 引擎 resolveNetOpts 按既有分层生效）。
+ */
+export function dirEngineCfg(d: SyncDir): DavConfig {
+  const cfg: DavConfig = { ...state.server }
+  if (d.overrides?.ratePerSec != null) {
+    cfg.netOpts = { ...cfg.netOpts, ratePerSec: d.overrides.ratePerSec }
+  }
+  return cfg
 }
 
 /** 用户请求取消同步的目录 id 集合：runSync 经 shouldAbort 注入引擎，轮末 finally 统一清除 */
@@ -408,8 +463,13 @@ function cancelSync(id: string) {
  * 真实同步的冲突由引擎 onConflict 回调经 conflictQueue 即时弹窗处理（见 resolveConflict），
  * 弹窗勾选「对本轮剩余冲突都这样处理」后，本轮后续冲突直接按该选择解决，不再弹窗。
  * opts.conflictStrategy 可覆盖目录冲突策略（手动冲突处理入口复用同一条状态机）。
+ * opts.op 携带一次单向操作（'pull' = 「云端补齐本地」/ 'pull-full' = 「云端覆盖
+ * 本地」/ 'push' = 「本地补齐云端」/ 'push-full' = 「本地覆盖云端」）：经引擎
+ * hints.op 注入本轮规划 —— 补齐档恢复本端缺失、保留本端多出与改动；覆盖档以
+ * 选定侧为准镜像对侧。无调度器形态（浏览器预览 / 降级直调引擎）时由本函数注入
+ * hints，与调度器路径同一语义。
  */
-async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflictStrategy'] }) {
+async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflictStrategy']; op?: 'pull' | 'push' | 'pull-full' | 'push-full' }) {
   dir.status = 'syncing'
   dir.errorMessage = null
   dir.progress = { filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 }
@@ -417,7 +477,7 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
     const prefs = dirSyncPrefs(dir)
     if (opts?.conflictStrategy) prefs.conflictStrategy = opts.conflictStrategy
     const summary = await window.services.sync.syncDirectory(
-      { ...state.server },
+      dirEngineCfg(dir),
       { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode },
       prefs,
       {
@@ -447,6 +507,7 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
             conflictResolvers.set(info, resolve)
           }),
         shouldAbort: () => cancelRequested.has(dir.id),
+        hints: { source: 'manual', ...(opts?.op ? { op: opts.op } : {}) },
       }
     )
     dir.lastResult = summary
@@ -494,8 +555,15 @@ async function runSync(dir: SyncDir, opts?: { conflictStrategy?: Prefs['conflict
   }
 }
 
-/** 同步单个目录：调度器在线时经其手动通道（直插队首）；进度 / 冲突 / 状态全部来自订阅事件 */
-async function syncDir(dir: SyncDir) {
+/**
+ * 同步单个目录：调度器在线时经其手动通道（直插队首）；进度 / 冲突 / 状态全部来自订阅事件。
+ * opts.op 携带一次单向操作（'pull' = 「云端补齐本地」/ 'pull-full' = 「云端覆盖
+ * 本地」/ 'push' = 「本地补齐云端」/ 'push-full' = 「本地覆盖云端」）：调度器路径
+ * 经 syncNow 透传给引擎（补齐档恢复本端缺失、保留本端多出与改动；覆盖档以选定
+ * 侧为准镜像对侧）；无调度器形态退回 runSync 直调引擎注入 hints。演示模式忽略
+ * op（同一模拟过程）。
+ */
+async function syncDir(dir: SyncDir, opts?: { op?: 'pull' | 'push' | 'pull-full' | 'push-full' }) {
   if (!configured.value || dir.status === 'syncing' || !dirEnabled(dir)) return
 
   // 浏览器演示模式（无 preload）：模拟一次同步过程，便于预览「立即同步」交互
@@ -529,7 +597,7 @@ async function syncDir(dir: SyncDir) {
     dir.errorMessage = null
     dir.progress = { filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 }
     try {
-      await sched.syncNow(dir.id)
+      await sched.syncNow(dir.id, opts?.op ? { op: opts.op } : undefined)
     } catch (e) {
       // syncNow 的明确拒绝（未就绪 / 未配置 / 目录不存在）：目录置错误并提示
       dir.status = 'error'
@@ -538,7 +606,7 @@ async function syncDir(dir: SyncDir) {
     }
     return
   }
-  await runSync(dir)
+  await runSync(dir, opts)
 }
 
 /** 顺序同步全部目录（带宽友好，与设计稿的「单目录进度」一致）；已禁用的目录跳过 */
@@ -564,6 +632,112 @@ async function syncAll() {
 }
 
 // ---------- 目录管理 ----------
+
+// ----------【实验：ZTools 插件同步】虚拟行 ----------
+//
+// 开关（prefs.ztoolsPluginSync）开启时，同步列表追加一条固定 id 的虚拟行：
+// 本地目录由 preload 自动发现（~/.ztools/plugins，用户不可修改）、远端目录 =
+// 用户可选的云端父目录（prefs.ztoolsPluginSyncRemoteDir，设置页「云端文件夹」）
+// 之后固定跟上 ztools-plugins/<platformKey> 两段。行与普通目录完全同构 —— 调度器
+// slot / 轮末事件 / 冲突与待处理面板经同一 id 通道流转；差异只有三点：
+//   1. 不持久化（persist 与 dirs watch 均过滤；调度器 reload 时按开关现场合成）；
+//   2. 配置不可修改（updateDir / setDirOverrides 对虚拟行 no-op，UI 也不给入口）；
+//   3. 启停走 prefs.ztoolsPluginSyncPaused（setDirEnabled 路由），删除即关开关。
+
+/**
+ * 维护「ZTools 插件同步」虚拟行：开关关闭时移除；开启时经 preload 的
+ * describe() 取自动发现结果注入（已存在则只刷新配置字段与 enabled，运行时
+ * 状态 —— status / lastResult / 挂起列表等 —— 原样保留）。云端父目录随 prefs
+ * 传入：更换位置后行的远端路径即时跟随，调度器经 reload 用同一参数合成 slot。
+ * 无 preload（浏览器预览）或 describe 不可用时保持现状：行不出现，开关仍可
+ * 保存（回到宿主环境后 init / 切换开关时补上）。
+ * 注入后异步刷新注册表对账状态（registrySync）：对账走 IPC（内部 API），describe
+ * 是同步发现拿不到 —— 未授权 / 旧宿主的降级提示由此补齐（refreshPluginRegistryState）。
+ */
+function refreshPluginSyncRow() {
+  const idx = state.dirs.findIndex((d) => isPluginSyncDir(d))
+  if (!state.prefs.ztoolsPluginSync) {
+    if (idx >= 0) state.dirs.splice(idx, 1)
+    return
+  }
+  let desc: ZtoolsPluginsSyncDesc | null = null
+  try {
+    desc = window.services?.ztoolsPlugins?.describe?.(state.prefs.ztoolsPluginSyncRemoteDir || undefined) ?? null
+  } catch {
+    desc = null
+  }
+  if (!desc) return
+  const enabled = state.prefs.ztoolsPluginSyncPaused !== true
+  if (idx >= 0) {
+    const row = state.dirs[idx]
+    row.name = 'ZTools 插件'
+    row.localPath = desc.pluginsDir
+    row.remotePath = desc.remotePath
+    row.mode = 'two-way'
+    row.enabled = enabled
+    // registrySync 是异步注入字段：重建 desc 时保留上次探测结果，避免提示条闪烁
+    row.pluginSyncInfo = { ...desc, registrySync: row.pluginSyncInfo?.registrySync }
+    return
+  }
+  state.dirs.push({
+    id: PLUGIN_SYNC_DIR_ID,
+    name: 'ZTools 插件',
+    localPath: desc.pluginsDir,
+    remotePath: desc.remotePath,
+    mode: 'two-way',
+    status: 'idle',
+    lastSyncAt: null,
+    lastResult: null,
+    conflictFile: null,
+    errorMessage: null,
+    progress: null,
+    enabled,
+    pluginSyncInfo: desc,
+  })
+  void refreshPluginRegistryState()
+}
+
+/**
+ * 异步刷新虚拟行的注册表对账状态（registrySync）：读 preload 侧最近一次对账
+ * 结果（调度器轮末 / init 时触发，本函数只读不触发对账），把降级形态合并进
+ * 行的 pluginSyncInfo 供 DirRow 提示条渲染。无 preload / 尚未对账过（null）时
+ * 保持现状 —— 提示条不出现（尚未对账意味着尚未同步，先让位给行级状态）。
+ */
+async function refreshPluginRegistryState() {
+  if (!state.prefs.ztoolsPluginSync) return
+  const row = state.dirs.find((d) => isPluginSyncDir(d))
+  if (!row) return
+  let st: (RegistryReconcileResult & { at: number }) | null = null
+  try {
+    st = window.services?.ztoolsPlugins?.registryState?.() ?? null
+  } catch {
+    st = null
+  }
+  if (!st) return
+  const registrySync =
+    st.status === 'ok' || st.status === 'noop'
+      ? 'ok'
+      : st.status === 'pending'
+        ? 'pending'
+        : st.status === 'denied'
+          ? 'denied'
+          : st.status === 'unavailable'
+            ? 'unavailable'
+            : undefined
+  if (registrySync && row.pluginSyncInfo && row.pluginSyncInfo.registrySync !== registrySync) {
+    row.pluginSyncInfo = { ...row.pluginSyncInfo, registrySync }
+  }
+}
+
+/**
+ * 关闭实验功能「ZTools 插件同步」（虚拟行的替代删除入口，DirRow 菜单「关闭
+ * 插件同步」）：关开关并清行级暂停标记 —— 虚拟行经 prefs watch 移除、调度器
+ * reload 后不再合成该 slot；电脑与云端文件都不会被删除。
+ */
+function disablePluginSync() {
+  state.prefs.ztoolsPluginSync = false
+  state.prefs.ztoolsPluginSyncPaused = false
+}
 
 /** 新增同步目录；overrides 可选（「覆盖全局设置」开启时传入，保证首次同步即用目录级参数） */
 function addDir(localPath: string, remotePath: string, mode: SyncMode, overrides: DirOverrides | null = null): SyncDir | null {
@@ -594,6 +768,11 @@ function addDir(localPath: string, remotePath: string, mode: SyncMode, overrides
 }
 
 function removeDir(id: string) {
+  // 虚拟行不走删除（电脑与云端文件不删）：等价操作是关闭实验开关
+  if (id === PLUGIN_SYNC_DIR_ID) {
+    disablePluginSync()
+    return
+  }
   const i = state.dirs.findIndex((d) => d.id === id)
   if (i >= 0) {
     state.dirs.splice(i, 1)
@@ -602,32 +781,38 @@ function removeDir(id: string) {
   }
 }
 
-/** 启用 / 停用某个同步目录（停用后自动与手动同步都会跳过） */
+/** 启用 / 停用某个同步目录（停用后自动与手动同步都会跳过）；虚拟行路由到行级暂停 prefs */
 function setDirEnabled(id: string, enabled: boolean) {
+  if (id === PLUGIN_SYNC_DIR_ID) {
+    // 虚拟行不持久化，启停的权威只有 prefs（调度器合成时映射回 enabled）
+    state.prefs.ztoolsPluginSyncPaused = !enabled
+    return
+  }
   const d = state.dirs.find((x) => x.id === id)
   if (d) d.enabled = enabled
 }
 
-/** 写入目录级设置覆盖（冲突处理 / 忽略隐藏文件 / 同步间隔） */
+/** 写入目录级设置覆盖（自动同步 / 检查频率 / 冲突处理 / 忽略隐藏 / 并发 / 限速 / 租约锁 / 深度校验 / 排除规则）；虚拟行无目录级设置（no-op） */
 function setDirOverrides(id: string, patch: DirOverrides) {
   const d = state.dirs.find((x) => x.id === id)
-  if (d) d.overrides = { ...(d.overrides ?? {}), ...patch }
+  if (d && !isPluginSyncDir(d)) d.overrides = { ...(d.overrides ?? {}), ...patch }
 }
 
-/** 清除目录级设置覆盖：全部恢复跟随全局偏好 */
+/** 清除目录级设置覆盖：全部恢复跟随全局偏好；虚拟行 no-op */
 function resetDirOverrides(id: string) {
   const d = state.dirs.find((x) => x.id === id)
-  if (d) d.overrides = null
+  if (d && !isPluginSyncDir(d)) d.overrides = null
 }
 
 /**
  * 修改目录配置（「修改同步目录」弹窗保存入口）：
  * 本地路径变更时目录名跟随更新；overrides 为整体替换（null 表示清除全部覆盖、跟随全局）。
  * 路径 / 方式变化会通过 dirs 的序列化 watch 触发 onDirsChanged，重挂文件监听并持久化。
+ * 插件同步虚拟行 no-op —— 本地目录自动发现、远端按平台隔离，均不可修改。
  */
 function updateDir(id: string, patch: { localPath?: string; remotePath?: string; mode?: SyncMode; overrides?: DirOverrides | null }) {
   const d = state.dirs.find((x) => x.id === id)
-  if (!d) return
+  if (!d || isPluginSyncDir(d)) return
   if (patch.localPath !== undefined) {
     d.localPath = patch.localPath
     d.name = baseName(patch.localPath)
@@ -801,6 +986,11 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
   const heldCount =
     (Number(summary?.deleteHeld) || 0) + (Number(summary?.deferredConflicts) || 0) + (Number(summary?.rootLostHeld) || 0)
   if (heldCount > 0) void refreshPendingConflicts(dir)
+  // 插件同步虚拟行：注册表对账在调度器轮末异步执行（fire-and-forget），降级
+  // 状态略晚于本事件落地 —— 延迟一拍再取，让「未授权 / 旧宿主」提示条及时出现
+  if (ev.dirId === PLUGIN_SYNC_DIR_ID && !ev.cancelled) {
+    setTimeout(() => void refreshPluginRegistryState(), 1500)
+  }
   // 本轮结束：清空「应用到全部」勾选，下一轮冲突重新询问
   state.conflictApplyAll = false
   persist()
@@ -905,6 +1095,40 @@ export function dirRootLostOpen(d: SyncDir): boolean {
   return (d.pendingConflicts ?? []).some((p) => p.kind === 'root-lost' && !p.choice)
 }
 
+/**
+ * 目录当前的「待处理信号」：未决策挂起里最新的时间戳（冲突 / 删除逐条登记取
+ * createdAt，批量删除取快照 at），无未决策挂起时为 0。口径与 DirRow 行内待处理
+ * 挂起条的计数一致（root-lost 有专门提示条、逐文件 delete 无快照时行内也不计）。
+ * 作为「不再显示」的比较基准：关闭提示条时记下当时的信号，之后信号变大
+ *（有新挂起）提示条重新显示 —— 关闭只对当前这批事项生效。
+ */
+export function dirPendingSignal(d: SyncDir): number {
+  let t = 0
+  for (const p of d.pendingConflicts ?? []) {
+    if (p.choice || p.kind === 'root-lost' || p.kind === 'delete') continue
+    t = Math.max(t, p.createdAt || 0)
+  }
+  if ((d.deleteBatch?.undecided ?? 0) > 0) t = Math.max(t, d.deleteBatch?.at || 0)
+  return t
+}
+
+/**
+ * 全部目录的待处理信号（各目录 dirPendingSignal 的最大值）：同步记录页顶部
+ * 待处理横幅「不再显示」的比较基准，语义同 dirPendingSignal（有新挂起重新提示）。
+ */
+export function allPendingSignal(dirs: SyncDir[]): number {
+  return dirs.reduce((acc, d) => Math.max(acc, dirPendingSignal(d)), 0)
+}
+
+/**
+ * 关闭目录行内的「待处理挂起条」（不再显示）：记下当前待处理信号到目录的
+ * pendingStripMutedAt（随目录持久化）。之后该目录出现更新的挂起时信号变大，
+ * 提示条自动恢复显示；待处理中心 / 状态栏入口不受影响。
+ */
+function mutePendingStrip(d: SyncDir) {
+  d.pendingStripMutedAt = dirPendingSignal(d)
+}
+
 /** 拉取某目录当前挂起冲突（面板打开 / 事件外的兜底刷新）。
  *  同步拉取批量删除快照（listDeleteBatch）—— 删除确认的目录树数据源：逐文件
  *  挂起表有 500 条上限，超限部分没有逐文件记录，只有快照承载；两类数据同源
@@ -971,62 +1195,6 @@ async function openPendingCenter() {
   state.pendingCenterOpen = true
   await refreshAllPendingConflicts()
 }
-
-/** 决策记录页的目录分组行：开放计数（待决策）+ 已决策进度（部分决策的展示与判定） */
-export interface DecisionGroup {
-  dir: SyncDir
-  /** 未决策的「云端文件夹丢失」挂起数（0/1，目录级决策） */
-  rootLost: number
-  /** 未决策的删除确认数（批量快照 undecided 真值；无快照退回逐文件记录口径） */
-  deleteConfirm: number
-  /** 未决策的冲突数（无 choice 的冲突挂起） */
-  conflict: number
-  /** 已选择、待下一轮生效的冲突数（同一批决策做了一部分） */
-  decidedConflict: number
-  /** 已决策的删除数（快照口径 total - undecided；无快照退回已选逐文件记录数） */
-  decidedDelete: number
-}
-
-/**
- * 决策记录页的目录分组（待决策 / 部分决策两类，互斥）：
- *   待决策 —— 有未决策事项且同一批里还没做过任何选择（根丢失 / 删除确认 / 冲突）；
- *   部分决策 —— 同一批事项里已做出部分选择但还有未决策的剩余（删除树已决策部分
- *   子树、冲突已选部分文件），可从决策记录页「继续处理」完成剩余决策。
- * 已全部决策（无开放项）的目录不出现；仅剩「已选待生效、无开放项」的目录也不出现
- *（选择由下一轮同步自动消费，无决策可继续）。待决策组内根丢失排最前（与待处理
- * 中心同口径）；删除确认计数与角标同源（优先快照 undecided 真值）。
- */
-const decisionGroups = computed(() => {
-  const pending: DecisionGroup[] = []
-  const partial: DecisionGroup[] = []
-  for (const d of state.dirs) {
-    let rootLost = 0
-    let conflict = 0
-    let decidedConflict = 0
-    for (const p of d.pendingConflicts ?? []) {
-      if (p.kind === 'root-lost') {
-        if (!p.choice) rootLost++
-        continue
-      }
-      if (p.kind === 'delete') continue
-      if (p.choice) decidedConflict++
-      else conflict++
-    }
-    const batch = d.deleteBatch
-    const deleteConfirm = batch
-      ? batch.undecided
-      : (d.pendingConflicts ?? []).filter((p) => !p.choice && p.kind === 'delete').length
-    const decidedDelete = batch
-      ? Math.max(0, batch.total - batch.undecided)
-      : (d.pendingConflicts ?? []).filter((p) => p.choice && p.kind === 'delete').length
-    if (!rootLost && !conflict && !deleteConfirm) continue
-    const g: DecisionGroup = { dir: d, rootLost, deleteConfirm, conflict, decidedConflict, decidedDelete }
-    const isPartial = (decidedConflict > 0 && conflict > 0) || (decidedDelete > 0 && deleteConfirm > 0)
-    ;(isPartial ? partial : pending).push(g)
-  }
-  pending.sort((a, b) => (b.rootLost > 0 ? 1 : 0) - (a.rootLost > 0 ? 1 : 0))
-  return { pending, partial }
-})
 
 /**
  * 待处理中心「去处理」直达：根丢失目录级决策弹 RootLostModal（既有 rootLostPromptDirId
@@ -1163,6 +1331,29 @@ function todayAt(h: number, m: number): number {
   return d.getTime()
 }
 
+/**
+ * 旧版本配置的检查频率归一：间隔选项已移除低于 15 分钟的档位（1 / 5 / 10 分钟），
+ * 历史持久化值落在被移除档位时归一到 15 分钟 —— 否则下拉框出现空选项，实际同步
+ * 频率也与界面可选范围不一致。覆盖全局偏好与目录级覆盖两处；有变更时立即落盘
+ *（调度器随后经 reload 读取归一后的配置）。调度器侧不做钳位 —— 「配置什么跑什么」
+ * 的语义留给配置本身，界面可选范围才是本归一的对齐目标。
+ */
+function normalizeLegacyIntervals(): void {
+  let changed = false
+  if (Number(state.prefs.intervalMin) < MIN_INTERVAL_MIN) {
+    state.prefs.intervalMin = MIN_INTERVAL_MIN
+    changed = true
+  }
+  for (const d of state.dirs) {
+    const o = d.overrides?.intervalMin
+    if (o != null && Number(o) < MIN_INTERVAL_MIN) {
+      d.overrides = { ...(d.overrides ?? {}), intervalMin: MIN_INTERVAL_MIN }
+      changed = true
+    }
+  }
+  if (changed) persist()
+}
+
 /** 应用启动：载入配置，绑定 preload 调度器；支持 ?demo= 场景用于界面预览 */
 async function init() {
   const persisted = loadPersisted()
@@ -1175,13 +1366,16 @@ async function init() {
     state.dirs = persisted.dirs || []
     state.prefs = { ...defaultPrefs(), ...(persisted.prefs || {}) }
   }
+  // 旧版本间隔档位归一（<15 分钟 → 15）：在演示场景改写目录之前、绑定调度器
+  // 之前执行 —— persist 落盘后调度器握手读到的即是归一后的配置
+  normalizeLegacyIntervals()
 
   // 演示场景（开发预览）：?demo=main|empty|add|syncing|conflict|done|settings
   const demoParam = new URLSearchParams(location.search).get('demo')
   if (demoParam) applyDemo(demoParam)
 
-  // 先绑定调度器（握手 + 订阅）—— 自举 / 启动同步（syncOnStartup）、定时
-  // 轮询、fs.watch 全部在 preload 侧，不再依赖渲染层定时器（宿主隐藏节流免疫）
+  // 先绑定调度器（握手 + 订阅）—— 定时轮询、新目录首轮、fs.watch 全部在
+  // preload 侧，不再依赖渲染层定时器（宿主隐藏节流免疫）；打开插件不触发同步
   bindScheduler()
   // 冷启动拉一次挂起冲突（后台轮 defer 产生；此后由 pending-conflicts 事件维护）
   void refreshAllPendingConflicts()
@@ -1195,14 +1389,30 @@ async function init() {
   )
 
   // 监听目录启用状态 / 目录级设置 / 路径与同步方式的修改 / 列表增删：持久化
-  //（只取这些字段的序列化特征，同步进度等运行时字段变化不会触发）
+  //（只取这些字段的序列化特征，同步进度等运行时字段变化不会触发；
+  //  插件同步虚拟行不参与特征 —— 它不持久化，增删由 prefs 开关的 watch 驱动）
   watch(
     () =>
       state.dirs
+        .filter((d) => !isPluginSyncDir(d))
         .map((d) => `${d.id}~${dirEnabled(d) ? 1 : 0}~${JSON.stringify(d.overrides ?? null)}~${d.localPath}~${d.remotePath}~${d.mode}`)
         .join('|'),
     onDirsChanged
   )
+
+  // 【实验：ZTools 插件同步】开关 / 行级暂停 / 云端父目录变化 → 维护虚拟行
+  //（增删 / 刷新 enabled 与发现结果，远端路径随父目录即时跟随）。行变化不直接
+  // 持久化（虚拟行被 persist 过滤），但 prefs 本身的变化经上方 prefs 深 watch
+  // 落盘并触发调度器 reload —— 调度器按同一组 prefs 合成 / 移除同 id 的 slot，
+  // 两侧自然对齐
+  watch(
+    () =>
+      `${state.prefs.ztoolsPluginSync ? 1 : 0}~${state.prefs.ztoolsPluginSyncPaused ? 1 : 0}~${state.prefs.ztoolsPluginSyncRemoteDir ?? ''}`,
+    () => {
+      refreshPluginSyncRow()
+    }
+  )
+  refreshPluginSyncRow()
 
   if (configured.value) {
     // 先读能力缓存（无网络开销）立即呈现档位；随后的连通性探测会刷新它
@@ -1350,8 +1560,8 @@ function applyDemo(scene: string) {
       { rel: 'Assets/废弃Logo.ai', createdAt: todayAt(9, 41), kind: 'delete', local: { size: 42000000, mtimeMs: todayAt(9, 41) }, remote: { size: 0, mtimeMs: 0, etag: '' } },
     ]
   } else if (scene === 'decisions') {
-    // 决策记录页预览：① 部分决策（删除树已随范围决策一部分 + 冲突已选一部分）+
-    // ② 待决策（纯冲突）+ ③ 待决策（根丢失目录级决策，组内排最前），历史为静态样例
+    // 同步记录页预览（路由键沿用历史命名 'decisions'）：挂起数据驱动顶部待处理
+    // 横幅的计数；记录时间线为静态样例（synclog.ts 的 demoSyncRecords）
     state.route = 'decisions'
     dirs[0].pendingConflicts = [
       { rel: 'Spec/接口约定.md', createdAt: todayAt(10, 12), local: { size: 4300, mtimeMs: todayAt(10, 12) }, remote: { size: 4710, mtimeMs: todayAt(10, 13) } },
@@ -1440,14 +1650,20 @@ export function useStore() {
     setDirEnabled,
     setDirOverrides,
     resetDirOverrides,
+    isPluginSyncDir,
+    disablePluginSync,
     dirEnabled,
+    dirAutoSyncOn,
     dirIntervalMin,
     dirSyncPrefs,
+    dirEngineCfg,
+    dirPendingSignal,
+    allPendingSignal,
+    mutePendingStrip,
     resolveConflict,
     openConflictFor,
     pendingConflictTotal,
     pendingCenterGroups,
-    decisionGroups,
     openPendingCenter,
     goPendingDir,
     refreshPendingConflicts,

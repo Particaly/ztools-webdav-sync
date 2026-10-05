@@ -309,7 +309,7 @@ export async function setupShard({ shard, port }) {
     SC_DB[SC_KEY] = {
       server: { serverUrl: `http://127.0.0.1:${PORT}/dav/`, username: 'u', password: services.secure.sealSecret('p') },
       dirs,
-      prefs: { autoSync: false, intervalMin: 15, syncOnStartup: false, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4, ...prefs },
+      prefs: { autoSync: false, intervalMin: 15, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4, ...prefs },
     }
   }
   /** 创建测试调度器实例（autoBootstrap:false；now / timers 可注入假时钟） */

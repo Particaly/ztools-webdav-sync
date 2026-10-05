@@ -5,7 +5,7 @@ import RemoteDirModal from '../components/RemoteDirModal.vue'
 import { AppButton, AppIconButton, AppInput, AppSelect, AppSwitch, InfoTip } from '../components/ui'
 import { useStore, defaultPrefs, tierLabel, tierHint } from '../composables/store'
 import { toast } from '../composables/toast'
-import { intervalOptions, strategyOptions } from '../composables/options'
+import { intervalOptions, strategyOptions, concurrencyOptions } from '../composables/options'
 import { fmtBytes, fmtRelTime } from '../composables/format'
 
 const store = useStore()
@@ -13,7 +13,22 @@ const s = store.state
 
 const showDirPicker = ref(false)
 
-const concurrencyOptions = [1, 2, 3, 4, 6, 8].map((n) => ({ value: n, label: `${n}` }))
+/**
+ * 明文 http 警告的显隐：地址是明文 http 且未被当前地址关闭过。关闭（不再显示）
+ * 记录的是关闭时的服务器地址（prefs.insecureHttpDismissedFor，与主界面服务器
+ * 卡片同一条警告共用标记），之后换成另一个 http 地址会重新提示。
+ */
+const insecureHttpVisible = computed(
+  () => store.insecureHttp.value && s.server.serverUrl !== (s.prefs.insecureHttpDismissedFor ?? '')
+)
+
+/** 关闭明文 http 警告（不再显示）：记录当前服务器地址作为情境指纹 */
+function dismissInsecureHttp() {
+  s.prefs.insecureHttpDismissedFor = s.server.serverUrl
+}
+
+/** 插件同步云端文件夹选择器显隐（实验卡片区「浏览…」入口） */
+const showPluginDirPicker = ref(false)
 
 const testResultText = computed(() => {
   if (!s.testResult) return ''
@@ -51,6 +66,13 @@ const capabilityHintText = computed(() => {
   if (!c || c.tier === 'A') return ''
   return tierHint(c.tier)
 })
+
+/**
+ * 档位结论提示行的显隐：有 B/C 档结论且未被当前档位关闭过。关闭（不再显示）
+ * 记录的是关闭时的档位（prefs.tierHintDismissed），档位变化（服务器变更 /
+ * 重新检测出不同结论）后重新提示。
+ */
+const capabilityHintVisible = computed(() => !!capabilityHintText.value && (s.prefs.tierHintDismissed ?? '') !== s.capabilities?.tier)
 
 /** B / C 档技术原因 + 重探说明（悬浮 title 展示） */
 const capabilityHintTitle = computed(() => {
@@ -137,6 +159,71 @@ const deepVerifyModel = computed<boolean>({
     s.prefs.deepVerify = v
   },
 })
+
+/**
+ * 【实验：ZTools 插件同步】开关（prefs.ztoolsPluginSync 可选布尔 → AppSwitch
+ * 必填 model 的适配）。开启后同步列表出现自动发现的虚拟行（store.refreshPluginSyncRow
+ * 经 prefs watch 维护），调度器侧按同一开关合成 slot；开启瞬间不触发同步，
+ * 首轮由调度器排到下一个自动同步时间点。
+ */
+const pluginSyncModel = computed<boolean>({
+  get: () => s.prefs.ztoolsPluginSync === true,
+  set: (v) => {
+    s.prefs.ztoolsPluginSync = v
+  },
+})
+
+/**
+ * 插件同步的自动发现结果（preload describe：本机目录 / 平台隔离的远端目录）。
+ * 云端父目录（ztoolsPluginSyncRemoteDir）是响应式依赖：更换位置后远端根即时
+ * 跟随刷新；无 preload（浏览器预览）时为 null，开关下方信息行不显示。
+ */
+const pluginSyncDesc = computed(() => {
+  const base = s.prefs.ztoolsPluginSyncRemoteDir || ''
+  try {
+    return window.services?.ztoolsPlugins?.describe?.(base) ?? null
+  } catch {
+    return null
+  }
+})
+
+/** 开关下方的说明文案（两行展示）：本机插件目录、平台隔离的云端目录（含所选父目录） */
+const pluginSyncDescLines = computed(() => {
+  const d = pluginSyncDesc.value
+  if (!d) return null
+  return {
+    local: `本机插件目录 ${d.pluginsDir}`,
+    cloud: `云端 ${d.remotePath}（${d.platformKey} 平台专用）`,
+  }
+})
+
+/** 打开插件同步的云端文件夹选择器（与默认云端文件夹同一形态） */
+function browsePluginSyncDir() {
+  if (!s.server.serverUrl.trim()) {
+    toast.warning('请先填写服务器地址', '填写 WebDAV 地址后再选择云端文件夹')
+    return
+  }
+  showPluginDirPicker.value = true
+}
+
+/**
+ * 确认插件同步的云端文件夹：写入 prefs.ztoolsPluginSyncRemoteDir（经 prefs
+ * 深度 watch 自动持久化，调度器 reload 后按同一父目录合成远端根）。最终同步
+ * 根 = 所选目录之后固定跟上 ztools-plugins/<平台>；清空输入即恢复默认云端根。
+ * 更换位置后旧云端内容不迁移不删除，首轮同步会把本机插件重新上传到新位置。
+ * @param path 远端目录选择器回传的绝对路径（以 / 开头；容错补齐缺省的起始斜杠）
+ */
+function confirmPluginSyncDir(path: string) {
+  showPluginDirPicker.value = false
+  const p = String(path || '').trim().replace(/\/+$/, '')
+  const next = p ? (p.startsWith('/') ? p : '/' + p) : ''
+  if (next === (s.prefs.ztoolsPluginSyncRemoteDir ?? '')) return
+  s.prefs.ztoolsPluginSyncRemoteDir = next
+  toast.success(
+    '插件云端文件夹已更新',
+    next ? `插件将同步到 ${next}/ztools-plugins 下的平台子文件夹；旧位置的内容不会自动迁移` : '已恢复默认位置（云端的 ztools-plugins 文件夹）'
+  )
+}
 
 /** 打开远端目录选择器：未填服务器地址时直接提示，避免必然失败的请求 */
 function browseDefaultDir() {
@@ -240,10 +327,14 @@ function save() {
                   sm
                   placeholder="https://dav.example.com/remote.php/dav/files/user/"
                 />
-                <!-- http 明文连接警告：内网回环地址不打扰 -->
-                <div v-if="store.insecureHttp.value" class="flex items-start gap-[5px]">
+                <!-- http 明文连接警告：内网回环地址不打扰；关闭（不再显示）记录当时
+                     的服务器地址（与主界面服务器卡片同一条警告共用标记） -->
+                <div v-if="insecureHttpVisible" class="flex items-start gap-[5px]">
                   <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
-                  <span class="text-[11px] text-warning-icon leading-[1.5]">当前地址使用 http 明文传输，账号密码与文件内容均未加密，存在被截取的风险，建议改用 https</span>
+                  <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">当前地址使用 http 明文传输，账号密码与文件内容均未加密，存在被截取的风险，建议改用 https</span>
+                  <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3 -mt-[2px]" @click="dismissInsecureHttp">
+                    <AppIcon name="close" :size="10" />
+                  </AppIconButton>
                 </div>
               </div>
               <div class="flex gap-[10px]">
@@ -304,8 +395,13 @@ function save() {
                   {{ s.probing ? '测试中…' : '功能测试' }}
                 </AppButton>
               </div>
-              <div v-if="capabilityHintText" class="text-[11px] text-warning-icon" :title="capabilityHintTitle">
-                {{ capabilityHintText }}
+              <!-- 档位结论提示行（B/C 档说明）：关闭（不再显示）后同档位不再出现，
+                   档位变化（服务器变更 / 重新检测）后重新提示 -->
+              <div v-if="capabilityHintVisible" class="flex items-start gap-[5px]" :title="capabilityHintTitle">
+                <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">{{ capabilityHintText }}</span>
+                <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3 -mt-[2px]" @click="s.prefs.tierHintDismissed = s.capabilities?.tier || ''">
+                  <AppIcon name="close" :size="10" />
+                </AppIconButton>
               </div>
             </div>
           </section>
@@ -331,14 +427,6 @@ function save() {
                 </div>
                 <span class="flex-spacer" />
                 <AppSelect v-model="s.prefs.intervalMin" :options="intervalOptions" :width="104" />
-              </div>
-              <div class="pref-row flex items-center gap-3">
-                <div class="flex items-center gap-[3px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">启动时自动同步</span>
-                  <InfoTip text="启动 ZTools 时先检查一次云端变更" />
-                </div>
-                <span class="flex-spacer" />
-                <AppSwitch v-model="s.prefs.syncOnStartup" />
               </div>
             </div>
           </section>
@@ -424,6 +512,49 @@ function save() {
             </div>
           </section>
 
+          <!-- 实验卡片：ZTools 插件同步（默认关） -->
+          <section class="card">
+            <div class="card-head flex items-center gap-2 px-[14px] py-[8px]">
+              <span class="card-title text-[12px] font-semibold text-ink-1">实验</span>
+            </div>
+            <div class="flex flex-col gap-[10px] px-[14px] py-[11px]">
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">ZTools 插件同步</span>
+                  <InfoTip text="实验功能：把本机 ZTools 的插件同步到云端，换机或重装后可找回。电脑上的插件文件夹由 ZTools 自动发现，不能修改；云端按操作系统分文件夹存放（互不相通），避免不同系统的设备互相同步不兼容的插件。开启后不会立刻同步，会在下一个自动同步时间点执行" />
+                </div>
+                <span class="flex-spacer" />
+                <AppSwitch v-model="pluginSyncModel" />
+              </div>
+              <!-- 云端存储位置：最终同步根 = 所选目录之后固定跟上 ztools-plugins/<平台>；
+                   留空 = 默认云端根。多台设备须选择同一个文件夹才能互通 -->
+              <div v-if="pluginSyncModel" class="flex flex-col gap-[6px]">
+                <div class="flex items-center gap-[3px]">
+                  <span class="text-[12px] font-medium text-ink-1">云端文件夹</span>
+                  <InfoTip text="插件会存到所选文件夹下的 ztools-plugins 子文件夹（其中再按操作系统分文件夹）；多台设备请选择同一个文件夹。留空时默认放在云端的 ztools-plugins 文件夹；更换位置后旧云端内容不会自动迁移" />
+                </div>
+                <div class="flex gap-2">
+                  <AppInput
+                    v-model="s.prefs.ztoolsPluginSyncRemoteDir"
+                    icon="cloud"
+                    mono
+                    sm
+                    class="flex-1 min-w-0"
+                    placeholder="默认（/ztools-plugins）"
+                  />
+                  <AppButton @click="browsePluginSyncDir">浏览…</AppButton>
+                </div>
+              </div>
+              <div v-if="pluginSyncModel && pluginSyncDescLines" class="flex items-start gap-[5px]">
+                <AppIcon name="info" :size="11" class="text-ink-4 shrink-0 mt-[2px]" />
+                <div class="flex flex-col gap-[2px] min-w-0">
+                  <span class="text-[11px] text-ink-4 leading-[1.5] break-words" :title="pluginSyncDescLines.local">{{ pluginSyncDescLines.local }}</span>
+                  <span class="text-[11px] text-ink-4 leading-[1.5] break-words" :title="pluginSyncDescLines.cloud">{{ pluginSyncDescLines.cloud }}</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <!-- 同步状态卡片 -->
           <section class="card">
             <div class="card-head flex items-center gap-2 px-[14px] py-[8px]">
@@ -478,6 +609,19 @@ function save() {
         :initial-path="s.prefs.probeRemoteDir"
         @pick="store.confirmProbeDir"
         @close="s.showProbeDirPicker = false"
+      />
+    </Transition>
+
+    <!-- 弹窗：插件同步的云端文件夹选择（实验卡片区「浏览…」入口；
+         确认后由 confirmPluginSyncDir 写入 prefs.ztoolsPluginSyncRemoteDir） -->
+    <Transition name="modal-pop">
+      <RemoteDirModal
+        v-if="showPluginDirPicker"
+        title="选择插件云端文件夹"
+        subtitle="插件将同步到所选文件夹下的 ztools-plugins 子文件夹（其中再按操作系统分文件夹）；多台设备请选择同一个文件夹"
+        :initial-path="s.prefs.ztoolsPluginSyncRemoteDir"
+        @pick="confirmPluginSyncDir"
+        @close="showPluginDirPicker = false"
       />
     </Transition>
   </div>

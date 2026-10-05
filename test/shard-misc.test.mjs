@@ -1,5 +1,5 @@
 /**
- * e2e 分片「misc」：解析与删除安全组（V1 / RD / RL / X1-X5 / B1 / B3 / B4 / ES0-1 / DP / HP / DS1-6 / FN0-5）
+ * e2e 分片「misc」：解析与删除安全组（V1 / RD / RL / NE / FSW / X1-X5 / B1 / B3 / B4 / ES0-1 / DP / HP / DS1-6 / FN0-5）
  * 由 test/sync-e2e.mjs 机械拆分（节体逐字保留）；每文件独立 dav-server / 端口 / 根目录，
  * vitest 按文件并行、文件内保持原节顺序。共享基建见 test/harness.mjs。
  * 日常回归：npm run test:fast（跳过 slow tag）；等待组单独回归：npm run test:slow。
@@ -171,6 +171,78 @@ const {
     await fsp.rm(path.join(ROOT, '.wdsync-test-ratelimit'), { force: true }).catch(() => {})
   }
 
+  })
+
+  // ============================================================
+  // NE：传输中断的错误归类（网络故障 ≠ 本地读失败）
+  // 回归：singleRequest 曾以「读流是否报过错」判定本地上传失败 —— 请求侧被销毁
+  //（对端失联 → socket 空闲超时 → req.destroy(err)）时，pipeline 拆除会把同一错误
+  // 传播进读流，网络卡顿被包装成 LOCAL_IO「文件暂时读不出来」（permanent，当轮
+  // 不重试）。blackhole 档（收请求头后搁置不读不响应）制造该触发器；断言归类为
+  // NETWORK（可重试），且真读失败（开流前文件消失）仍归 LOCAL_IO。
+  // ============================================================
+
+  await section('NE：传输中断归类（请求侧销毁 ≠ 本地读失败）', async () => {
+  fs.writeFileSync(path.join(ROOT, '.wdsync-test-blackhole'), 'x')
+  const NE_LOCAL = path.join(os.tmpdir(), `wdsync-e2e-ne-${Date.now()}`)
+  try {
+    await fsp.mkdir(NE_LOCAL, { recursive: true })
+    // 8MB 远超 loopback 套接字缓冲：对端不读时客户端写必然停滞 → 空闲超时 → req.destroy(err)
+    await fsp.writeFile(path.join(NE_LOCAL, 'ne-big.bin'), Buffer.alloc(8 * 1024 * 1024, 7))
+    const neCfg = { ...cfg, netOpts: { ...(cfg.netOpts || {}), idleTimeoutMs: 400 } }
+    const neT0 = Date.now()
+    let neErr = null
+    try {
+      await services.sync._internals.davRequest(neCfg, 'PUT', '/ne/ne-big.bin', { bodyFile: path.join(NE_LOCAL, 'ne-big.bin') })
+    } catch (e) {
+      neErr = e
+    }
+    check(
+      'NE stalled-peer upload is classified as NETWORK (not the LOCAL_IO misread)',
+      !!neErr && neErr.code === 'NETWORK' && neErr.permanent === false && !/暂时读不出来/.test(neErr.message) && Date.now() - neT0 < 15000,
+      neErr && `${neErr.code} ${neErr.message} (${Date.now() - neT0}ms)`
+    )
+    // 真读失败（读流自身先报错）：bodyFile 指向目录 —— stat 通过、开流后首读 EISDIR
+    // —— 读流先于请求侧报错 → 仍按 LOCAL_IO「文件暂时读不出来」归类（permanent 不变）
+    const dirBody = path.join(NE_LOCAL, 'ne-dir-body')
+    await fsp.mkdir(dirBody, { recursive: true })
+    let dirErr = null
+    try {
+      await services.sync._internals.davRequest(neCfg, 'PUT', '/ne/ne-dir.bin', { bodyFile: dirBody })
+    } catch (e) {
+      dirErr = e
+    }
+    check(
+      'NE genuine body-read failure still classified as LOCAL_IO',
+      !!dirErr && dirErr.code === 'LOCAL_IO' && /暂时读不出来/.test(dirErr.message),
+      dirErr && `${dirErr.code} ${dirErr.message}`
+    )
+  } finally {
+    await fsp.rm(path.join(ROOT, '.wdsync-test-blackhole'), { force: true }).catch(() => {})
+    await fsp.rm(NE_LOCAL, { recursive: true, force: true }).catch(() => {})
+  }
+
+  })
+
+  // ============================================================
+  // FSW：本地文件 IO 的 fs 解析接线（asar 补丁旁路）
+  // 宿主（Electron）内应解析为未打补丁的 original-fs；Node 测试环境回落 node:fs。
+  // 引擎全部本地 IO（stat / 扫描 / 读流 / 写流）都经 services 模块级 fs —— 接线
+  // 一旦漏挂，.asar 路径会被 asar 视图当 0 字节虚拟条目（回归 2026-10 插件同步事故）
+  // ============================================================
+
+  await section('FSW：本地 fs 解析接线（original-fs 优先 / node:fs 回落）', async () => {
+  const lfs = services.sync._internals.localFs
+  check(
+    'FSW resolved local fs is a full fs facade (statSync / streams / promises)',
+    !!lfs && typeof lfs.statSync === 'function' && typeof lfs.createReadStream === 'function' && typeof lfs.createWriteStream === 'function' && !!lfs.promises,
+    lfs ? 'resolved' : 'missing'
+  )
+  check(
+    'FSW fallback path under plain Node resolves to node:fs (same module identity)',
+    lfs === (await import('node:fs')).default,
+    ''
+  )
   })
 
   // ============================================================
@@ -917,7 +989,7 @@ const {
       F_DB['webdav-sync:data'] = {
         server: { serverUrl: `http://127.0.0.1:${PORT}/dav/`, username: 'u', password: services.secure.sealSecret('p') },
         dirs: [{ id: 'd1', localPath: DP_F, remotePath: '/dp-f', mode: 'two-way' }],
-        prefs: { autoSync: true, intervalMin: 1, syncOnStartup: false, backgroundRunning: true, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4 },
+        prefs: { autoSync: true, intervalMin: 1, backgroundRunning: true, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4 },
       }
       const fCalls = []
       const fPeeked = []
@@ -1113,9 +1185,10 @@ const {
       )
       // 调度器自举经注入的内存 config：此刻 window.ztools mock 只有 shellTrashItem、
       // 没有 dbStorage —— ready 即证明配置读的是端口而非宿主对象。
-      // 冲突提醒用 startup 轮验证：init() 会标记 rendererOnline，手动轮（syncNow）的
-      // 冲突将转发等待渲染层应答（无订阅者应答即永久等待 —— 生产语义正确但测试会
-      // 挂起）；startup / watch 等自动轮冲突一律 defer，才是系统提醒的生产路径。
+      // 冲突提醒用新目录 startup 轮验证（reload 新增目录触发；打开插件已不立即同步）：
+      // init() 会标记 rendererOnline，手动轮（syncNow）的冲突将转发等待渲染层应答
+      //（无订阅者应答即永久等待 —— 生产语义正确但测试会挂起）；startup / watch 等
+      // 自动轮冲突一律 defer，才是系统提醒的生产路径。
       // 挂起 services.mts 挂载期的默认调度器：它同样读得到注入的 config 端口 —— 若
       // 本节在它 ~1s 的自举重试窗口内运行（当前节序靠后不会，但顺序调整后会），
       // 它会抢先持有同一存储根的 leader 锁，本节的测试实例永远 standby。挂起让它
@@ -1124,11 +1197,12 @@ const {
       await fsp.writeFile(path.join(HP_LOCAL, 'c.txt'), 'hp-c-local')
       await fsp.writeFile(path.join(ROOT, 'hp', 'c.txt'), 'hp-c-remote')
       // autoSync 必须开：dirEligible 以「全局 autoSync !== false」为门（scheduler.mts），
-      // 关着时任何调度器（含本节实例）都不会跑 startup 轮，挂起冲突的提醒无从触发
+      // 关着时任何调度器（含本节实例）都不会跑 startup 轮，挂起冲突的提醒无从触发。
+      // 初始 dirs 留空：打开插件不立即同步；下方 reload 新增 hp1 触发新目录首轮
       HP_DB['webdav-sync:data'] = {
         server: { serverUrl: cfg.serverUrl, username: 'u', password: services.secure.sealSecret('p') },
-        dirs: [{ id: 'hp1', localPath: HP_LOCAL, remotePath: '/hp', mode: 'two-way' }],
-        prefs: { autoSync: true, intervalMin: 15, syncOnStartup: true, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4 },
+        dirs: [],
+        prefs: { autoSync: true, intervalMin: 15, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4 },
       }
       hpSched = services.sync._internals.createScheduler({
         engine: {
@@ -1143,11 +1217,22 @@ const {
       })
       const hpInit = await hpSched.init()
       check(
-        'HPa scheduler bootstraps from the injected in-memory config port (ready + 1 slot)',
-        hpInit.ready === true && hpInit.slots.length === 1,
+        'HPa scheduler bootstraps from the injected in-memory config port (ready, no slot)',
+        hpInit.ready === true && hpInit.slots.length === 0,
         JSON.stringify({ ready: hpInit.ready, reason: hpInit.notReadyReason, slots: hpInit.slots.length })
       )
-      // startup 轮（自动类，冲突一律 defer）→ 挂起冲突的系统提醒走注入 notify 端口
+      HP_DB['webdav-sync:data'] = {
+        server: { serverUrl: cfg.serverUrl, username: 'u', password: services.secure.sealSecret('p') },
+        dirs: [{ id: 'hp1', localPath: HP_LOCAL, remotePath: '/hp', mode: 'two-way' }],
+        prefs: { autoSync: true, intervalMin: 15, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4 },
+      }
+      const hpReload = await hpSched.reload()
+      check(
+        'HPa reload adds hp1 (new slot + first round armed)',
+        hpReload.applied === true && hpSched.getSnapshot().slots.length === 1,
+        JSON.stringify({ applied: hpReload.applied, slots: hpSched.getSnapshot().slots.length })
+      )
+      // 新目录 startup 轮（自动类，冲突一律 defer）→ 挂起冲突的系统提醒走注入 notify 端口
       const hpNotified = await hpWait(() => HP_NOTES.length >= 1, 15000)
       check(
         'HPa deferred-conflict notification routed through the injected notify port',
@@ -2037,6 +2122,115 @@ const {
     }
   })
 
+  // DS7 同步记录（sync-log.json）：每次引擎轮一条 —— 触发方式（hints.source）/
+  // 起止时间 / 计数摘要 / 逐文件操作明细（upload / download / delete-local /
+  // delete-remote，含 added 新增标记）/ 失败轮的 status=error 与 errors 清单；
+  // 环形上限 200 轮防膨胀；落盘可跨存储重开读取。
+  // 本节自包含（节首切到 STORAGE_MAIN，与 DS6 同款）。
+
+  await section('DS7：同步记录', async () => {
+    await switchDevice(STORAGE_MAIN)
+    const L = path.join(os.tmpdir(), `wdsync-e2e-ds7-${Date.now()}`)
+    const d = () => ({ id: 'ds7', localPath: L, remotePath: '/ds7', mode: 'two-way' })
+    const rawPut = (rel, body) =>
+      new Promise((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port: PORT, path: `/dav/ds7/${rel}`, method: 'PUT', agent: false }, resolve)
+        req.on('error', reject)
+        req.end(body)
+      })
+    try {
+      await fsp.mkdir(L, { recursive: true })
+      for (let i = 0; i < 3; i++) await fsp.writeFile(path.join(L, `f${i}.txt`), `ds7-${i}`)
+      // —— 首轮（startup 触发）：3 个上传全部入明细（云端新增）
+      await services.sync.syncDirectory(cfg, d(), SP, { hints: { source: 'startup' } })
+      let log = await services.sync.listSyncLog(d())
+      check(
+        'DS7 首轮入记录（触发方式 / 状态 / 计数摘要）',
+        log.length === 1 && log[0].trigger === 'startup' && log[0].status === 'ok' && log[0].uploaded === 3 && log[0].totalFiles === 3,
+        JSON.stringify(log)
+      )
+      check(
+        'DS7 首轮操作明细：3 条上传 + added 标记 + 起止时间',
+        log[0].ops.length === 3 &&
+          log[0].ops.every((o) => o.op === 'upload' && o.added === true && o.bytes > 0 && o.rel) &&
+          log[0].at > 0 &&
+          log[0].endAt >= log[0].at,
+        JSON.stringify(log[0].ops)
+      )
+      // —— 无变化轮（interval 触发）：零传输轮也入记录，明细为空
+      await services.sync.syncDirectory(cfg, d(), SP, { hints: { source: 'interval' } })
+      log = await services.sync.listSyncLog(d())
+      check(
+        'DS7 无变化轮入记录（interval，零操作明细）',
+        log.length === 2 && log[0].trigger === 'interval' && log[0].status === 'ok' && log[0].ops.length === 0 && log[0].uploaded === 0,
+        JSON.stringify(log[0])
+      )
+      // —— 双向删除传播轮（watch 触发）：本地删 f0 → delete-remote；云端删 f2 → delete-local
+      await fsp.rm(path.join(L, 'f0.txt'))
+      await services.dav.remove(cfg, '/ds7/f2.txt')
+      await services.sync.syncDirectory(cfg, d(), SP, { hints: { source: 'watch' } })
+      log = await services.sync.listSyncLog(d())
+      check(
+        'DS7 删除传播轮：两侧删除各入明细（delete-remote / delete-local）',
+        log.length === 3 &&
+          log[0].trigger === 'watch' &&
+          log[0].deleted === 2 &&
+          log[0].ops.some((o) => o.op === 'delete-remote' && o.rel === 'f0.txt') &&
+          log[0].ops.some((o) => o.op === 'delete-local' && o.rel === 'f2.txt'),
+        JSON.stringify(log[0].ops)
+      )
+      // —— 下载轮（manual 触发）：云端新文件 → download 入明细（本地新增）
+      await rawPut('from-remote.txt', 'ds7-remote-new')
+      await services.sync.syncDirectory(cfg, d(), SP, { hints: { source: 'manual' } })
+      log = await services.sync.listSyncLog(d())
+      check(
+        'DS7 下载轮：download 入明细（added = 本地新增）',
+        log.length === 4 && log[0].trigger === 'manual' && log[0].downloaded === 1 && log[0].ops.some((o) => o.op === 'download' && o.rel === 'from-remote.txt' && o.added === true),
+        JSON.stringify(log[0].ops)
+      )
+      // —— 大轮次全量记录：一次 220 个文件的上传 → 明细不截断（全量 ops、无 dropped 字段）
+      await fsp.mkdir(path.join(L, 'bulk'), { recursive: true })
+      for (let i = 0; i < 220; i++) await fsp.writeFile(path.join(L, 'bulk', `f${i}.txt`), `bulk-${i}`)
+      await services.sync.syncDirectory(cfg, d(), SP, { hints: { source: 'manual' } })
+      log = await services.sync.listSyncLog(d())
+      check(
+        'DS7 大轮次全量记录：220 个上传全部入明细（不截断）',
+        log.length === 5 && log[0].ops.length === 220 && log[0].ops.every((o) => o.op === 'upload' && o.added === true) && log[0].opsDropped === undefined,
+        JSON.stringify({ len: log.length, ops: log[0].ops.length, dropped: log[0].opsDropped })
+      )
+      // —— 失败轮：网络切断 → status=error + errors 清单（人话原因）；未成功的上传不入明细
+      await fsp.writeFile(path.join(L, 'f1.txt'), 'ds7-modified')
+      await setNetcut('1')
+      try {
+        await services.sync.syncDirectory(cfg, d(), SP, { hints: { source: 'manual' } })
+      } catch (_) {
+        /* 预期网络类失败轮 */
+      }
+      await setNetcut(null)
+      log = await services.sync.listSyncLog(d())
+      check(
+        'DS7 失败轮入记录（error + 人话原因 + errors 清单）',
+        log.length === 6 && log[0].status === 'error' && !!log[0].error && log[0].errors.length > 0,
+        JSON.stringify({ status: log[0].status, error: log[0].error, errors: log[0].errors })
+      )
+      check('DS7 失败轮没有把未成功的上传记入明细', !log[0].ops.some((o) => o.op === 'upload' && o.rel === 'f1.txt'), JSON.stringify(log[0].ops))
+      // —— 环形上限：store 层直接追加 205 轮（叠加既有 5 条真实记录）→ 恰 200 条
+      const st = await storeModule.openDirStore({ localPath: L, remotePath: '/ds7' })
+      for (let i = 0; i < 205; i++) {
+        st.appendSyncLog({ at: i, endAt: i, trigger: 'interval', status: 'ok', uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, adopted: 0, deferredConflicts: 0, deleteHeld: 0, bytesUp: 0, bytesDown: 0, totalFiles: 0, ops: [], errors: [] })
+      }
+      check('DS7 环形上限：超出 200 轮丢弃最旧', st.listSyncLog().length === 200 && st.listSyncLog()[0].at === 204, String(st.listSyncLog().length))
+      await st.saveSyncLog()
+      // —— 落盘重载：同根重开 → 记录仍完整可读（_load 解析 sync-log.json）
+      await switchDevice(STORAGE_MAIN)
+      log = await services.sync.listSyncLog(d())
+      check('DS7 同步记录跨存储重开持久（磁盘读取）', log.length === 200 && log[0].trigger === 'interval' && log[0].at === 204, JSON.stringify({ len: log.length, first: log[0] && log[0].at }))
+    } finally {
+      await setNetcut(null)
+      await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
   // ============================================================
   // FN 系列（跨平台与配置安全）
   // FN0 NFC 规范化一致性（NFD 服务器名 ↔ NFC 内部 key / origName 落地）
@@ -2305,7 +2499,7 @@ const {
     FN_DB['webdav-sync:data'] = {
       server: { serverUrl: cfg.serverUrl, username: 'u', password: services.secure.sealSecret('sched-pw') },
       dirs: [{ id: 'fn5d', localPath: L2, remotePath: '/fn5d', mode: 'two-way' }],
-      prefs: { autoSync: false, intervalMin: 15, syncOnStartup: false },
+      prefs: { autoSync: false, intervalMin: 15 },
     }
     fs.writeFileSync(path.join(ROOT, '.wdsync-test-captheaders'), 'x')
     const sched = createTestSched()

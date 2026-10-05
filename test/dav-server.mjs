@@ -97,6 +97,13 @@
  *                              用户取消的 ABORTED）；M 为每路径最多切断次数（缺省不限）。
  *                              与 partialput 叠用时半截字节保留；单独使用时中断的 PUT
  *                              不落任何字节（原子服务器 + 网络中断）。
+ *   .wdsync-test-blackhole —— 一切 PUT 的请求头到达后**完全搁置**：不读请求体、不回
+ *                              任何响应，直到客户端自行放弃（socket 空闲超时 destroy →
+ *                              连接 close 才放行）。模拟「对端失联」—— 客户端侧
+ *                              req.on('timeout') → req.destroy(err) 是上传读流错误
+ *                              传播误判（网络故障被包装成本地读失败）的回归触发器
+ *                              （区别于 netcut 的服务端主动断开：那条路客户端本就
+ *                              以请求侧错误收场，触发不了误判）。
  *   .wdsync-test-getfail  —— 内容为路径子串：命中的 GET 一律 404（无重试成本的
  *                              「GET 失败」，用于采纳确认失败回退用例）。
  *
@@ -248,6 +255,8 @@ const netcutSpec = () => {
 }
 /** getfail 档：命中的 GET 一律 404（路径子串匹配） */
 const getfailSubstring = () => flagContent('.wdsync-test-getfail')
+/** blackhole 档：一切 PUT 的请求头到达后完全搁置（不读请求体不响应），等客户端自行放弃 */
+const blackholeOn = () => hasFlag('.wdsync-test-blackhole')
 /** casepair 档：目录列举发现同名文件时额外虚拟列出首字母大小写翻转的孪生条目 */
 const casepairName = () => flagContent('.wdsync-test-casepair')
 // ---- Depth:infinity 单请求扫描标记 ----
@@ -813,6 +822,15 @@ const server = http.createServer(async (req, res) => {
       }
     } else if (req.method === 'PUT') {
       logCapHeaders(req, urlPath)
+      // blackhole 档：完全搁置 —— 不读请求体、不回任何响应，直到客户端自行放弃
+      //（socket 空闲超时 destroy → 连接 close 才放行）。回归触发器见文件头注释
+      if (blackholeOn()) {
+        await new Promise((r) => {
+          if (!res.socket) return r()
+          res.socket.once('close', r)
+        })
+        return
+      }
       // err503 档：一切 PUT 返回 503（无 Retry-After）—— 整轮熔断用例
       if (err503On()) {
         await new Promise((r) => { req.resume(); req.on('end', r) })

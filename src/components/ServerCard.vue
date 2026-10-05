@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
-import { AppButton, InfoTip } from './ui'
+import { AppButton, AppIconButton, InfoTip } from './ui'
 import { useStore, tierLabel, tierHint } from '../composables/store'
 import { fmtRelTime } from '../composables/format'
 import type { DavTier } from '../env.d'
@@ -54,45 +54,66 @@ const tierLegend = computed(() => {
 })
 
 const testing = computed(() => store.state.testing)
+
+/**
+ * 明文 http 警告的显隐：地址是明文 http 且未被当前地址关闭过。关闭（不再显示）
+ * 记录的是关闭时的服务器地址（prefs.insecureHttpDismissedFor，与设置页同一条
+ * 警告共用），之后换成另一个 http 地址会重新提示。
+ */
+const insecureHttpVisible = computed(
+  () => store.insecureHttp.value && store.state.server.serverUrl !== (store.state.prefs.insecureHttpDismissedFor ?? '')
+)
+
+/** 关闭明文 http 警告（不再显示）：记录当前服务器地址作为情境指纹 */
+function dismissInsecureHttp() {
+  store.state.prefs.insecureHttpDismissedFor = store.state.server.serverUrl
+}
 </script>
 
 <template>
-  <section class="card flex items-center gap-3 px-[14px] py-3">
-    <div class="server-info flex-1 min-w-0 flex flex-col gap-1 cursor-pointer" @click="store.state.route = 'settings'">
-      <div class="flex items-center gap-2">
-        <span class="text-[12px] font-semibold text-ink-1">WebDAV 服务器</span>
-        <!-- 档位徽标：悬停展开全部档位与说明（当前档位标注），单独一个词看不出好差边界 -->
-        <InfoTip v-if="tierText" text="">
-          <template #trigger>
-            <span class="tier-chip" :class="store.state.capabilities?.tier">{{ tierText }}</span>
-          </template>
-          <div class="tier-legend">
-            <div v-for="row in tierLegend" :key="row.tier" class="tier-legend-row">
-              <span class="tier-chip" :class="[row.tier, { current: row.current }]">{{ row.label }}</span>
-              <span class="tier-legend-text">{{ row.hint }}<template v-if="row.current">（当前）</template></span>
+  <section class="card flex flex-col gap-1 px-[14px] py-3">
+    <div class="flex items-center gap-3">
+      <div class="server-info flex-1 min-w-0 flex flex-col gap-1 cursor-pointer" @click="store.state.route = 'settings'">
+        <div class="flex items-center gap-2">
+          <span class="text-[12px] font-semibold text-ink-1">WebDAV 服务器</span>
+          <!-- 档位徽标：悬停展开全部档位与说明（当前档位标注），单独一个词看不出好差边界 -->
+          <InfoTip v-if="tierText" text="">
+            <template #trigger>
+              <span class="tier-chip" :class="store.state.capabilities?.tier">{{ tierText }}</span>
+            </template>
+            <div class="tier-legend">
+              <div v-for="row in tierLegend" :key="row.tier" class="tier-legend-row">
+                <span class="tier-chip" :class="[row.tier, { current: row.current }]">{{ row.label }}</span>
+                <span class="tier-legend-text">{{ row.hint }}<template v-if="row.current">（当前）</template></span>
+              </div>
             </div>
-          </div>
-        </InfoTip>
-        <AppIcon name="chevron-right" :size="12" class="chev text-ink-4" />
+          </InfoTip>
+          <AppIcon name="chevron-right" :size="12" class="chev text-ink-4" />
+        </div>
+        <div class="flex items-center gap-[7px] min-w-0">
+          <AppIcon name="globe" :size="13" class="text-ink-4" />
+          <span class="font-mono text-[12px] text-ink-2 truncate">{{ store.state.server.serverUrl || '尚未配置服务器地址' }}</span>
+        </div>
+        <div class="flex items-center gap-[6px]">
+          <span class="dot" :class="store.connStatus.value" />
+          <span class="text-[11px]" :class="store.connStatus.value === 'disconnected' ? 'text-warning' : 'text-ink-2'" :title="tierNoteTitle">{{ metaText }}</span>
+        </div>
       </div>
-      <div class="flex items-center gap-[7px] min-w-0">
-        <AppIcon name="globe" :size="13" class="text-ink-4" />
-        <span class="font-mono text-[12px] text-ink-2 truncate">{{ store.state.server.serverUrl || '尚未配置服务器地址' }}</span>
-      </div>
-      <div class="flex items-center gap-[6px]">
-        <span class="dot" :class="store.connStatus.value" />
-        <span class="text-[11px]" :class="store.connStatus.value === 'disconnected' ? 'text-warning' : 'text-ink-2'" :title="tierNoteTitle">{{ metaText }}</span>
-      </div>
-      <!-- http 明文连接警告：密码与文件内容可被窃听，提醒但不阻止 -->
-      <div v-if="store.insecureHttp.value" class="flex items-center gap-[5px]">
-        <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0" />
-        <span class="text-[11px] text-warning-icon truncate">当前地址以 http 开头，密码和文件在传输时没有加密，可能被他人截获。建议改用 https 开头的地址</span>
-      </div>
+      <AppButton :disabled="testing" @click="store.testConnection()">
+        <AppIcon name="refresh" :size="13" :class="{ spin: testing }" />
+        {{ testing ? '测试中…' : '测试连接' }}
+      </AppButton>
     </div>
-    <AppButton :disabled="testing" @click="store.testConnection()">
-      <AppIcon name="refresh" :size="13" :class="{ spin: testing }" />
-      {{ testing ? '测试中…' : '测试连接' }}
-    </AppButton>
+    <!-- http 明文连接警告：密码与文件内容可被窃听，提醒但不阻止。
+         全宽行放在信息行之外 —— 关闭按钮才能贴到卡片最右侧；
+         关闭（不再显示）记录当时的服务器地址，换成另一个 http 地址后重新提示 -->
+    <div v-if="insecureHttpVisible" class="flex items-center gap-[5px]">
+      <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0" />
+      <span class="flex-1 min-w-0 text-[11px] text-warning-icon truncate">当前地址以 http 开头，密码和文件在传输时没有加密，可能被他人截获。建议改用 https 开头的地址</span>
+      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click.stop="dismissInsecureHttp">
+        <AppIcon name="close" :size="10" />
+      </AppIconButton>
+    </div>
   </section>
 </template>
 

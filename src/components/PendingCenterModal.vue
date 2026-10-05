@@ -13,8 +13,8 @@ import { loadDecisionHistory, decisionActionText, HISTORY_SHOWN, type DecisionHi
  * pendingPanelDirId 通道打开该目录的待处理面板）；下半部是「最近处理记录」
  *（decision-log.json，打开时经 listDecisionLog 拉取各目录日志合并，只读回看
  * 「当时选了什么、影响了多少文件」）。解决「提示分散在各目录行内、找不到入口」。
- * 历史拉取与文案渲染由 composables/decisions 单点维护（决策记录页共用同口径）；
- * 底部入口可跳转决策记录页（待决策 / 部分决策 / 全部历史的完整视图）。
+ * 历史拉取与文案渲染由 composables/decisions 单点维护（同步记录页共用同口径）；
+ * 底部入口可跳转同步记录页（全部同步轮次 / 决策记录的统一时间线视图）。
  */
 const store = useStore()
 
@@ -48,7 +48,7 @@ async function loadHistory() {
   historyLoading.value = false
 }
 
-/** 打开决策记录页（待决策 / 部分决策 / 全部历史的完整视图） */
+/** 打开同步记录页（全部同步轮次 / 决策记录的统一时间线视图） */
 function openDecisionsPage() {
   open.value = false
   store.state.route = 'decisions'
@@ -110,7 +110,7 @@ function openDecisionsPage() {
         </div>
       </div>
       <template #footer>
-        <AppButton size="sm" @click="openDecisionsPage">查看决策记录页</AppButton>
+        <AppButton size="sm" @click="openDecisionsPage">查看同步记录</AppButton>
         <span class="flex-spacer" />
         <AppButton size="sm" @click="open = false">关闭</AppButton>
       </template>

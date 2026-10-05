@@ -151,7 +151,7 @@ const mountScZtools = () => {
     await fsp.rm(sc1lp, { recursive: true, force: true }).catch(() => {})
   })
 
-  // ---- SC2（快，假时钟）：DirSlot 状态机 —— 启动轮 / interval 锚定 / concurrent
+  // ---- SC2（快，假时钟）：DirSlot 状态机 —— 新目录首轮 / interval 锚定 / concurrent
   //      重入置 rerunPending / 取消保持原计划 / reload 新目录 ----
 
   await section('SC2：DirSlot 状态机（假时钟）', async () => {
@@ -162,7 +162,9 @@ const mountScZtools = () => {
     const SC2_LOCAL = await tmpLocal('sc2')
     const sc2dir = { id: 'd1', localPath: SC2_LOCAL, remotePath: '/sc2', mode: 'two-way' }
     await fsp.writeFile(path.join(SC2_LOCAL, 'a.txt'), 'sc2-a')
-    setSCConfig([sc2dir], { autoSync: true, intervalMin: 1, syncOnStartup: true })
+    // 打开插件不立即同步（syncOnStartup 已移除）：初始 0 目录，首个同步轮由
+    // reload 新增 d1 的「新目录首轮」承担
+    setSCConfig([], { autoSync: true, intervalMin: 1 })
     const sched = createTestSched({ now: clock.now, timers: clock.timers })
     const events = []
     sched.subscribe((ev) => events.push(ev))
@@ -172,18 +174,25 @@ const mountScZtools = () => {
       // 选举在 init 后异步完成（真实 IO）：泵动假时钟等待上位，再断言
       const elected = await pumpUntil(clock, () => sched.getSnapshot().leader.isLeader === true, 8000, 8000)
       check(
-        'SC2 init loads config, elects leader (single instance), 1 slot',
-        snap0.ready === true && snap0.slots.length === 1 && elected,
-        JSON.stringify({ ready: snap0.ready, leader: sched.getSnapshot().leader })
+        'SC2 init loads config, elects leader (single instance), no slot yet',
+        snap0.ready === true && snap0.slots.length === 0 && elected,
+        JSON.stringify({ ready: snap0.ready, slots: snap0.slots.length, leader: sched.getSnapshot().leader })
       )
       check('SC2 leader.lock holds this instance token', (await readLeaderLock())?.instanceId === sched.instanceId, '')
+      setSCConfig([sc2dir], { autoSync: true, intervalMin: 1 })
+      const rl0 = await sched.reload()
+      check(
+        'SC2 reload adds d1 (new slot, first round armed)',
+        rl0.applied === true && sched.getSnapshot().slots.length === 1,
+        JSON.stringify({ applied: rl0.applied, slots: sched.getSnapshot().slots.length })
+      )
       // 本节测 DirSlot 状态机（假时钟）：autoSync=true 使 leader 挂了 watcher，而测试
       // 写入 b.txt / c-throttle.bin 会在 1.5s 真实去抖后注入 watch 触发 —— 真实时钟
       // 事件与假时钟断言窗竞态（rerunPending 轮末 +2s 重排按规格清掉 interval 预订，
       // 「取消保持原计划」断言被测试自身的写入污染）。显式摘掉 watcher 使本节完全
       // 由假时钟决定（watcher 集成由 SC3 专测）；watcherId 契约 = `${instanceId}:${dirId}`
       services.fsx.stopWatch(`${sched.instanceId}:d1`)
-      // 启动轮（syncOnStartup）：排队 → running → round-end（uploaded=1）。
+      // 新目录首轮（reload 新增 d1）：排队 → running → round-end（uploaded=1）。
       // 泵只负责把 tick 推到发射（假时钟管调度决策，不驱动真实 IO）；轮体是真实
       // IO（首轮含能力探测，冷缓存实测可达 ~2s）——若靠持续泵假时钟等轮结束，
       // 30000ms fake 上限折算的真实时间不够冷轮跑完，且推进过量会吞掉 interval
@@ -191,14 +200,14 @@ const mountScZtools = () => {
       const startupStarted = await pumpUntil(clock, () => roundEnds().length >= 1 || (sched.getSnapshot().slots[0] && sched.getSnapshot().slots[0].state === 'running'), 15000, 30000)
       const startupOk = startupStarted && (await waitReal(() => roundEnds().length >= 1, 15000))
       check(
-        'SC2 startup round runs and uploads',
+        'SC2 first round of the newly added dir runs and uploads',
         startupOk && roundEnds()[0].error == null && roundEnds()[0].summary && roundEnds()[0].summary.uploaded === 1,
         JSON.stringify(roundEnds()[0] || {})
       )
       let slot = sched.getSnapshot().slots[0]
       const firstDue = slot.nextDueAt
       check(
-        'SC2 interval booked (+60s from load) after startup round',
+        'SC2 interval booked (+60s from reload) after first round',
         slot.state === 'scheduled' && slot.nextDueKind === 'interval' && firstDue != null && firstDue - clock.now() <= 60000 && firstDue - clock.now() > 0,
         `state=${slot.state} dueIn=${firstDue == null ? '-' : firstDue - clock.now()}`
       )
@@ -277,7 +286,7 @@ const mountScZtools = () => {
       const cfgVBefore = sched.getSnapshot().configV
       const rl1 = await sched.reload()
       check('SC2 reload with unchanged config is a no-op', rl1.applied === false && sched.getSnapshot().configV === cfgVBefore, '')
-      setSCConfig([sc2dir, { id: 'd2', localPath: SC2_LOCAL, remotePath: '/sc2b', mode: 'two-way' }], { autoSync: true, intervalMin: 1, syncOnStartup: true })
+      setSCConfig([sc2dir, { id: 'd2', localPath: SC2_LOCAL, remotePath: '/sc2b', mode: 'two-way' }], { autoSync: true, intervalMin: 1 })
       const rl2 = await sched.reload()
       const snapRl = sched.getSnapshot()
       check(
@@ -285,7 +294,7 @@ const mountScZtools = () => {
         rl2.applied === true && snapRl.slots.length === 2 && snapRl.configV !== cfgVBefore,
         JSON.stringify({ applied: rl2.applied, slots: snapRl.slots.length })
       )
-      // 同 SC2 启动轮：泵到 d2 的 startup 轮 running 即止（冷缓存探测轮 ~2s 真实
+      // 同上新目录首轮：泵到 d2 的 startup 轮 running 即止（冷缓存探测轮 ~2s 真实
       // IO），round-end 用真实时钟等，避免 fake 上限折算的真实时间不够
       const d2Started = await pumpUntil(clock, () => {
         if (roundEnds().some((e) => e.dirId === 'd2')) return true
@@ -387,7 +396,7 @@ const mountScZtools = () => {
         // 写入触发文件 → watch 轮撞上 g 冲突 → defer（不转发弹窗）
         await fsp.writeFile(path.join(SC3_LOCAL, 'g-defer.txt'), 'sc3-local-defer')
         await fsp.writeFile(path.join(ROOT, 'sc3', 'g-defer.txt'), 'sc3-remote-defer')
-        setSCConfig([sc3dir], { autoSync: true, intervalMin: 30, syncOnStartup: false })
+        setSCConfig([sc3dir], { autoSync: true, intervalMin: 30 })
         await sched.reload()
         const conflictsBefore = events.filter((e) => e.type === 'conflict').length
         await fsp.writeFile(path.join(SC3_LOCAL, 'trigger.txt'), 'sc3-trigger') // 触发 watcher（1.5s 去抖）
@@ -908,7 +917,7 @@ const mountScZtools = () => {
       await freshStore('sc9a')
       const LP = await tmpLocal('sc9a')
       await fsp.writeFile(path.join(LP, 'g.txt'), 'sc9a-good')
-      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9a', mode: 'two-way' }], { autoSync: true, intervalMin: 1, syncOnStartup: false, leaseLock: false })
+      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9a', mode: 'two-way' }], { autoSync: true, intervalMin: 1, leaseLock: false })
       const clock = makeFakeClock()
       const sched = createTestSched({ now: clock.now, timers: clock.timers })
       const events = []
@@ -1023,7 +1032,7 @@ const mountScZtools = () => {
       await freshStore('sc9a2')
       const LP = await tmpLocal('sc9a2')
       await fsp.writeFile(path.join(LP, 'bad1.txt'), 'sc9a2-bad1') // 故障轮的上传目标（初始无干净轮：无需能力缓存预热？——需要！见下）
-      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9a2', mode: 'two-way' }], { autoSync: true, intervalMin: 1, syncOnStartup: false, leaseLock: false })
+      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9a2', mode: 'two-way' }], { autoSync: true, intervalMin: 1, leaseLock: false })
       const clock = makeFakeClock()
       const sched = createTestSched({ now: clock.now, timers: clock.timers })
       const events = []
@@ -1081,7 +1090,7 @@ const mountScZtools = () => {
       await fsp.writeFile(path.join(LP, 'big.bin'), big)
       // autoSync 必须 true：follow-up 属自动调度轮（tick 的 autoSync 门控）；
       // 假时钟节纪律 —— 选举后显式摘 watcher（本段无受控写入需求）
-      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9b', mode: 'two-way' }], { autoSync: true, intervalMin: 1, syncOnStartup: false, leaseLock: false })
+      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9b', mode: 'two-way' }], { autoSync: true, intervalMin: 1, leaseLock: false })
       const clock = makeFakeClock()
       const sched = createTestSched({ now: clock.now, timers: clock.timers })
       const events = []
@@ -1168,7 +1177,7 @@ const mountScZtools = () => {
       const LP = await tmpLocal('sc9c')
       await fsp.writeFile(path.join(LP, 'a.txt'), 'sc9c-a')
       // autoSync true：yield-retry / 收敛后的 interval 轮都要经 tick 发射；选举后摘 watcher
-      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9c', mode: 'two-way' }], { autoSync: true, intervalMin: 1, syncOnStartup: false })
+      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9c', mode: 'two-way' }], { autoSync: true, intervalMin: 1 })
       const lockPath = path.join(ROOT, 'sc9c', '.webdav-sync.lock')
       const clock = makeFakeClock()
       const sched = createTestSched({ now: clock.now, timers: clock.timers })
@@ -1223,7 +1232,7 @@ const mountScZtools = () => {
       await fsp.writeFile(path.join(LP, 'dedupfail', 'f1.txt'), 'sc9p2-f1')
       await fsp.writeFile(path.join(LP, 't1.toolarge.txt'), 'sc9p2-too-large')
       // autoSync true：backoff-expiry 轮经 tick 发射（自动调度门控）；选举后摘 watcher
-      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9p2', mode: 'two-way' }], { autoSync: true, intervalMin: 1, syncOnStartup: false, leaseLock: false })
+      setSCConfig([{ id: 'd1', localPath: LP, remotePath: '/sc9p2', mode: 'two-way' }], { autoSync: true, intervalMin: 1, leaseLock: false })
       const clock = makeFakeClock()
       const sched = createTestSched({ now: clock.now, timers: clock.timers })
       const events = []
@@ -1295,7 +1304,7 @@ const mountScZtools = () => {
       await fsp.mkdir(path.join(ROOT, 'sc10'), { recursive: true })
       await fsp.writeFile(path.join(ROOT, 'sc10', 'c1.txt'), 'sc10-remote-v1')
       const sc10dir = { id: 'd1', localPath: LP, remotePath: '/sc10', mode: 'two-way' }
-      setSCConfig([sc10dir], { autoSync: true, intervalMin: 1, syncOnStartup: false })
+      setSCConfig([sc10dir], { autoSync: true, intervalMin: 1 })
       const clock = makeFakeClock()
       const sched = createTestSched({ now: clock.now, timers: clock.timers })
       const events = []
@@ -1405,7 +1414,7 @@ const mountScZtools = () => {
     const sameNameRel = 'w2hole' // 用户文件恰与监听目录同名
     await fsp.writeFile(path.join(W10_DIR, sameNameRel), 'w10-v1')
     const w10dir = { id: 'd1', localPath: W10_DIR, remotePath: '/w10', mode: 'two-way' }
-    setSCConfig([w10dir], { autoSync: true, intervalMin: 1, syncOnStartup: false })
+    setSCConfig([w10dir], { autoSync: true, intervalMin: 1 })
     const clock10 = makeFakeClock()
     const sched10 = createTestSched({ now: clock10.now, timers: clock10.timers })
     const ev10 = []
@@ -1456,6 +1465,268 @@ const mountScZtools = () => {
       sched10.cleanup()
       await fsp.rm(W10_BASE, { recursive: true, force: true }).catch(() => {})
       await fsp.rm(path.join(ROOT, 'w10'), { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // ---- SC11（快）：实验「ZTools 插件同步」目录合成 —— 自动发现 / 平台隔离远端 /
+  //      开关与行级暂停 / 同 id 手改条目滤除 ----
+  // 说明：插件目录发现走 ZTOOLS_DATA_ROOT 环境变量（与宿主 appDataPaths 同序）。
+  // 该变量是进程级的，本节设置并在 finally 恢复 —— 绝不读到真实 ~/.ztools
+  //（开发机存在装有插件的真目录，误同步会污染真实数据）。
+
+  await section('SC11：实验 ZTools 插件同步（loadConfig 合成 + 端到端轮）', async () => {
+    mountScZtools() // 幂等：fast/slow 过滤下 SC1 可能未运行
+    const prevEnv = process.env.ZTOOLS_DATA_ROOT
+    const ZT_ROOT = path.join(os.tmpdir(), `wdsync-e2e-sc11-ztroot-${Date.now()}`)
+    const PLUGINS = path.join(ZT_ROOT, 'plugins')
+    const sc11Sched = createTestSched()
+    let ud11 = null
+    try {
+      // 模拟真实插件目录形态：目录插件与 asar 插件混放
+      await fsp.mkdir(path.join(PLUGINS, 'plugin-a'), { recursive: true })
+      await fsp.writeFile(path.join(PLUGINS, 'plugin-a', 'plugin.json'), '{"name":"plugin-a"}')
+      await fsp.writeFile(path.join(PLUGINS, 'demo-b-0.1.0-ab12cd34.asar'), 'fake-asar-body')
+      process.env.ZTOOLS_DATA_ROOT = ZT_ROOT
+
+      // ① 公共 describe 入口：id 契约 + 自动发现 + 平台隔离远端
+      const desc = services.ztoolsPlugins.describe()
+      const platformKey = { darwin: 'mac', win32: 'windows', linux: 'linux' }[process.platform] || process.platform
+      check(
+        'SC11 describe discovers plugins dir and platform-isolated remote path',
+        desc.id === 'ztools-plugins' && desc.pluginsDir === PLUGINS && desc.available === true && desc.remotePath === `/ztools-plugins/${platformKey}` && desc.platformKey === platformKey,
+        JSON.stringify({ id: desc.id, pluginsDir: desc.pluginsDir, remotePath: desc.remotePath, available: desc.available })
+      )
+
+      // ② 开关关闭（缺省）：不合成虚拟目录
+      await freshStore('sc11')
+      ud11 = await tmpLocal('sc11')
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: false })
+      await sc11Sched.init()
+      await sc11Sched.reload()
+      check('SC11 toggle off synthesizes no plugin slot', !sc11Sched.getSnapshot().slots.some((s) => s.id === 'ztools-plugins'), JSON.stringify(sc11Sched.getSnapshot().slots.map((s) => s.id)))
+
+      // ③ 开关开启：合成 slot 与用户目录并存（固定 id）。autoSync 打开使
+      // dirEligible 成立 —— 下方「只排 interval、无 startup 轮」的断言才有意义
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: true, autoSync: true })
+      await sc11Sched.reload()
+      const ids11 = sc11Sched.getSnapshot().slots.map((s) => s.id)
+      check('SC11 toggle on synthesizes fixed-id plugin slot alongside user dirs', ids11.includes('ztools-plugins') && ids11.includes('ud1') && ids11.length === 2, JSON.stringify(ids11))
+      // ③b 开启瞬间不立即同步：新 slot 不设 startup 标记，首轮只排到下一个
+      // interval 时间点（setSCConfig 缺省 intervalMin=15 → 预订应在 ~15min 后）
+      const plug11 = sc11Sched.getSnapshot().slots.find((s) => s.id === 'ztools-plugins')
+      check(
+        'SC11 toggle-on books the first round at the next interval point (no immediate sync)',
+        plug11 && plug11.state === 'scheduled' && plug11.nextDueKind === 'interval' && plug11.nextDueAt != null && plug11.nextDueAt - Date.now() > 14 * 60000,
+        JSON.stringify(plug11 ? { state: plug11.state, kind: plug11.nextDueKind, dueInMin: plug11.nextDueAt == null ? null : Math.round((plug11.nextDueAt - Date.now()) / 60000) } : null)
+      )
+
+      // ④ 端到端一轮：插件目录（自动发现）→ 平台隔离远端；目录插件与 asar 文件都上传
+      await waitReal(() => sc11Sched.getSnapshot().leader.isLeader === true, 5000)
+      // leader 上位后也无 startup 轮：真实等待窗内 slot 保持 scheduled（旧实现会在
+      // tick ≤1s 内把 startup 轮入队 → queued/running）
+      await new Promise((r) => setTimeout(r, 2200))
+      const plugQuiet11 = sc11Sched.getSnapshot().slots.find((s) => s.id === 'ztools-plugins')
+      check(
+        'SC11 no round fires right after toggle-on even with leader elected (waits for the booked point)',
+        plugQuiet11 && plugQuiet11.state === 'scheduled',
+        JSON.stringify(plugQuiet11 ? { state: plugQuiet11.state, kind: plugQuiet11.nextDueKind } : null)
+      )
+      const r11 = await sc11Sched.syncNow('ztools-plugins')
+      const remoteBase11 = path.join(ROOT, 'ztools-plugins', platformKey)
+      check(
+        'SC11 plugin round uploads dir plugin + asar artifact to platform-isolated remote',
+        r11.ok === true && r11.summary && r11.summary.uploaded === 2 && fs.existsSync(path.join(remoteBase11, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11, 'demo-b-0.1.0-ab12cd34.asar')),
+        JSON.stringify(r11.ok ? r11.summary : r11.error)
+      )
+
+      // ④b 云端存储位置可配置：prefs 指定父目录 → 合成项远端 = <父目录>/ztools-plugins/<平台>。
+      // remotePath 变化 → 基线随键更换 → 首轮把本机插件重新上传到新位置（旧位置不动）
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: true, autoSync: true, ztoolsPluginSyncRemoteDir: '/sc11-custom' })
+      await sc11Sched.reload()
+      const r11b = await sc11Sched.syncNow('ztools-plugins')
+      const remoteBase11b = path.join(ROOT, 'sc11-custom', 'ztools-plugins', platformKey)
+      check(
+        'SC11 custom cloud folder composes <chosen>/ztools-plugins/<platform> and re-uploads there',
+        r11b.ok === true && r11b.summary && r11b.summary.uploaded === 2 && fs.existsSync(path.join(remoteBase11b, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11b, 'demo-b-0.1.0-ab12cd34.asar')),
+        JSON.stringify(r11b.ok ? r11b.summary : r11b.error)
+      )
+
+      // ⑤ 行级暂停（ztoolsPluginSyncPaused → enabled=false）：全量手动同步不含该目录
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: true, ztoolsPluginSyncPaused: true })
+      await sc11Sched.reload()
+      const all11 = await sc11Sched.syncNow()
+      check(
+        'SC11 paused plugin slot is skipped by sync-all (maps to enabled=false)',
+        all11.ok === true && all11.perDir.length === 1 && all11.perDir[0].dirId === 'ud1',
+        JSON.stringify(all11.perDir)
+      )
+
+      // ⑥ 手改同 id 条目被滤除：固定 id 由合成项独占，防止 slot 撞 id
+      setSCConfig([{ id: 'ztools-plugins', localPath: path.join(ZT_ROOT, 'rogue'), remotePath: '/sc11-rogue', mode: 'two-way' }], { ztoolsPluginSync: false })
+      await sc11Sched.reload()
+      check('SC11 rogue user entry with the reserved id is dropped', sc11Sched.getSnapshot().slots.length === 0, JSON.stringify(sc11Sched.getSnapshot().slots.map((s) => s.id)))
+    } finally {
+      sc11Sched.cleanup()
+      if (prevEnv === undefined) delete process.env.ZTOOLS_DATA_ROOT
+      else process.env.ZTOOLS_DATA_ROOT = prevEnv
+      await fsp.rm(ZT_ROOT, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'ztools-plugins'), { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'sc11-custom'), { recursive: true, force: true }).catch(() => {})
+      if (ud11) await fsp.rm(ud11, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // ============================================================
+  // SC12：目录级覆盖 —— 单个同步文件夹单独设置全部高级项与自动同步。
+  //   ① 记录型引擎包装捕获取 down 的 cfg / prefs：目录级 overrides（并发 / 限速 /
+  //      租约锁 / 深度校验 / 排除规则 / 冲突 / 隐藏）整体替换全局对应项，
+  //      限速经 cfg.netOpts.ratePerSec 注入；
+  //   ② 目录级 autoSync=false：不排 interval、tick 清预订、watcher 摘除；
+  //   ③ 自动同步关的目录手动 syncNow 仍可用，文件变化不触发自动轮；
+  //   ④ 重新开启 → 按目录级 interval 重新预订；
+  //   ⑤ 全局 autoSync=false 时目录级 true 覆盖生效（未覆盖目录仍不排程）。
+  // ============================================================
+  await section('SC12：目录级覆盖（全部高级项 + 目录级自动同步）', async () => {
+    mountScZtools()
+    await freshStore('sc12')
+    const clock = makeFakeClock()
+    const SC12_LOCAL = await tmpLocal('sc12')
+    const SC12_LOCAL2 = await tmpLocal('sc12b')
+    await fsp.writeFile(path.join(SC12_LOCAL, 'a.txt'), 'sc12-a')
+
+    // 记录型引擎包装：捕获调度器下发的 cfg / dir / prefs（轮体委托真实引擎执行）；
+    // watcher 注册 / 摘除同步记账（目录级自动同步门控的观测面）
+    const seen = []
+    const watchRegs = []
+    const watchStops = []
+    const sched = createTestSched({
+      engine: {
+        syncDirectory: async (c, d, p, h) => {
+          seen.push({ cfg: c, dir: d, prefs: p })
+          return services.sync.syncDirectory(c, d, p, h)
+        },
+        watchDir: (id, lp, cb) => {
+          watchRegs.push(id)
+          return services.fsx.watchDir(id, lp, cb)
+        },
+        stopWatch: (id) => {
+          watchStops.push(id)
+          return services.fsx.stopWatch(id)
+        },
+        stopAllWatch: services.fsx.stopAllWatch,
+        listPendingConflicts: services.sync.listPendingConflicts,
+      },
+      now: clock.now,
+      timers: clock.timers,
+    })
+    const events = []
+    sched.subscribe((ev) => events.push(ev))
+    const roundEnds = () => events.filter((e) => e.type === 'round-end')
+    const watcherId = `${sched.instanceId}:d1`
+    const overrides = {
+      autoSync: true,
+      intervalMin: 30,
+      conflictStrategy: 'local',
+      ignoreHidden: false,
+      concurrency: 6,
+      ratePerSec: 9,
+      leaseLock: false,
+      deepVerify: true,
+      excludePatterns: ['*.iso'],
+    }
+    // 全局：并发 4 / 租约锁开 / 深度校验关 / 另一套排除规则 —— 目录级覆盖应整体替换
+    setSCConfig([{ id: 'd1', localPath: SC12_LOCAL, remotePath: '/sc12', mode: 'two-way', overrides }], {
+      autoSync: true,
+      intervalMin: 1,
+      concurrency: 4,
+      leaseLock: true,
+      deepVerify: false,
+      excludePatterns: ['*.tmp'],
+    })
+    try {
+      await sched.init()
+      const elected = await waitReal(() => sched.getSnapshot().leader.isLeader === true, 8000)
+      check('SC12 leader elected for override tests', elected, '')
+
+      // ① 目录级覆盖下发引擎：prefs 各项取 overrides 值；限速经 cfg.netOpts 注入
+      const r1 = await sched.syncNow('d1')
+      check('SC12 manual round on override dir completes', r1.ok === true && r1.summary && r1.summary.uploaded === 1, JSON.stringify(r1.ok ? r1.summary : r1.error))
+      const first = seen[seen.length - 1]
+      check(
+        'SC12 per-dir overrides reach the engine (concurrency/leaseLock/deepVerify/exclude/conflict/ignoreHidden)',
+        !!first &&
+          first.prefs.concurrency === 6 &&
+          first.prefs.leaseLock === false &&
+          first.prefs.deepVerify === true &&
+          JSON.stringify(first.prefs.excludePatterns) === JSON.stringify(['*.iso']) &&
+          first.prefs.conflictStrategy === 'local' &&
+          first.prefs.ignoreHidden === false,
+        JSON.stringify(first && first.prefs)
+      )
+      check(
+        'SC12 per-dir ratePerSec injected via cfg.netOpts (explicit value wins over profile/global layering)',
+        !!first && first.cfg && first.cfg.netOpts && first.cfg.netOpts.ratePerSec === 9,
+        JSON.stringify(first && first.cfg)
+      )
+      check('SC12 watcher registered for auto-sync dir', watchRegs.includes(watcherId), JSON.stringify({ watchRegs, watchStops }))
+
+      // ② 目录级 autoSync=false：预订被清（tick 清理）、watcher 摘除
+      setSCConfig([{ id: 'd1', localPath: SC12_LOCAL, remotePath: '/sc12', mode: 'two-way', overrides: { ...overrides, autoSync: false } }], {
+        autoSync: true,
+        intervalMin: 1,
+      })
+      await sched.reload()
+      const cleared = await pumpUntil(clock, () => {
+        const s = sched.getSnapshot().slots.find((x) => x.id === 'd1')
+        return s && s.state === 'idle' && s.nextDueAt == null
+      }, 8000, 5000)
+      const slotOff = sched.getSnapshot().slots.find((x) => x.id === 'd1')
+      check(
+        'SC12 per-dir autoSync=false clears the booked auto schedule',
+        cleared && slotOff.state === 'idle' && slotOff.nextDueAt == null && slotOff.nextDueKind == null,
+        JSON.stringify(slotOff && { state: slotOff.state, due: slotOff.nextDueAt, kind: slotOff.nextDueKind })
+      )
+      check('SC12 watcher stopped for per-dir autoSync=false', watchStops.includes(watcherId), JSON.stringify(watchStops))
+
+      // ③ 自动同步关的目录：文件变化不触发自动轮；手动同步仍可用
+      const roundsBefore = roundEnds().length
+      await fsp.writeFile(path.join(SC12_LOCAL, 'b.txt'), 'sc12-b')
+      await sleep(2600) // 引擎 watcher 去抖 1.5s：若 watcher 未摘除，此处必然出现 watch 轮
+      check('SC12 no auto round fires for per-dir autoSync=false after file change', roundEnds().length === roundsBefore, `rounds=${roundEnds().length}/${roundsBefore}`)
+      const r3 = await sched.syncNow('d1')
+      check('SC12 manual syncNow still works with per-dir autoSync=false', r3.ok === true && r3.summary && r3.summary.uploaded === 1, JSON.stringify(r3.ok ? r3.summary : r3.error))
+
+      // ④ 重新开启目录级自动同步：按目录级 interval（30min）重新预订，无 startup 轮
+      setSCConfig([{ id: 'd1', localPath: SC12_LOCAL, remotePath: '/sc12', mode: 'two-way', overrides }], { autoSync: true, intervalMin: 1 })
+      await sched.reload()
+      const slotBack = sched.getSnapshot().slots.find((x) => x.id === 'd1')
+      check(
+        'SC12 re-enabled per-dir autoSync rebooks the interval at the dir-level cadence',
+        slotBack && slotBack.state === 'scheduled' && slotBack.nextDueKind === 'interval' && slotBack.nextDueAt != null && Math.abs(slotBack.nextDueAt - (Date.now() + 30 * 60000)) < 60000,
+        JSON.stringify(slotBack && { state: slotBack.state, kind: slotBack.nextDueKind, dueInMin: slotBack.nextDueAt == null ? null : Math.round((slotBack.nextDueAt - clock.now()) / 60000) })
+      )
+
+      // ⑤ 全局 autoSync=false：目录级 true 覆盖生效；未覆盖目录不排程
+      setSCConfig(
+        [
+          { id: 'd1', localPath: SC12_LOCAL, remotePath: '/sc12', mode: 'two-way', overrides },
+          { id: 'd2', localPath: SC12_LOCAL2, remotePath: '/sc12b', mode: 'two-way' },
+        ],
+        { autoSync: false, intervalMin: 1 }
+      )
+      await sched.reload()
+      const d1 = sched.getSnapshot().slots.find((x) => x.id === 'd1')
+      const d2 = sched.getSnapshot().slots.find((x) => x.id === 'd2')
+      check(
+        'SC12 per-dir autoSync=true overrides a globally off autoSync (dir scheduled, uncovered dir stays idle)',
+        d1 && d2 && d1.state === 'scheduled' && d1.nextDueKind === 'interval' && d1.nextDueAt != null && d2.state === 'idle' && d2.nextDueAt == null,
+        JSON.stringify({ d1: d1 && { state: d1.state, kind: d1.nextDueKind }, d2: d2 && { state: d2.state, kind: d2.nextDueKind } })
+      )
+    } finally {
+      sched.cleanup()
+      await fsp.rm(SC12_LOCAL, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(SC12_LOCAL2, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'sc12'), { recursive: true, force: true }).catch(() => {})
     }
   })
 

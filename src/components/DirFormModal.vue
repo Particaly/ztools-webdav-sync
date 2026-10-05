@@ -4,15 +4,17 @@ import AppIcon from './AppIcon.vue'
 import RemoteDirModal from './RemoteDirModal.vue'
 import { AppButton, AppInput, AppModal, AppSegmented, AppSelect, AppSwitch, InfoTip } from './ui'
 import { useStore, suggestRemote } from '../composables/store'
-import { intervalOptions, strategyOptions } from '../composables/options'
+import { concurrencyOptions, intervalOptions, strategyOptions } from '../composables/options'
 import { toast } from '../composables/toast'
 import type { DirOverrides, Prefs, SyncDir, SyncMode } from '../env.d'
 
 /**
  * 同步目录「创建 / 修改」共用弹窗：传入 dir 为修改模式，不传为创建模式，仅标题不同。
  * 基础字段：本地目录 / WebDAV 目录 / 同步方式；「高级设置」默认收起，
- * 内含「覆盖全局设置」开关与冲突处理 / 忽略隐藏文件 / 同步间隔三项：
- * 未开启覆盖时三项只读展示全局当前值，开启后可单独编辑并随保存写入目录级覆盖。
+ * 内含「单独设置这个文件夹」开关与全部可覆盖项（是否自动同步 / 检查频率 /
+ * 冲突处理 / 忽略隐藏文件 / 并发传输数 / 请求频率限制 / 多设备互斥同步 /
+ * 深度校验 / 排除规则）：未开启覆盖时各项只读展示全局当前值，开启后可单独
+ * 编辑并随保存整体写入目录级覆盖（关闭覆盖 = 整体恢复跟随全局，不做逐字段回退）。
  * 所有值先暂存在本地 ref，点击主按钮才提交；关闭（取消 / 遮罩 / 右上角）即丢弃未保存修改。
  * 通过 Teleport 挂到 body：DirRow 位于 relative 列表容器内，
  * 直接渲染会让 AppModal 的 absolute 遮罩被限制在列表卡片里。
@@ -28,24 +30,53 @@ const isEdit = computed(() => !!props.dir)
 
 // ---------- 表单暂存值 ----------
 
+/** 目录级覆盖的合法键（overrideOn 判定与 initForm 取值共用） */
+const OVERRIDE_KEYS = [
+  'autoSync',
+  'intervalMin',
+  'conflictStrategy',
+  'ignoreHidden',
+  'concurrency',
+  'ratePerSec',
+  'leaseLock',
+  'deepVerify',
+  'excludePatterns',
+] as const
+
 const localPath = ref('')
 const remotePath = ref('')
 const mode = ref<SyncMode>('two-way')
 /** 高级设置折叠区展开状态：默认收起 */
 const advancedOpen = ref(false)
-/** 「覆盖全局设置」开关：关闭时三项只读跟随全局，开启后可单独编辑 */
+/** 「单独设置这个文件夹」开关：关闭时各项只读跟随全局，开启后可单独编辑 */
 const overrideOn = ref(false)
+// 打开时由 initForm 按覆盖值 ?? 全局当前值重设；此处初值仅占位
+const autoSync = ref(true)
 const conflictStrategy = ref<Prefs['conflictStrategy']>('ask')
 const ignoreHidden = ref(true)
-const intervalMin = ref(15)
+const intervalMin = ref(60)
+const concurrency = ref(4)
+/** 每秒请求上限（字符串形态承载「空 = 跟随全局」：空串保存时不写入该键） */
+const ratePerSec = ref('')
+const leaseLock = ref(true)
+const deepVerify = ref(false)
+/** 排除规则 textarea 逐行编辑（与设置页同口径：空行丢弃、上限 200 条） */
+const excludeText = ref('')
 const localError = ref('')
 const remoteError = ref('')
 const showRemotePicker = ref(false)
 
+/** 全局生效的每秒请求上限（显式值；未设置显示空 —— 分层口径下档案默认仍可能生效） */
+const globalRatePerSec = computed(() => {
+  const v = store.state.server.netOpts?.ratePerSec
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
+})
+
 /** 每次打开时按当前模式初始化表单：创建取全局默认，修改取目录当前生效值（覆盖 ?? 全局） */
 function initForm() {
   const o = props.dir?.overrides
-  overrideOn.value = !!o && (o.conflictStrategy !== undefined || o.ignoreHidden !== undefined || o.intervalMin !== undefined)
+  overrideOn.value =
+    !!o && OVERRIDE_KEYS.some((k) => (o as Record<string, unknown>)[k] !== undefined)
   if (props.dir) {
     localPath.value = props.dir.localPath
     remotePath.value = props.dir.remotePath
@@ -55,10 +86,17 @@ function initForm() {
     remotePath.value = prefs.defaultRemoteDir
     mode.value = 'two-way'
   }
-  // 三项展示值：有目录级覆盖取覆盖值，否则展示全局当前值（未开启覆盖时为只读预览）
+  // 各项展示值：有目录级覆盖取覆盖值，否则展示全局当前值（未开启覆盖时为只读预览）
+  autoSync.value = (overrideOn.value ? o?.autoSync : undefined) ?? prefs.autoSync
   conflictStrategy.value = (overrideOn.value ? o?.conflictStrategy : undefined) ?? prefs.conflictStrategy
   ignoreHidden.value = (overrideOn.value ? o?.ignoreHidden : undefined) ?? prefs.ignoreHidden
   intervalMin.value = (overrideOn.value ? o?.intervalMin : undefined) ?? prefs.intervalMin
+  concurrency.value = (overrideOn.value ? o?.concurrency : undefined) ?? prefs.concurrency
+  const rateVal = (overrideOn.value ? o?.ratePerSec : undefined) ?? store.state.server.netOpts?.ratePerSec
+  ratePerSec.value = typeof rateVal === 'number' && Number.isFinite(rateVal) ? String(rateVal) : ''
+  leaseLock.value = (overrideOn.value ? o?.leaseLock : undefined) ?? prefs.leaseLock !== false
+  deepVerify.value = (overrideOn.value ? o?.deepVerify : undefined) ?? prefs.deepVerify === true
+  excludeText.value = ((overrideOn.value ? o?.excludePatterns : undefined) ?? prefs.excludePatterns ?? []).join('\n')
   advancedOpen.value = false
   localError.value = ''
 }
@@ -120,10 +158,38 @@ function onAdvAfterLeave(el: Element) {
 
 // ---------- 提交 ----------
 
-/** 当前表单对应的目录级覆盖：未开启覆盖为 null（跟随全局）；开启时三项全部按当前值单独保存 */
+/** 排除规则 textarea → 数组（与设置页同口径：去首尾空白、空行丢弃、上限 200 条） */
+function excludeLines(): string[] {
+  return String(excludeText.value ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 200)
+}
+
+/**
+ * 当前表单对应的目录级覆盖：未开启覆盖为 null（全部跟随全局）；开启时全部字段
+ * 按当前值整体写入（关闭覆盖 = 恢复跟随全局，不做逐字段回退）。
+ * 限速留空 = 不写入该键（跟随全局的分层口径：全局显式值 > 档案默认 > 不限制）。
+ */
 function currentOverrides(): DirOverrides | null {
   if (!overrideOn.value) return null
-  return { conflictStrategy: conflictStrategy.value, ignoreHidden: ignoreHidden.value, intervalMin: intervalMin.value }
+  const out: DirOverrides = {
+    autoSync: autoSync.value,
+    intervalMin: intervalMin.value,
+    conflictStrategy: conflictStrategy.value,
+    ignoreHidden: ignoreHidden.value,
+    concurrency: concurrency.value,
+    leaseLock: leaseLock.value,
+    deepVerify: deepVerify.value,
+    excludePatterns: excludeLines(),
+  }
+  const rateRaw = String(ratePerSec.value ?? '').trim()
+  if (rateRaw !== '') {
+    const n = Number(rateRaw)
+    if (Number.isFinite(n) && n >= 0 && n <= 100) out.ratePerSec = n
+  }
+  return out
 }
 
 function close() {
@@ -256,15 +322,34 @@ function browseRemote() {
               @after-leave="onAdvAfterLeave"
             >
               <div v-show="advancedOpen" class="flex flex-col gap-[6px]">
-                <!-- 「单独设置这个文件夹」开关：位于冲突处理上方，说明同时涵盖开 / 关两种状态 -->
+                <!-- 「单独设置这个文件夹」开关：位于首行，说明同时涵盖开 / 关两种状态 -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">单独设置这个文件夹</span>
-                    <InfoTip text="开启后，以下选项仅对此目录生效；关闭时跟随「设置」中的全局选项" />
+                    <InfoTip text="开启后，以下选项仅对此文件夹生效；关闭时全部跟随「设置」里的全局选项" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="overrideOn" />
                 </div>
+                <!-- 是否自动同步：目录级开关，关闭后只手动同步（不影响「暂停同步」的整体停用） -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">自动同步</span>
+                    <InfoTip text="关闭后这个文件夹不再自动同步，只在点「立即同步」或菜单里的单向同步时执行" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppSwitch v-model="autoSync" :disabled="!overrideOn" />
+                </div>
+                <!-- 检查频率（同步频率）：自动同步的轮询间隔 -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">检查频率</span>
+                    <InfoTip text="自动同步开启时，检查这个文件夹变更的时间间隔" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppSelect v-model="intervalMin" :options="intervalOptions" :width="104" :disabled="!overrideOn" />
+                </div>
+                <!-- 冲突处理 -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">冲突处理</span>
@@ -273,6 +358,7 @@ function browseRemote() {
                   <span class="flex-spacer" />
                   <AppSelect v-model="conflictStrategy" :options="strategyOptions" :width="104" :disabled="!overrideOn" />
                 </div>
+                <!-- 忽略隐藏文件 -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">忽略隐藏文件</span>
@@ -281,13 +367,63 @@ function browseRemote() {
                   <span class="flex-spacer" />
                   <AppSwitch v-model="ignoreHidden" :disabled="!overrideOn" />
                 </div>
-                <div class="flex items-center gap-3 pt-[4px] mb-[2px]">
+                <!-- 并发传输数 -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">检查频率</span>
-                    <InfoTip text="此目录独立的轮询间隔（覆盖全局设置）" />
+                    <span class="text-[12px] font-medium text-ink-1">并发传输数</span>
+                    <InfoTip text="同时上传 / 下载的文件数量上限；值越大同步越快，过高可能触发服务器限流" />
                   </div>
                   <span class="flex-spacer" />
-                  <AppSelect v-model="intervalMin" :options="intervalOptions" :width="104" :disabled="!overrideOn" />
+                  <AppSelect v-model="concurrency" :options="concurrencyOptions" :width="104" :disabled="!overrideOn" />
+                </div>
+                <!-- 请求频率限制：留空 = 跟随全局（占位展示全局显式值）；0 = 明确不限速 -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">请求频率限制</span>
+                    <InfoTip text="每秒向服务器发起的最大请求数；留空跟随全局设置，0 表示不限制" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppInput
+                    v-model="ratePerSec"
+                    sm
+                    type="number"
+                    class="rate-input !w-[104px]"
+                    :disabled="!overrideOn"
+                    :placeholder="globalRatePerSec || '0'"
+                  />
+                </div>
+                <!-- 多设备互斥同步（目录租约锁） -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">多设备互斥同步</span>
+                    <InfoTip text="每轮同步前先获取云端目录锁，同一时刻只允许一台设备同步，避免多设备并发写入互相覆盖；每次同步约增加 1~2 秒开销" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppSwitch v-model="leaseLock" :disabled="!overrideOn" />
+                </div>
+                <!-- 深度校验（默认关） -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">深度校验</span>
+                    <InfoTip text="定期重新计算本地文件的内容校验值（hash）并与基线比对，可发现大小与修改时间均未变化的改动；文件较多时耗时与磁盘读取开销显著，默认关闭" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppSwitch v-model="deepVerify" :disabled="!overrideOn" />
+                </div>
+                <!-- 排除规则：逐行 glob；内置 OS 垃圾规则不可关闭 -->
+                <div class="flex flex-col gap-[6px] pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px]">
+                    <span class="text-[12px] font-medium text-ink-1">排除规则</span>
+                    <InfoTip text="每行一条通配规则（glob），匹配的文件或目录不参与同步，如 *.iso、node_modules/；内置的系统临时文件规则始终生效" />
+                  </div>
+                  <textarea
+                    v-model="excludeText"
+                    rows="2"
+                    spellcheck="false"
+                    class="exclude-input font-mono"
+                    :disabled="!overrideOn"
+                    placeholder="每行一条，如 *.iso&#10;node_modules/"
+                  />
                 </div>
               </div>
             </Transition>
@@ -366,5 +502,50 @@ function browseRemote() {
   font-size: 10px;
   font-weight: 500;
   color: var(--blue);
+}
+
+/* 请求频率限制输入：禁用（跟随全局）时整体置灰 —— AppInput 的 disabled 透传到
+   内部 input，外层用 :has 感知后降透明度保持视觉一致 */
+.rate-input {
+  transition: opacity 0.15s ease;
+
+  &:has(input:disabled) {
+    opacity: 0.55;
+  }
+}
+
+/* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌同款），等宽字体便于编辑 glob */
+.exclude-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 48px;
+  padding: 6px 9px;
+  border: 1px solid var(--br-input);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--text-1);
+  font-size: 11px;
+  line-height: 1.6;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+
+  &::placeholder {
+    color: var(--text-muted);
+  }
+
+  &:hover:not(:disabled) {
+    border-color: #c9d0d7;
+  }
+
+  &:focus:not(:disabled) {
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.12);
+  }
+
+  &:disabled {
+    cursor: default;
+    background: var(--bg-track);
+    color: var(--text-muted);
+  }
 }
 </style>

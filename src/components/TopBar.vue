@@ -25,8 +25,8 @@ const statusText = computed(() =>
       </div>
     </div>
     <span class="flex-spacer" />
-    <!-- 决策记录入口：有待决策事项时图标角标红点提示 -->
-    <AppIconButton title="决策记录" variant="ghost" class="text-icon-dark dec-entry" @click="store.state.route = 'decisions'">
+    <!-- 同步记录入口：有待处理事项时图标角标红点提示（事项本身经待处理中心处理） -->
+    <AppIconButton title="同步记录" variant="ghost" class="text-icon-dark dec-entry" @click="store.state.route = 'decisions'">
       <AppIcon name="history" :size="15" />
       <span v-if="store.pendingConflictTotal.value > 0" class="badge-dot" />
     </AppIconButton>
@@ -98,7 +98,7 @@ const statusText = computed(() =>
   }
 }
 
-/* 决策记录入口的待决策角标：图标右上角红点（描白边避免与图标粘连） */
+/* 同步记录入口的待处理角标：图标右上角红点（描白边避免与图标粘连） */
 .dec-entry {
   position: relative;
 

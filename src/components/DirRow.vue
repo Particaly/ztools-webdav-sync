@@ -4,12 +4,21 @@ import AppIcon from './AppIcon.vue'
 import DirFormModal from './DirFormModal.vue'
 import PendingConflictsModal from './PendingConflictsModal.vue'
 import { AppDropdown, AppIconButton } from './ui'
-import { useStore, dirRootLostOpen } from '../composables/store'
+import { useStore, dirRootLostOpen, dirPendingSignal, isPluginSyncDir } from '../composables/store'
 import { fmtBytes, fmtRelTime } from '../composables/format'
 import type { SyncDir } from '../env.d'
 
 const props = defineProps<{ dir: SyncDir }>()
 const store = useStore()
+
+/**
+ * 【实验：ZTools 插件同步】虚拟行：本地目录由 ZTools 自动发现（不可修改）、
+ * 远端目录按平台隔离。菜单与提示条据此特化 —— 「同步设置」不出现（无配置可
+ * 改），「移除同步」换成「关闭插件同步」（等价于关掉设置里的实验开关）。
+ */
+const isPlugin = computed(() => isPluginSyncDir(props.dir))
+/** 插件目录是否可用（自动发现结果；缺失时行内提示条说明，等待 ZTools 创建） */
+const pluginAvailable = computed(() => props.dir.pluginSyncInfo?.available !== false)
 
 /** 目录进度载荷（SyncDir.progress 的非空形态，本组件的折算与文案输入） */
 type DirProgress = NonNullable<SyncDir['progress']>
@@ -92,6 +101,8 @@ const bytesText = computed(() => {
 
 const enabled = computed(() => store.dirEnabled(props.dir))
 const syncing = computed(() => props.dir.status === 'syncing')
+/** 目录生效的自动同步开关（目录级覆盖优先）：关闭后空闲态展示「等待手动同步」而不是「等待同步」 */
+const autoOn = computed(() => store.dirAutoSyncOn(props.dir))
 
 /** 未处理（无 choice）的挂起数：冲突（后台轮 defer）+ 删除确认（批量超阈值），面板统一处理；
  *  根丢失决策（kind='root-lost'）是独立的目录级决策，由专门提示条承载，不计入这里 */
@@ -105,6 +116,30 @@ const pendingOpen = computed(
 const pendingDeleteOpen = computed(() => props.dir.deleteBatch?.undecided ?? 0)
 /** 未决策的「云端文件夹丢失」挂起：同步已暂停（零删除零传输），展示专门提示条 */
 const rootLostOpen = computed(() => dirRootLostOpen(props.dir))
+
+// ---------- 长时间展示的黄色提示条：「不再显示」关闭入口 ----------
+// 关闭状态持久化（prefs / 目录字段），且大多记录关闭时的情境指纹 —— 情境变化
+// （状态改变 / 有新挂起）自动重新提示，保证「不再显示当前这条」而不是「永久失明」。
+
+/** demo/兼容冲突提示条的会话内关闭（真实同步从不产生该状态，无需持久化） */
+const conflictStripClosed = ref(false)
+/** 插件目录未发现提示条：用户关闭后不再显示（目录出现后提示条本就会消失） */
+const pluginUnavailableVisible = computed(() => isPlugin.value && !pluginAvailable.value && !store.state.prefs.pluginUnavailableDismissed)
+/** 注册表对账降级状态（undefined = 正常；提示条显隐与关闭标记的情境指纹） */
+const registrySyncState = computed(() => (isPlugin.value && pluginAvailable.value ? props.dir.pluginSyncInfo?.registrySync : undefined))
+/** 注册表降级提示条：状态与关闭时记录的一致则不再显示（状态变化后重新提示） */
+const registrySyncStripVisible = computed(
+  () => !!registrySyncState.value && (store.state.prefs.registrySyncDismissed ?? '') !== registrySyncState.value
+)
+/** 待处理挂起条：关闭时记下待处理信号，出现更新的挂起（信号变大）时重新显示 */
+const pendingStripVisible = computed(
+  () => pendingOpen.value > 0 && dirPendingSignal(props.dir) > (props.dir.pendingStripMutedAt ?? 0)
+)
+
+/** 关闭注册表降级提示条：记录关闭时的对账状态，状态变化后重新提示 */
+function dismissRegistrySyncStrip() {
+  store.state.prefs.registrySyncDismissed = registrySyncState.value || ''
+}
 
 /** 错误详情的首条具体原因（跳过与摘要重复的首行）：失败条第二行展示「为什么失败」，
  *  扫描类失败（如没能完整读取文件列表）的具体原因（HTTP 码 / 哪一侧 / 哪个目录）在此可见 */
@@ -151,7 +186,7 @@ const statusText = computed(() => {
     case 'synced':
       return props.dir.justCompleted ? '同步完成' : '已同步'
     default:
-      return '等待同步'
+      return autoOn.value ? '等待同步' : '等待手动同步'
   }
 })
 
@@ -173,6 +208,17 @@ function onSyncNow(close: () => void) {
   close()
 }
 
+/**
+ * 一次性单向同步（「云端补齐本地 / 云端覆盖本地 / 本地补齐云端 / 本地覆盖云端」）：
+ * op 经 store.syncDir → 调度器 syncNow 透传给引擎 —— 补齐档把对端内容带过来
+ *（恢复本端缺失，保留本端多出与本端改动，双侧都改走冲突流程）；覆盖档以选定侧
+ * 为准镜像对侧（缺失恢复 / 不一致覆盖 / 多余删除，删除同样过删除安全闸）。
+ */
+function onOneWaySync(close: () => void, op: 'pull' | 'push' | 'pull-full' | 'push-full') {
+  void store.syncDir(props.dir, { op })
+  close()
+}
+
 function onToggleEnabled(close: () => void) {
   store.setDirEnabled(props.dir.id, !enabled.value)
   close()
@@ -188,6 +234,15 @@ function onRemove(close: () => void) {
   if (confirm(`不再同步「${d.name}」？电脑和云端的文件都不会被删除`)) {
     store.removeDir(d.id)
   }
+  close()
+}
+
+/**
+ * 关闭实验功能「ZTools 插件同步」（虚拟行的替代删除入口）：关开关并移除虚拟行，
+ * 电脑与云端的插件文件都不会被删除；重新开启在「设置 → 实验」。
+ */
+function onDisablePluginSync(close: () => void) {
+  store.disablePluginSync()
   close()
 }
 
@@ -209,14 +264,18 @@ function onCancelSync() {
         class="w-[30px] h-[30px] rounded-[7px] flex items-center justify-center shrink-0"
         :class="enabled ? 'bg-fill-folder text-primary' : 'bg-fill-track text-ink-4'"
       >
-        <AppIcon name="folder" :size="16" />
+        <AppIcon :name="isPlugin ? 'box' : 'folder'" :size="16" />
       </div>
       <div class="flex-1 min-w-0 flex flex-col gap-[3px]">
-        <div class="dir-title text-[13px] font-semibold text-ink-1 leading-[1.25]">{{ dir.name }}</div>
-        <div class="dir-path font-mono text-[11px] text-ink-2 truncate" :title="dir.localPath">{{ dir.localPath }}</div>
+        <div class="dir-title flex items-center gap-[6px]">
+          <span class="truncate text-[13px] font-semibold text-ink-1 leading-[1.25]">{{ dir.name }}</span>
+          <!-- 插件同步虚拟行：目录由 ZTools 自动发现，标注「自动」并悬浮说明 -->
+          <span v-if="isPlugin" class="auto-badge" title="这个文件夹由 ZTools 自动发现，包含已安装的全部插件，不能修改">自动</span>
+        </div>
+        <div class="dir-path font-mono text-[11px] text-ink-2 truncate" :title="isPlugin ? `${dir.localPath}（ZTools 自动发现）` : dir.localPath">{{ dir.localPath }}</div>
         <div class="dir-path flex items-center gap-[5px]">
           <AppIcon name="cloud" :size="12" class="text-ink-4" />
-          <span class="font-mono text-[11px] text-ink-3 truncate" :title="dir.remotePath">{{ dir.remotePath }}</span>
+          <span class="font-mono text-[11px] text-ink-3 truncate" :title="isPlugin ? `${dir.remotePath}（按操作系统分开存放，避免互相同步不兼容的插件）` : dir.remotePath">{{ dir.remotePath }}</span>
         </div>
       </div>
       <div class="flex items-center gap-[10px] shrink-0 self-center">
@@ -270,7 +329,7 @@ function onCancelSync() {
             <span class="time">{{ timeText }}</span>
           </template>
         </div>
-        <AppDropdown placement="bottom-end" teleport :min-width="232" :offset="6">
+        <AppDropdown placement="bottom-end" teleport :min-width="248" :offset="6">
           <template #trigger="{ toggle }">
             <AppIconButton :size="26" variant="ghost" title="更多操作" class="text-ink-3" @click="toggle">
               <AppIcon name="dots-h" :size="9" />
@@ -282,16 +341,68 @@ function onCancelSync() {
                 <AppIcon name="refresh" :size="13" class="mi-ic" :class="{ spin: syncing }" />
                 <span>立即同步</span>
               </button>
+              <!-- 单向补齐 / 覆盖操作：与目录模式矛盾的方向不出现（upload 模式没有可拉的
+                   更新，download 模式没有可传的更新）。「补齐」与「覆盖」的区别由各项
+                   悬停 title 说明：补齐只补对端多出的内容、不动本端；覆盖以对端为准删除/覆盖本端差异 -->
+              <template v-if="dir.mode !== 'upload'">
+                <button
+                  type="button"
+                  class="mi"
+                  :disabled="!enabled || syncing"
+                  title="把云端多出的内容补到电脑：下载云端新增或有变化的文件，恢复你在电脑上删除的文件。不删除电脑上的任何文件，不覆盖你在电脑上改过的内容（两边都改过的会问你保留哪个）"
+                  @click="onOneWaySync(close, 'pull')"
+                >
+                  <AppIcon name="download" :size="13" class="mi-ic" />
+                  <span>云端补齐本地</span>
+                </button>
+                <button
+                  type="button"
+                  class="mi"
+                  :disabled="!enabled || syncing"
+                  title="以云端为准，把电脑上的文件夹完全恢复成云端的样子：云端没有的本地文件会被删除，内容与云端不一致的以云端版本覆盖（本地未同步的修改会丢失）。要删除的文件数量偏多时会先请你确认"
+                  @click="onOneWaySync(close, 'pull-full')"
+                >
+                  <AppIcon name="download" :size="13" class="mi-ic" />
+                  <span>云端覆盖本地</span>
+                </button>
+              </template>
+              <template v-if="dir.mode !== 'download'">
+                <button
+                  type="button"
+                  class="mi"
+                  :disabled="!enabled || syncing"
+                  title="把电脑上多出的内容补到云端：上传本地新增或有变化的文件，恢复云端被删除的文件。不删除云端的任何文件，不覆盖云端改过的内容（两边都改过的会问你保留哪个）"
+                  @click="onOneWaySync(close, 'push')"
+                >
+                  <AppIcon name="upload" :size="13" class="mi-ic" />
+                  <span>本地补齐云端</span>
+                </button>
+                <button
+                  type="button"
+                  class="mi"
+                  :disabled="!enabled || syncing"
+                  title="以电脑为准，把云端文件夹完全恢复成本地的样子：本地没有的云端文件会被删除，内容与本地不一致的以本地版本覆盖（云端未同步的修改会丢失）。要删除的文件数量偏多时会先请你确认"
+                  @click="onOneWaySync(close, 'push-full')"
+                >
+                  <AppIcon name="upload" :size="13" class="mi-ic" />
+                  <span>本地覆盖云端</span>
+                </button>
+              </template>
               <button type="button" class="mi" @click="onToggleEnabled(close)">
                 <AppIcon :name="enabled ? 'pause' : 'play'" :size="13" class="mi-ic" />
                 <span>{{ enabled ? '暂停同步' : '恢复同步' }}</span>
               </button>
-              <button type="button" class="mi" @click="onOpenSettings(close)">
+              <!-- 插件同步虚拟行没有可修改的文件夹设置（目录自动发现 / 远端按平台隔离），不给「同步设置」入口 -->
+              <button v-if="!isPlugin" type="button" class="mi" @click="onOpenSettings(close)">
                 <AppIcon name="gear" :size="13" class="mi-ic" />
                 <span>同步设置</span>
               </button>
               <div class="mi-sep" />
-              <button type="button" class="mi danger" @click="onRemove(close)">
+              <button v-if="isPlugin" type="button" class="mi danger" @click="onDisablePluginSync(close)">
+                <AppIcon name="close" :size="13" class="mi-ic" />
+                <span>关闭插件同步</span>
+              </button>
+              <button v-else type="button" class="mi danger" @click="onRemove(close)">
                 <AppIcon name="trash" :size="13" class="mi-ic" />
                 <span>移除同步</span>
               </button>
@@ -329,13 +440,50 @@ function onCancelSync() {
     </div>
 
     <!-- 冲突提示条（demo/兼容：真实同步的冲突经 onConflict 即时弹窗，status 不会停在 'conflict'） -->
-    <div v-if="dir.status === 'conflict' && dir.conflictFile" class="strip warn-strip rise-in-sm">
+    <div v-if="dir.status === 'conflict' && dir.conflictFile && !conflictStripClosed" class="strip warn-strip rise-in-sm">
       <AppIcon name="warn" :size="14" class="text-warning-icon" />
       <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{ dir.conflictFile }} 这个文件在电脑和云端都被改过，请选择保留哪一个</span>
       <button type="button" class="inline-flex items-center gap-[3px] border-0 bg-transparent text-primary text-[11px] font-semibold shrink-0 py-[2px] px-0 [text-underline-offset:2px] hover:underline" @click="handleConflict">
         处理
         <AppIcon name="chevron-right" :size="10" />
       </button>
+      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="conflictStripClosed = true">
+        <AppIcon name="close" :size="10" />
+      </AppIconButton>
+    </div>
+
+    <!-- 插件目录尚未发现（ZTools 未创建 / 环境异常）：说明性提示条，等待目录出现后自动恢复 -->
+    <div v-if="pluginUnavailableVisible" class="strip warn-strip rise-in-sm">
+      <AppIcon name="warn" :size="14" class="text-warning-icon" />
+      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep" :title="dir.pluginSyncInfo?.reason || ''">
+        {{ dir.pluginSyncInfo?.reason || '本机还没有找到 ZTools 插件目录，等 ZTools 创建后会自动开始同步' }}
+      </span>
+      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="store.state.prefs.pluginUnavailableDismissed = true">
+        <AppIcon name="close" :size="10" />
+      </AppIconButton>
+    </div>
+
+    <!-- 插件注册表对账降级提示条：实体同步照常，但自动登记（无感安装）未就绪。
+         pending = 已向宿主提交「高级 API」授权申请，等用户在设置页批准（批准后
+         实时生效，下一轮同步自动登记）；denied = 宿主无申请通道（旧版宿主，需
+         手动授权或升级）；unavailable = 旧版宿主没有内部 API 命名空间 -->
+    <div
+      v-if="registrySyncStripVisible"
+      class="strip warn-strip rise-in-sm"
+    >
+      <AppIcon name="warn" :size="14" class="text-warning-icon" />
+      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">
+        {{
+          dir.pluginSyncInfo.registrySync === 'pending'
+            ? '已向 ZTools 提交「高级 API」授权申请，批准后插件将自动安装（无需重启，下一轮同步生效）'
+            : dir.pluginSyncInfo.registrySync === 'denied'
+              ? '插件文件会同步，但自动安装需要 ZTools 支持权限申请（请升级 ZTools 或在设置中手动授权）'
+              : '当前 ZTools 版本不支持自动安装同步的插件（缺少内部 API），升级 ZTools 后恢复'
+        }}
+      </span>
+      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="dismissRegistrySyncStrip">
+        <AppIcon name="close" :size="10" />
+      </AppIconButton>
     </div>
 
     <!-- 失败提示条：摘要 + 首条具体原因（完整细节折叠在悬浮 title），并提供「重试同步」；
@@ -369,8 +517,9 @@ function onCancelSync() {
       </button>
     </div>
 
-    <!-- 待处理挂起条：后台轮 defer 的冲突 + 批量删除超阈值的确认挂起，回窗口统一处理 -->
-    <div v-if="pendingOpen > 0" class="strip warn-strip rise-in-sm">
+    <!-- 待处理挂起条：后台轮 defer 的冲突 + 批量删除超阈值的确认挂起，回窗口统一处理；
+         关闭（不再显示）后出现更新的挂起会重新显示 -->
+    <div v-if="pendingStripVisible" class="strip warn-strip rise-in-sm">
       <AppIcon name="warn" :size="14" class="text-warning-icon" />
       <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{
         pendingDeleteOpen > 0
@@ -385,6 +534,9 @@ function onCancelSync() {
         处理
         <AppIcon name="chevron-right" :size="10" />
       </button>
+      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="store.mutePendingStrip(props.dir)">
+        <AppIcon name="close" :size="10" />
+      </AppIconButton>
     </div>
 
     <!-- 修改同步目录弹窗：与「添加同步目录」共用 DirFormModal，Teleport 到 body，遮罩覆盖整个插件窗口 -->
@@ -419,6 +571,18 @@ function onCancelSync() {
   .dir-path {
     opacity: 0.5;
   }
+}
+
+/* 插件同步虚拟行的「自动」徽标：自动发现目录的轻量标注（悬浮 title 有完整说明） */
+.auto-badge {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-badge);
+  color: var(--blue);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.4;
 }
 
 /* 状态文字与时间：颜色随状态切换 */

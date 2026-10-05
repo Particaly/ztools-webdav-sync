@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.preload.json && vue-tsc && vite build && npm run build:preload",
-    "build:preload": "esbuild src-ztools/preload/services.mts --bundle --platform=node --format=cjs --target=node20 --sourcemap=linked --outfile=src-ztools/preload/dist/services.js",
+    "build:preload": "esbuild src-ztools/preload/services.mts --bundle --platform=node --format=cjs --target=node20 --sourcemap=linked --external:original-fs --outfile=src-ztools/preload/dist/services.js",
     "test:unit": "tsc -p tsconfig.preload.json && vitest run test/unit",
     "test:e2e": "vitest run test/shard",
     "test:fast": "vitest run --tagsFilter \"!slow\"",

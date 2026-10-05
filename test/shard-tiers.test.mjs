@@ -357,6 +357,10 @@ const {
   )
   const p7settle = await settleStable(P7_A, '/px7')
   check('P7 settles to no-op (no infinite loop despite ignored conditionals)', p7settle.ok, `rounds=${p7settle.rounds}`)
+  // B 档并发安全提示只在首轮携带（渲染层逐轮 toast 会重复打扰；标记随 noise.json
+  // 跨轮持久）—— 后续干净轮次不再出现
+  const p7s3 = await syncP(P7_A, '/px7')
+  check('P7 concurrency warning appears only once (later rounds carry none)', !p7s3.warnings.some((w) => /多台设备/.test(w)), JSON.stringify(p7s3.warnings))
   // 多设备基础交替
   const P7_SB = await freshStore('p7b')
   const P7_B = await tmpLocal('p7b')
