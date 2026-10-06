@@ -63,6 +63,8 @@ export function triggerText(trigger: string): string {
       return '自动跟进同步'
     case 'yield-retry':
       return '等待后自动重试'
+    case 'dry-run':
+      return '预演（未改动文件）'
     default:
       return '自动同步'
   }

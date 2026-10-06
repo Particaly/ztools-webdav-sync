@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { pushEscLayer } from '../../composables/esc'
 
 /** 浮层弹出位置：bottom-* 在触发器下方，top-* 在上方（空间不足时自动翻转用） */
 type Placement = 'bottom-start' | 'bottom-end' | 'top-start' | 'top-end'
@@ -104,10 +105,26 @@ onMounted(() => {
   window.addEventListener('scroll', onViewportChange, true)
   window.addEventListener('resize', onViewportChange)
 })
+
+// ESC 退层：浮层打开期间入全局退层栈（composables/esc，后开先关）—— 全局路由
+// 先关浮层再谈路由回退，且消费事件不让宿主把插件退回搜索框。原模板上的
+// @keydown.esc 依赖焦点在浮层 / 触发器内且不消费事件（ESC 会泄漏给宿主直接
+// 退出插件），已由这条与焦点无关的通道取代。
+let unregisterEsc: (() => void) | null = null
+watch(open, (v) => {
+  if (v && !unregisterEsc) unregisterEsc = pushEscLayer(close)
+  else if (!v && unregisterEsc) {
+    unregisterEsc()
+    unregisterEsc = null
+  }
+})
+
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocMousedown, true)
   window.removeEventListener('scroll', onViewportChange, true)
   window.removeEventListener('resize', onViewportChange)
+  unregisterEsc?.()
+  unregisterEsc = null
 })
 
 // 浮层定位：垂直方向由 placement 决定，水平对齐同侧（非 teleport 模式）；
@@ -124,7 +141,7 @@ defineExpose({ close })
 </script>
 
 <template>
-  <div ref="rootRef" class="pop-wrap" @keydown.esc="close">
+  <div ref="rootRef" class="pop-wrap">
     <slot name="trigger" :open="open" :toggle="toggle" />
     <Teleport to="body" :disabled="!teleport">
       <Transition name="pop">
@@ -133,7 +150,6 @@ defineExpose({ close })
           ref="panelRef"
           class="pop-panel"
           :style="teleport ? fixedStyle : panelStyle"
-          @keydown.esc="close"
         >
           <slot :close="close" />
         </div>

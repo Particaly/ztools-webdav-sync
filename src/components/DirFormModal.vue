@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import RemoteDirModal from './RemoteDirModal.vue'
 import { AppButton, AppInput, AppModal, AppSegmented, AppSelect, AppSwitch, InfoTip } from './ui'
-import { useStore, suggestRemote } from '../composables/store'
+import { useStore, suggestRemote, serverLabel } from '../composables/store'
 import { concurrencyOptions, intervalOptions, strategyOptions } from '../composables/options'
 import { toast } from '../composables/toast'
 import type { DirOverrides, Prefs, SyncDir, SyncMode } from '../env.d'
@@ -30,7 +30,9 @@ const isEdit = computed(() => !!props.dir)
 
 // ---------- 表单暂存值 ----------
 
-/** 目录级覆盖的合法键（overrideOn 判定与 initForm 取值共用） */
+/** 目录级覆盖的合法键（overrideOn 判定与 initForm 取值共用）。excludeRels 是
+ * 选择性同步树的落地形态（不在本表单编辑，见 SyncTreeModal）—— 计入判定，
+ * 使「只用树做过勾选」的目录在表单里如实显示「已单独设置」状态 */
 const OVERRIDE_KEYS = [
   'autoSync',
   'intervalMin',
@@ -41,11 +43,17 @@ const OVERRIDE_KEYS = [
   'leaseLock',
   'deepVerify',
   'excludePatterns',
+  'excludeRels',
 ] as const
 
 const localPath = ref('')
 const remotePath = ref('')
 const mode = ref<SyncMode>('two-way')
+/**
+ * 使用的服务器（多账号 / 多服务器）：创建模式默认当前活跃的服务器，修改模式取
+ * 目录现有指向；单服务器形态（列表只有一条）不显示选择器、行为与从前一致
+ */
+const serverId = ref('')
 /** 高级设置折叠区展开状态：默认收起 */
 const advancedOpen = ref(false)
 /** 「单独设置这个文件夹」开关：关闭时各项只读跟随全局，开启后可单独编辑 */
@@ -72,6 +80,14 @@ const globalRatePerSec = computed(() => {
   return typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
 })
 
+/** 服务器下拉选项（展示名 = 显式名称 > 地址 host > 序号）；单台时不显示选择器 */
+const serverOptions = computed(() =>
+  store.state.servers.map((sv, i) => ({ value: sv.id, label: serverLabel(sv, i) }))
+)
+
+/** 表单当前选定的服务器条目（浏览云端目录用；缺省回落活跃服务器） */
+const formServer = computed(() => store.state.servers.find((sv) => sv.id === serverId.value) || store.state.server)
+
 /** 每次打开时按当前模式初始化表单：创建取全局默认，修改取目录当前生效值（覆盖 ?? 全局） */
 function initForm() {
   const o = props.dir?.overrides
@@ -81,10 +97,13 @@ function initForm() {
     localPath.value = props.dir.localPath
     remotePath.value = props.dir.remotePath
     mode.value = props.dir.mode
+    // 修改模式：显式 serverId 优先，缺省展示实际生效的条目（第一台，与引擎口径一致）
+    serverId.value = props.dir.serverId || store.serverOfDir(props.dir).id
   } else {
     localPath.value = ''
     remotePath.value = prefs.defaultRemoteDir
     mode.value = 'two-way'
+    serverId.value = store.state.activeServerId
   }
   // 各项展示值：有目录级覆盖取覆盖值，否则展示全局当前值（未开启覆盖时为只读预览）
   autoSync.value = (overrideOn.value ? o?.autoSync : undefined) ?? prefs.autoSync
@@ -189,6 +208,11 @@ function currentOverrides(): DirOverrides | null {
     const n = Number(rateRaw)
     if (Number.isFinite(n) && n >= 0 && n <= 100) out.ratePerSec = n
   }
+  // 选择性同步树的勾选不在本表单编辑：已在 overrides 里时原样保留（表单保存
+  // 不冲掉树的勾选；树上重新打开即所见即所得）。关闭「单独设置」= 整体清除
+  //（含树的勾选 —— 与「恢复跟随全局」语义一致，树上重开回到全选）
+  const prevRels = props.dir?.overrides?.excludeRels
+  if (Array.isArray(prevRels) && prevRels.length) out.excludeRels = prevRels
   return out
 }
 
@@ -224,9 +248,9 @@ function submit() {
   remoteError.value = ''
   const overrides = currentOverrides()
   if (props.dir) {
-    store.updateDir(props.dir.id, { localPath: local, remotePath: remote, mode: mode.value, overrides })
+    store.updateDir(props.dir.id, { localPath: local, remotePath: remote, mode: mode.value, overrides, serverId: serverId.value || null })
   } else {
-    store.addDir(local, remote, mode.value, overrides)
+    store.addDir(local, remote, mode.value, overrides, serverId.value || undefined)
   }
   close()
 }
@@ -243,9 +267,9 @@ function browse() {
   }
 }
 
-/** 打开远端目录选择器：未配置服务器时直接提示，避免必然失败的请求 */
+/** 打开远端目录选择器：选定的服务器未填地址时直接提示，避免必然失败的请求 */
 function browseRemote() {
-  if (!store.state.server.serverUrl.trim()) {
+  if (!formServer.value.serverUrl.trim()) {
     toast.warning('请先填写服务器地址', '填写服务器地址后才能浏览云端文件夹')
     return
   }
@@ -293,6 +317,15 @@ function browseRemote() {
               <AppButton @click="browseRemote">浏览…</AppButton>
             </div>
             <div v-if="remoteError" class="text-[11px] text-danger">{{ remoteError }}</div>
+          </div>
+
+          <!-- 使用的服务器（多账号 / 多服务器；单台时不显示，行为与从前一致） -->
+          <div v-if="serverOptions.length > 1" class="flex flex-col gap-[6px]">
+            <div class="flex items-center gap-[6px]">
+              <span class="text-[12px] font-medium text-btn-text">服务器</span>
+              <InfoTip text="这个文件夹同步到哪台 WebDAV 服务器（可在「设置 → WebDAV」添加多台，如坚果云 + 家用 NAS）；账号与网络设置按服务器各自独立" />
+            </div>
+            <AppSelect v-model="serverId" :options="serverOptions" />
           </div>
 
           <!-- 同步方式 -->
@@ -439,10 +472,11 @@ function browseRemote() {
           </AppButton>
         </template>
 
-        <!-- 弹窗：远端目录选择（WebDAV 目录的浏览入口） -->
+        <!-- 弹窗：远端目录选择（WebDAV 目录的浏览入口；按表单选定的服务器连接） -->
         <RemoteDirModal
           v-if="showRemotePicker"
           :initial-path="remotePath"
+          :server="formServer"
           @pick="(p) => (remotePath = p)"
           @close="showRemotePicker = false"
         />

@@ -81,6 +81,14 @@
  *                              目录的第 1 次 Depth:1 列举是扫描（通过）、第 2 次是写前查重
  *                              （失败）—— 用于验证「查重请求失败时不盲目裸 PUT」。
  *
+ * 认证相关标记：
+ *   .wdsync-test-digest  —— 内容为 username:password（缺省 u:p）：一切请求必须携带
+ *                              计算正确的 Digest Authorization（qop=auth、algorithm=MD5）
+ *                              才放行，Basic 一律 401 + Digest 挑战 —— 模拟只支持
+ *                              Digest 的老 NAS / 路由器 / Apache。nonce 为服务器进程
+ *                              生命期内固定一枚（引擎侧按 origin+账号缓存复用、跨请求
+ *                              nc 递增，正好验证挑战缓存链路）。
+ *
  * 取消中断在途传输相关标记：
  *   .wdsync-test-throttle —— 内容为每块延迟毫秒数（缺省 5；路径含 'throttle' 的 GET
  *                              响应与 PUT 请求体按 64KB 块节流）：把大文件传输拉长到
@@ -142,6 +150,11 @@
  *                              成日志是因为 reqlog 的既有断言按整行精确匹配请求行，
  *                              不能改格式），供断言「扫描是一次 infinity 请求还是
  *                              逐目录 N 次」。
+ *   .wdsync-test-quota     —— 内容为数字 N：集合条目的 PROPFIND 附带 RFC 4331
+ *                              quota-available-bytes N（云端剩余空间展示与轮前配额
+ *                              预检的测试数据源）；内容 'none' 时不输出（验证无配额
+ *                              服务器的静默跳过路径）。文件条目恒不携带（真实服务
+ *                              器只在集合上返回配额属性）。
  *
  * 集合 etag 深层传播相关标记：
  *   .wdsync-test-etagprop   —— 集合条目的 etag 改为递归聚合（树内所有文件 mtimeMs 最大值
@@ -225,6 +238,51 @@ function flagContent(name) {
 }
 
 const hasFlag = (name) => fs.existsSync(path.join(ROOT, name))
+
+// ---- Digest 认证档（.wdsync-test-digest） ----
+// 内容为 username:password（缺省 u:p）。开启后一切请求须携带计算正确的 Digest
+// Authorization（qop=auth、algorithm=MD5），Basic 一律 401 + Digest 挑战。
+// nonce / opaque 为服务器进程生命期内固定值：引擎按 origin+账号缓存挑战后应跨请求
+// 复用并递增 nc —— 固定 nonce 恰好让「缓存复用」成为唯一可行路径。
+const DIGEST_REALM = 'wdsync-test-realm'
+const DIGEST_NONCE = crypto.randomBytes(12).toString('hex')
+const DIGEST_OPAQUE = crypto.randomBytes(8).toString('hex')
+const digestAuthOn = () => hasFlag('.wdsync-test-digest')
+const digestCreds = () => {
+  const raw = flagContent('.wdsync-test-digest') || 'u:p'
+  const i = raw.indexOf(':')
+  return i < 0 ? { user: raw, pass: '' } : { user: raw.slice(0, i), pass: raw.slice(i + 1) }
+}
+/** 发 401 + Digest 挑战 */
+function challengeDigest(res) {
+  res.writeHead(401, {
+    'WWW-Authenticate': `Digest realm="${DIGEST_REALM}", qop="auth", nonce="${DIGEST_NONCE}", opaque="${DIGEST_OPAQUE}", algorithm=MD5`,
+  }).end()
+}
+/** 校验 Digest Authorization（与 RFC 7616 qop=auth 同口径计算 response 比对） */
+function verifyDigest(req) {
+  const h = String(req.headers.authorization || '')
+  if (!/^Digest\s/i.test(h)) return false
+  const params = {}
+  for (const part of h.replace(/^Digest\s*/i, '').split(',')) {
+    const eq = part.indexOf('=')
+    if (eq < 0) continue
+    const k = part.slice(0, eq).trim().toLowerCase()
+    let v = part.slice(eq + 1).trim()
+    if (v.startsWith('"') && v.endsWith('"') && v.length >= 2) v = v.slice(1, -1)
+    params[k] = v
+  }
+  const { user, pass } = digestCreds()
+  if (!params.username || !params.realm || !params.nonce || !params.response) return false
+  if (params.nonce !== DIGEST_NONCE) return false
+  // uri 与实际请求行一致（引擎按 pathname+search 组装）
+  if (params.uri !== req.url) return false
+  const H = (s) => crypto.createHash('md5').update(s).digest('hex')
+  const ha1 = H(`${params.username}:${params.realm}:${pass}`)
+  const ha2 = H(`${req.method}:${params.uri}`)
+  const expect = H(`${ha1}:${params.nonce}:${params.nc}:${params.cnonce}:${params.qop}:${ha2}`)
+  return params.username === user && params.response === expect
+}
 
 // ---- 档位行为推导：profile 是单行为标记的组合预设 ----
 const profile = () => flagContent('.wdsync-test-profile') || 'p1'
@@ -570,6 +628,14 @@ async function entryXml(href, st, style, abs) {
   const etag = isDir ? (etagPropOn() ? await collectionEtagAgg(abs, etagPropShallow() ? 1 : Infinity) : '') : await etagFor(abs, st)
   // cdataetag 档：etag 用 CDATA 包裹（部分服务器对含特殊字符的 etag 的做法）
   const etagText = style === 'cdataetag' && etag ? `<![CDATA[${etag}]]>` : escapeXml(etag)
+  // quota 档（RFC 4331）：内容为数字 N 时集合条目附带 quota-available-bytes N ——
+  // 云端剩余空间展示与轮前配额预检的测试数据源；文件条目不携带（真实服务器只在集合上返回）。
+  // 内容 'none' 时不输出（模拟不返回配额属性的服务器，验证静默跳过路径）。
+  const quotaRaw = flagContent('.wdsync-test-quota')
+  const quotaLine =
+    isDir && quotaRaw != null && quotaRaw !== 'none' && Number.isFinite(Number(quotaRaw))
+      ? `<${tag('quota-available-bytes')}>${Number(quotaRaw)}</${tag('quota-available-bytes')}>`
+      : ''
   return `  <${tag('response')}>
     <${tag('href')}>${hrefText}</${tag('href')}>
     <${tag('propstat')}>
@@ -578,6 +644,7 @@ async function entryXml(href, st, style, abs) {
         ${isDir ? '' : `<${tag('getcontentlength')}>${st.size}</${tag('getcontentlength')}>`}
         <${tag('getlastmodified')}>${lm}</${tag('getlastmodified')}>
         ${!etag ? '' : `<${tag('getetag')}>${etagText}</${tag('getetag')}>`}
+        ${quotaLine}
       </${tag('prop')}>
       <${tag('status')}>HTTP/1.1 200 OK</${tag('status')}>
     </${tag('propstat')}>
@@ -716,6 +783,14 @@ const requestHandler = async (req, res) => {
   // 服务器吞掉响应流错误，让「连接被中断」只体现在 reqlog 的 !ABORT 行上
   res.on('error', () => {})
   logReq(req, urlPath, res)
+  // Digest 认证档：未带正确 Digest 应答一律 401 + 挑战（Basic 也拒）。请求体先
+  // 消费再拒绝（PROPFIND 也带 XML 请求体），保持 keep-alive framing —— 客户端在
+  // 同一连接上重发 Digest 应答请求时才不会撞上未读的旧请求体
+  if (digestAuthOn() && !verifyDigest(req)) {
+    await new Promise((r) => { req.resume(); req.on('end', r) })
+    challengeDigest(res)
+    return
+  }
   const abs = toLocal(urlPath)
   // 限流预算的启用跳变检测（每个请求都查）：重新启用 = 新用例开始，重置已消耗额度
   const rlNow = ratelimitEnabled()

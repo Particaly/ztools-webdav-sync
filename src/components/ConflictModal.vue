@@ -49,6 +49,7 @@ function choose(choice: 'local' | 'remote' | 'both') {
       :width="420"
       :show-close="false"
       :close-on-mask="false"
+      :esc-close="false"
       footer-justify="start"
     >
     <template #icon>

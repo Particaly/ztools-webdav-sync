@@ -64,6 +64,8 @@ export const ICONS: Record<string, string> = {
   // 暂停 / 播放（停用 / 启用同步）
   pause: `<path d="M9.5 5.5v13M14.5 5.5v13"/>`,
   play: `<path d="M8.5 5.9v12.2a.5.5 0 0 0 .76.43l10.06-6.1a.5.5 0 0 0 0-.86L9.26 5.47a.5.5 0 0 0-.76.43Z"/>`,
+  // 预演（「预演一次」入口：只看不动的眼睛）
+  eye: `<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.8"/>`,
 }
 
 export type IconName = keyof typeof ICONS | string

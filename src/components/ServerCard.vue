@@ -3,10 +3,29 @@ import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton, AppIconButton, InfoTip } from './ui'
 import { useStore, tierLabel, tierHint } from '../composables/store'
-import { fmtRelTime } from '../composables/format'
+import { fmtBytes, fmtRelTime } from '../composables/format'
 import type { DavTier } from '../env.d'
 
 const store = useStore()
+
+/**
+ * 云端剩余空间（RFC 4331 配额属性随连接测试带出）：服务器返回 quota-available-bytes
+ * 且为正数时展示「云端剩余 X」；未返回 / 返回 0 或负数（部分服务器把 0 当「无限制」
+ * 误报）的服务器不展示 —— 无配额信息的形态零行为变化。
+ */
+const quotaText = computed(() => {
+  const q = store.state.quota
+  if (!q || !Number.isFinite(q.available) || (q.available ?? 0) <= 0) return ''
+  return fmtBytes(q.available as number)
+})
+const quotaTitle = computed(() => {
+  const q = store.state.quota
+  if (!q) return ''
+  const parts: string[] = []
+  if (Number.isFinite(q.used) && (q.used ?? 0) > 0) parts.push(`已用 ${fmtBytes(q.used as number)}`)
+  if (Number.isFinite(q.available) && (q.available ?? 0) > 0) parts.push(`剩余 ${fmtBytes(q.available as number)}`)
+  return `云端空间：${parts.join('，') || '未知'}（服务器报告，随「测试连接」刷新）`
+})
 
 const metaText = computed(() => {
   if (store.connStatus.value === 'connected') {
@@ -85,6 +104,8 @@ const tlsTrustVisible = computed(() => {
       <div class="server-info flex-1 min-w-0 flex flex-col gap-1 cursor-pointer" @click="store.state.route = 'settings'">
         <div class="flex items-center gap-2">
           <span class="text-[12px] font-semibold text-ink-1">WebDAV 服务器</span>
+          <!-- 多服务器计数（多账号形态）：点击卡片进设置可切换 / 管理 -->
+          <span v-if="store.state.servers.length > 1" class="text-[10px] text-ink-3 bg-fill-seg rounded-[4px] px-[5px] py-px" title="已配置多台服务器：各同步文件夹使用各自的服务器，点击进设置查看与切换">共 {{ store.state.servers.length }} 台</span>
           <!-- 档位徽标：悬停展开全部档位与说明（当前档位标注），单独一个词看不出好差边界 -->
           <InfoTip v-if="tierText" text="">
             <template #trigger>
@@ -106,6 +127,11 @@ const tlsTrustVisible = computed(() => {
         <div class="flex items-center gap-[6px]">
           <span class="dot" :class="store.connStatus.value" />
           <span class="text-[11px]" :class="store.connStatus.value === 'disconnected' ? 'text-warning' : 'text-ink-2'" :title="tierNoteTitle">{{ metaText }}</span>
+        </div>
+        <!-- 云端剩余空间：服务器返回 RFC 4331 配额属性时展示（未返回的服务器不出现） -->
+        <div v-if="quotaText" class="flex items-center gap-[6px]" :title="quotaTitle">
+          <AppIcon name="cloud" :size="12" class="text-ink-4" />
+          <span class="text-[11px] text-ink-2">云端剩余 {{ quotaText }}</span>
         </div>
       </div>
       <AppButton :disabled="testing" @click="store.testConnection()">

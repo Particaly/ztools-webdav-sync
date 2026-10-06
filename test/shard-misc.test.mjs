@@ -146,6 +146,71 @@ const {
   })
 
   // ============================================================
+  // TO 系列：下载覆盖前，本地旧版本移入系统回收站（本地可恢复性）。
+  // 与删除语义统一：被云端覆盖前的旧版可从回收站找回（另一台设备误改 /
+  // 勒索加密 / 保存损坏时的最后一道本地保险）。回收站失败绝不无备份覆盖。
+  // ============================================================
+
+  await section('TO：下载覆盖前旧版本入回收站 / 回收站失败放弃覆盖', async () => {
+    await freshStore('to')
+    const TO_LOCAL = await tmpLocal('to')
+    const TO_NAME = 'to-unique.txt'
+    try {
+      // 第一轮：本地上传 v1（建立基线）
+      await fsp.writeFile(path.join(TO_LOCAL, TO_NAME), 'to-v1')
+      const s1 = await syncP(TO_LOCAL, '/to')
+      check('TO round1 uploads v1', s1.uploaded === 1, JSON.stringify(s1))
+      // 对端（直接写 dav 根）修改 → 下一轮下载覆盖本地旧版
+      await fsp.writeFile(path.join(ROOT, 'to', TO_NAME), 'to-v2-by-peer')
+      const trashBefore = trashLog.length
+      const s2 = await syncP(TO_LOCAL, '/to')
+      check(
+        'TO round2 downloads the peer edit (overwrite path taken)',
+        s2.downloaded === 1 && (await fsp.readFile(path.join(TO_LOCAL, TO_NAME), 'utf-8')) === 'to-v2-by-peer',
+        JSON.stringify(s2)
+      )
+      check(
+        'TO pre-overwrite version moved to trash (recoverable)',
+        trashLog.length === trashBefore + 1 && trashLog[trashLog.length - 1].endsWith(TO_NAME),
+        JSON.stringify(trashLog.slice(trashBefore))
+      )
+      const trashedNames = fs.readdirSync(TRASH_DIR).filter((n) => n.endsWith(TO_NAME))
+      const trashedContents = await Promise.all(trashedNames.map((n) => fsp.readFile(path.join(TRASH_DIR, n), 'utf-8').catch(() => '')))
+      check(
+        'TO trashed copy holds the pre-overwrite content',
+        trashedContents.includes('to-v1'),
+        JSON.stringify({ trashed: trashedNames.length, contents: trashedContents })
+      )
+      // 回收站失败（注入一次 EACCES）→ 放弃本次覆盖：本地旧版原地保留、明确报错
+      //（文件级失败轮末以 err.summary 汇总抛出，需接住取 summary）
+      await fsp.writeFile(path.join(ROOT, 'to', TO_NAME), 'to-v3-by-peer')
+      trashFailNext = 1
+      let s3 = null
+      try {
+        s3 = await syncP(TO_LOCAL, '/to')
+      } catch (e) {
+        s3 = (e && e.summary) || { downloaded: 0, errors: [String(e && e.message)] }
+      }
+      trashFailNext = 0
+      check(
+        'TO trash failure skips the overwrite and keeps the local version',
+        s3.downloaded === 0 && (await fsp.readFile(path.join(TO_LOCAL, TO_NAME), 'utf-8')) === 'to-v2-by-peer' && (s3.errors || []).some((e) => /回收站/.test(String(e && (e.message || e)))),
+        JSON.stringify({ downloaded: s3.downloaded, errors: s3.errors, local: await fsp.readFile(path.join(TO_LOCAL, TO_NAME), 'utf-8') })
+      )
+      // 回收站恢复后，下一轮正常完成覆盖
+      const s4 = await syncP(TO_LOCAL, '/to')
+      check(
+        'TO retry after trash recovery completes the overwrite',
+        s4.downloaded === 1 && (await fsp.readFile(path.join(TO_LOCAL, TO_NAME), 'utf-8')) === 'to-v3-by-peer',
+        JSON.stringify(s4)
+      )
+    } finally {
+      await fsp.rm(TO_LOCAL, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'to'), { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // ============================================================
   // RL 系列：限流重试（6.7 / 6.6 Retry-After）
   // 前 3 次 PUT/GET 返回 429 + Retry-After: 1，之后放行；
   // PUT 属非幂等方法，仅在「服务端明确未处理」的 429 上重试 → 同步最终成功

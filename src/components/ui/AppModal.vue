@@ -1,13 +1,17 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted } from 'vue'
 import AppIcon from '../AppIcon.vue'
+import { pushEscLayer } from '../../composables/esc'
 
 /**
  * 弹窗：遮罩 + 标题栏 + 正文 + 底部操作条。
  * - 标题栏：icon 插槽 + 标题/副标题 + title-extra 插槽（如冲突文件徽标）+ 关闭按钮
  * - 正文布局（flex / gap）由使用方在默认插槽内用工具类自行组织
  * - closeOnMask=false 时点击遮罩不关闭（如冲突弹窗必须显式选择）
+ * - ESC：挂载期间自动注册进全局退层栈（composables/esc，后开先关）；
+ *   escClose=false 的必答弹窗只消费事件不关闭（不交给宿主退出插件）
  */
-withDefaults(
+const props = withDefaults(
   defineProps<{
     title: string
     subtitle?: string
@@ -17,13 +21,29 @@ withDefaults(
     showClose?: boolean
     /** 点击遮罩是否触发 close */
     closeOnMask?: boolean
+    /** ESC 是否关闭弹窗；必答弹窗（如冲突三选一）传 false —— 与 closeOnMask=false 同一哲学 */
+    escClose?: boolean
     /** 底部操作条主轴对齐：end 右对齐 / start 左对齐 */
     footerJustify?: 'start' | 'end'
   }>(),
-  { subtitle: undefined, width: undefined, showClose: true, closeOnMask: true, footerJustify: 'end' }
+  { subtitle: undefined, width: undefined, showClose: true, closeOnMask: true, escClose: true, footerJustify: 'end' }
 )
 
 const emit = defineEmits<{ close: [] }>()
+
+// 弹窗由使用方以 v-if 条件渲染（打开才挂载），挂载期间入全局 ESC 栈、卸载时注销。
+// escClose=false：注册的是消费占位 —— ESC 只被吞掉（宿主不接管、路由也不回退），
+// 弹窗保持，等待用户显式选择。
+let unregisterEsc: (() => void) | null = null
+onMounted(() => {
+  unregisterEsc = pushEscLayer(() => {
+    if (props.escClose) emit('close')
+  })
+})
+onUnmounted(() => {
+  unregisterEsc?.()
+  unregisterEsc = null
+})
 </script>
 
 <template>

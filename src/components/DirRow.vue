@@ -3,6 +3,8 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import DirFormModal from './DirFormModal.vue'
 import PendingConflictsModal from './PendingConflictsModal.vue'
+import SyncTreeModal from './SyncTreeModal.vue'
+import DryRunModal from './DryRunModal.vue'
 import { AppDropdown, AppIconButton } from './ui'
 import { useStore, dirRootLostOpen, dirPendingSignal, isPluginSyncDir } from '../composables/store'
 import { fmtBytes, fmtRelTime } from '../composables/format'
@@ -160,6 +162,21 @@ function openRootLost() {
 /** 「同步设置」弹窗与「待处理记录」面板开关 */
 const settingsOpen = ref(false)
 const pendingOpenModal = ref(false)
+/** 选择性同步树与预演结果弹窗开关（「更多操作」菜单入口） */
+const treeOpen = ref(false)
+const dryRunOpen = ref(false)
+
+/** 打开选择性同步树（勾选哪些子文件夹 / 文件参与同步；结果落 overrides.excludeRels） */
+function onSyncTree(close: () => void) {
+  close()
+  treeOpen.value = true
+}
+
+/** 预演一次（零副作用轮：只扫描与规划，结果以只读摘要 + 明细展示） */
+function onDryRun(close: () => void) {
+  close()
+  dryRunOpen.value = true
+}
 
 /**
  * 全局待处理中心「去处理」的一次性直达通道：store.pendingPanelDirId 指到本目录时
@@ -206,6 +223,12 @@ const summary = computed(() => props.dir.lastResult)
 
 function onSyncNow(close: () => void) {
   void store.syncDir(props.dir)
+  close()
+}
+
+/** 在系统文件管理器中打开本地同步文件夹（含插件同步虚拟行：插件目录同样可打开） */
+function onOpenLocalFolder(close: () => void) {
+  store.openLocalFolder(props.dir.localPath)
   close()
 }
 
@@ -389,6 +412,21 @@ function onCancelSync() {
                   <span>本地覆盖云端</span>
                 </button>
               </template>
+              <!-- 在系统文件管理器中打开本地文件夹：冲突 / 待处理时的第一动作是「打开看看」 -->
+              <button type="button" class="mi" @click="onOpenLocalFolder(close)">
+                <AppIcon name="folder" :size="13" class="mi-ic" />
+                <span>打开电脑文件夹</span>
+              </button>
+              <!-- 选择性同步树（普通行）：勾选哪些子文件夹 / 文件参与同步 -->
+              <button v-if="!isPlugin" type="button" class="mi" @click="onSyncTree(close)">
+                <AppIcon name="list" :size="13" class="mi-ic" />
+                <span>选择性同步…</span>
+              </button>
+              <!-- 预演一次：只扫描规划的零副作用轮，先看看将要发生什么 -->
+              <button type="button" class="mi" @click="onDryRun(close)">
+                <AppIcon name="eye" :size="13" class="mi-ic" />
+                <span>预演一次</span>
+              </button>
               <button type="button" class="mi" @click="onToggleEnabled(close)">
                 <AppIcon :name="enabled ? 'pause' : 'play'" :size="13" class="mi-ic" />
                 <span>{{ enabled ? '暂停同步' : '恢复同步' }}</span>
@@ -546,6 +584,10 @@ function onCancelSync() {
 
     <!-- 待处理冲突面板 -->
     <PendingConflictsModal v-model:open="pendingOpenModal" :dir="dir" />
+
+    <!-- 选择性同步树（勾选面板）与预演结果（只读摘要）：「更多操作」菜单入口 -->
+    <SyncTreeModal v-if="treeOpen" :dir="dir" @close="treeOpen = false" />
+    <DryRunModal v-if="dryRunOpen" :dir="dir" @close="dryRunOpen = false" />
   </div>
 </template>
 

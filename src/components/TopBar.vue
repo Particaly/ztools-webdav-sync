@@ -8,8 +8,16 @@ import { useStore } from '../composables/store'
 const store = useStore()
 
 const statusText = computed(() =>
-  store.connStatus.value === 'connected' ? '已连接' : store.connStatus.value === 'disconnected' ? '未连接' : '未配置'
+  store.autoSyncPaused.value
+    ? store.pauseStatusText.value
+    : store.connStatus.value === 'connected'
+      ? '已连接'
+      : store.connStatus.value === 'disconnected'
+        ? '未连接'
+        : '未配置'
 )
+/** 暂停以琥珀点覆盖连接状态展示（恢复时机在 title / 下拉里），点击入口转「恢复」 */
+const dotClass = computed(() => (store.autoSyncPaused.value ? 'paused' : store.connStatus.value))
 </script>
 
 <template>
@@ -20,11 +28,34 @@ const statusText = computed(() =>
     <div class="flex flex-col gap-px">
       <div class="app-name">WebDAV 同步</div>
       <div class="flex items-center gap-[5px]">
-        <span class="dot" :class="store.connStatus.value" />
-        <span class="text-[11px] text-ink-2 leading-[1.2]">{{ statusText }}</span>
+        <span class="dot" :class="dotClass" />
+        <span class="text-[11px] text-ink-2 leading-[1.2]" :title="store.autoSyncPaused.value ? '自动同步已暂停，手动「立即同步」仍可用' : ''">{{ statusText }}</span>
       </div>
     </div>
     <span class="flex-spacer" />
+    <!-- 全局暂停 / 恢复自动同步（手动「立即同步」不受影响） -->
+    <AppDropdown placement="bottom-end" :min-width="168">
+      <template #trigger="{ toggle }">
+        <AppIconButton
+          :title="store.autoSyncPaused.value ? '自动同步已暂停' : '暂停自动同步'"
+          variant="ghost"
+          class="text-icon-dark"
+          :class="{ 'pause-active': store.autoSyncPaused.value }"
+          @click="toggle"
+        >
+          <AppIcon :name="store.autoSyncPaused.value ? 'play' : 'pause'" :size="15" />
+        </AppIconButton>
+      </template>
+      <template #default="{ close }">
+        <template v-if="!store.autoSyncPaused.value">
+          <button type="button" class="menu-item" @click="store.pauseAutoSync(30 * 60000); close()">暂停 30 分钟</button>
+          <button type="button" class="menu-item" @click="store.pauseAutoSync(60 * 60000); close()">暂停 1 小时</button>
+          <button type="button" class="menu-item" @click="store.pauseAutoSync(4 * 60 * 60000); close()">暂停 4 小时</button>
+          <button type="button" class="menu-item" @click="store.pauseAutoSync(0); close()">一直暂停（手动恢复）</button>
+        </template>
+        <button type="button" class="menu-item" @click="store.resumeAutoSync(); close()">恢复自动同步</button>
+      </template>
+    </AppDropdown>
     <!-- 同步记录入口：有待处理事项时图标角标红点提示（事项本身经待处理中心处理） -->
     <AppIconButton title="同步记录" variant="ghost" class="text-icon-dark dec-entry" @click="store.state.route = 'decisions'">
       <AppIcon name="history" :size="15" />
@@ -96,6 +127,17 @@ const statusText = computed(() =>
     background: #d97706;
     box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.14);
   }
+
+  /* 全局暂停：琥珀常亮（与「警告但可控」的语义一致，不用红色） */
+  &.paused {
+    background: #d97706;
+    box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.14);
+  }
+}
+
+/* 暂停按钮激活态：图标转琥珀，提示当前处于暂停中 */
+.pause-active {
+  color: #d97706 !important;
 }
 
 /* 同步记录入口的待处理角标：图标右上角红点（描白边避免与图标粘连） */

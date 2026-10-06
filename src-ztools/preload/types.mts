@@ -53,6 +53,33 @@ export interface NetOpts {
   maxSockets?: number
   /** 每源每秒请求上限（默认 0 = 不限制；档案命中且未设置时按档案默认） */
   ratePerSec?: number
+  /**
+   * 上传带宽上限（KB/s，0 / 缺省 = 不限制）：按源（origin）共享的字节令牌桶，
+   * 同一服务器并发上传的总速率受限（限的是总量）；大文件按小块平滑放行，
+   * 低限速不会触发空闲超时。
+   */
+  uploadKBps?: number
+  /** 下载带宽上限（KB/s，0 / 缺省 = 不限制；口径同 uploadKBps，方向为下载） */
+  downloadKBps?: number
+  /**
+   * HTTP 代理地址（如 http://127.0.0.1:7890，可带 user:pass@ 代理认证；
+   * 空 / 缺省 = 直连）。https 目标经 CONNECT 隧道（TLS 端到端，代理看不到内容），
+   * http 目标按绝对 URI 经代理转发。公司内网到不了云端的场景。
+   */
+  proxyUrl?: string
+}
+
+/**
+ * 服务器列表条目（多账号 / 多服务器；配置的 servers[] 成员）。
+ * 在 DavConfig（地址 / 账号 / netOpts / tls）之上加 id 与显示名；
+ * 目录经 serverId 引用某台服务器（缺省跟随第一台），认证方式（Basic /
+ * Digest）由引擎按服务器挑战自动协商，凭据存储形态不变。
+ */
+export interface DavServerEntry extends DavConfig {
+  /** 稳定 id（目录 serverId 的引用键；旧单服务器配置迁移生成的固定为 'srv-default'） */
+  id: string
+  /** 显示名（设置页服务器下拉；空 = 按地址 host 推断） */
+  name?: string
 }
 
 /**
@@ -200,6 +227,14 @@ export interface SyncSummary {
    *   dirtyPaths —— 本地增量扫描的脏路径数（仅 local='dirty' 时有意义，后续任务填充）。
    */
   scan?: { remote: 'infinity' | 'per-dir'; skippedDirs?: number; local?: 'full' | 'dirty'; dirtyPaths?: number }
+  /**
+   * 预演轮标记（「预演一次」入口）：true = 本轮只扫描与规划、零副作用 —— 未执行
+   * 任何传输、未写基线 / 挂起 / 失败表，云端与本地文件零改动；uploaded / downloaded
+   * / deleted / conflicts / bytesUp / bytesDown 与 ops 明细是「将要发生什么」的
+   * 计划值（与随后真实轮同口径）。调度器据此不对预演结果做任何排程影响（不退避、
+   * 不 follow-up），渲染层 round-end 据此不进行目录行状态机（预演有自己的结果弹窗）。
+   */
+  dryRun?: boolean
 }
 
 /** 插件偏好设置（渲染层 prefs 段） */
@@ -266,6 +301,14 @@ export interface Prefs {
    * remotePath 键更换：首轮把本机插件重新上传到新位置，旧位置内容不迁移不删除。
    */
   ztoolsPluginSyncRemoteDir?: string
+  /**
+   * 全局暂停自动同步（顶栏一键暂停）：epoch ms 到期时刻。约定：> 0 且在未来 =
+   * 暂停至该时刻；-1 = 一直暂停（只能手动恢复）；0 / 缺省 / 已过期 = 未暂停。
+   * 暂停期间不排自动轮（interval / backoff / follow-up / startup 均不触发）、
+   * 不挂 watcher；手动「立即同步」不受影响（用户显式动作）。恢复 / 到期后由
+   * 调度器对有资格的空闲目录短抖动内补跑一轮，吸收暂停期间的积压变更。
+   */
+  globalPauseUntil?: number
 
   // ---------- 持久警告的「不再显示」标记（渲染层 UI 关注，引擎不消费） ----------
   //
@@ -489,8 +532,12 @@ export interface SchedulerApi {
    *  引擎 hints.op 注入本轮规划：补齐档恢复本端缺失、保留本端多出与改动，双侧
    *  都改走冲突流程；覆盖档以选定侧为准镜像对侧（缺失恢复 / 不一致覆盖 / 多余
    *  删除）。目录忙时明确拒绝 —— 忙时重排轮无法携带 op，放行会退化成常规轮，
-   *  违背按钮语义） */
-  syncNow(dirId?: string, opts?: { op?: 'pull' | 'push' | 'pull-full' | 'push-full' }): Promise<SyncNowResult | { ok: boolean; perDir: Array<{ dirId: string; ok: boolean; error?: string }> }>
+   *  违背按钮语义）
+   *  opts.dryRun 携带预演（「预演一次」入口，true = 只扫描与规划的零副作用轮，
+   *  经引擎 hints.dryRun 生效：返回 summary 带 dryRun 标记，计划值与随后真实轮
+   *  同口径；同步记录以 trigger='dry-run' 落一条预演记录；不触发排程影响 ——
+   *  不退避、不 follow-up、不动目录行状态；忙时同样拒绝） */
+  syncNow(dirId?: string, opts?: { op?: 'pull' | 'push' | 'pull-full' | 'push-full'; dryRun?: boolean }): Promise<SyncNowResult | { ok: boolean; perDir: Array<{ dirId: string; ok: boolean; error?: string }> }>
   /** 请求取消（接引擎 shouldAbort 通道；在飞轮在文件边界以取消语义收场） */
   cancel(dirId?: string): void
   /** 挂起自动调度（幂等；手动仍可用）。reason：'pref' = 用户偏好隐藏时挂起，'api' = 程序化挂起 */
@@ -723,7 +770,8 @@ export interface SyncLogEntry {
    * 触发方式：manual 手动同步 / manual-delegated 手动同步（多实例委托代跑，
    * 展示口径与 manual 合并）/ interval 定时自动 / watch 文件变化自动 /
    * startup 插件启动 / backoff 失败退避重试 / follow-up 开放意图后续轮 /
-   * yield-retry 让出后重试
+   * yield-retry 让出后重试 / dry-run 预演（只扫描规划不执行，trigger='dry-run'
+   * 的记录 counts 与 ops 是「将要发生什么」的计划值，summary.dryRun 同时标记）
    */
   trigger: string
   /** 一次性单向操作（手动「云端补齐 / 覆盖本地」等四个按钮）；常规轮缺省 */

@@ -1,9 +1,10 @@
-import { computed, reactive, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import type {
   ConflictChoice,
   ConflictInfo,
   DavCapabilities,
   DavConfig,
+  DavServerEntry,
   DavTier,
   DirOverrides,
   DirStatus,
@@ -12,6 +13,7 @@ import type {
   SchedulerEvent,
   SchedulerSlotView,
   SyncDir,
+  SyncLogEntry,
   SyncMode,
   SyncSummary,
   ZtoolsPluginsSyncDesc,
@@ -65,6 +67,8 @@ export function defaultPrefs(): Prefs {
     // ztools-plugins.mts —— 渲染层只持有开关与行级暂停两个 prefs 字段
     ztoolsPluginSync: false,
     ztoolsPluginSyncPaused: false,
+    // 全局暂停自动同步（顶栏一键暂停）：0 = 未暂停；-1 = 一直暂停；> 0 = 到期时刻
+    globalPauseUntil: 0,
     // 云端存储位置的父目录（'' = 默认云端根；实际同步根 = <该目录>/ztools-plugins/<平台>）
     ztoolsPluginSyncRemoteDir: '',
     // 持久黄色警告的「不再显示」标记（字段语义见 types.mts Prefs 注释）：
@@ -114,20 +118,35 @@ export function tierHint(t?: DavTier | null): string {
 }
 
 interface PersistShape {
+  /** 旧单服务器字段（多服务器形态下 = 活跃服务器条目的同步副本，兼容旧版本读取） */
   server: DavConfig
+  /** 服务器列表（多账号 / 多服务器；权威形态，调度器与设置页按此解析） */
+  servers?: DavServerEntry[]
+  /** 活跃服务器 id（设置页正在编辑 / 主界面卡片展示的那台；缺省 = 第一台） */
+  activeServerId?: string
   dirs: SyncDir[]
   prefs: Prefs
 }
 
 const state = reactive({
   route: 'main' as 'main' | 'settings' | 'decisions',
-  server: { serverUrl: '', username: '', password: '' } as DavConfig,
+  /**
+   * 服务器列表（多账号 / 多服务器）：state.server 恒指向其中的活跃条目
+   *（reactive 数组内的代理对象），v-model 直接改写条目、persist 整列表落盘。
+   * 恒保至少一条（零配置初态也是一条空白条目）—— 单服务器用户的形态不变。
+   */
+  servers: [] as DavServerEntry[],
+  activeServerId: '',
+  /** 活跃服务器条目（servers 内的代理；字段语义与旧单服务器完全一致） */
+  server: { serverUrl: '', username: '', password: '' } as DavServerEntry,
   dirs: [] as SyncDir[],
   prefs: defaultPrefs(),
   connected: false, // 服务器可达
   connChecked: false, // 是否已探测过连接
   testing: false,
   testResult: null as TestResult | null,
+  /** 最近一次连接测试带出的云端配额（RFC 4331；服务器未返回时为 null —— UI 零行为变化） */
+  quota: null as { available: number | null; used: number | null } | null,
   /** 最近一次能力探测结果（档位展示与 B 档提示的来源） */
   capabilities: null as DavCapabilities | null,
   probing: false, // 「重新探测」进行中
@@ -201,12 +220,23 @@ function persist() {
       // 密码混淆落盘：preload 的 AES-256-GCM sealSecret（同步接口）。
       // 防随手窥视而非强加密（密钥与密文同机，README 已知边界如实说明）；
       // 无 preload（浏览器预览）时原样保存 —— 演示形态无真实凭据。
+      // servers[] 为权威形态（逐条混淆）；server 字段 = 活跃条目的同步副本，
+      // 旧版本插件（只认单 server）降级运行时仍可用。
       server: (() => {
         const sv = { ...state.server }
         const sec = window.services?.secure
         if (sec && typeof sv.password === 'string') sv.password = sec.sealSecret(sv.password)
         return sv
       })(),
+      servers: (() => {
+        const sec = window.services?.secure
+        return state.servers.map((sv) => {
+          const out = { ...sv }
+          if (sec && typeof out.password === 'string') out.password = sec.sealSecret(out.password)
+          return out
+        })
+      })(),
+      activeServerId: state.activeServerId,
       // 进度等运行时字段不入库；入库字段显式限长（见 sanitizeDirForPersist）。
       // 【实验：ZTools 插件同步】虚拟行不持久化（dirs 里过滤）—— 调度器每次
       // reload 都按 prefs 开关现场合成同 id 的目录，配置权威只有 prefs
@@ -248,9 +278,101 @@ function loadPersisted(): PersistShape | null {
   }
 }
 
+// ---------- 服务器列表（多账号 / 多服务器） ----------
+
+/** 服务器条目的展示名：显式名称优先，缺省按地址推断 host（再缺省「服务器 N」） */
+export function serverLabel(sv: DavServerEntry, idx = 0): string {
+  if (sv.name && sv.name.trim()) return sv.name.trim()
+  const u = String(sv.serverUrl || '').trim()
+  if (u) {
+    try {
+      return new URL(u).hostname
+    } catch {
+      return u
+    }
+  }
+  return `服务器 ${idx + 1}`
+}
+
+/** 确保服务器列表至少一条且 state.server 指向活跃条目（init 与增删后统一收口） */
+function normalizeServers(activeId?: string): void {
+  if (!state.servers.length) {
+    state.servers.push({ id: uid(), name: '', serverUrl: '', username: '', password: '' })
+  }
+  const hit = activeId && state.servers.find((s) => s.id === activeId)
+  state.activeServerId = (hit || state.servers[0]).id
+  state.server = state.servers.find((s) => s.id === state.activeServerId) || state.servers[0]
+}
+
+/**
+ * 切换活跃服务器（设置页下拉 / 主界面卡片）：连接状态指示按新服务器归零
+ *（connected / 档位 / 配额都是旧服务器的观测值，不得串显），随后由启动探测
+ * 或用户测试重建。切换只影响编辑视图与主界面卡片展示 —— 各同步目录的
+ * serverId 不变，照常使用各自的服务器。
+ */
+function setActiveServer(id: string): void {
+  const hit = state.servers.find((s) => s.id === id)
+  if (!hit || id === state.activeServerId) return
+  state.activeServerId = id
+  state.server = hit
+  state.connected = false
+  state.connChecked = false
+  state.testResult = null
+  state.capabilities = null
+  state.quota = null
+  persist()
+}
+
+/** 添加服务器：空白条目入列并切换为活跃（设置页立即开始填写新服务器） */
+function addServer(): void {
+  const entry: DavServerEntry = { id: uid(), name: '', serverUrl: '', username: '', password: '' }
+  state.servers.push(entry)
+  state.activeServerId = entry.id
+  state.server = entry
+  state.connected = false
+  state.connChecked = false
+  state.testResult = null
+  state.capabilities = null
+  state.quota = null
+  persist()
+}
+
+/**
+ * 删除服务器：最后一台不可删（形态退化为空白可编辑条目）；仍有同步目录使用
+ *（显式 serverId 指向它，或目录未写 serverId 而它是第一台 —— 删除会让这些
+ * 目录静默改连另一台服务器）时明确拒绝并提示先改挂其他服务器。删除的是配置
+ * 条目，不影响电脑与云端文件。
+ */
+function removeServer(id: string): void {
+  if (state.servers.length <= 1) {
+    toast.warning('至少保留一台服务器', '可以清空地址与账号来停用这台服务器')
+    return
+  }
+  const idx = state.servers.findIndex((s) => s.id === id)
+  if (idx < 0) return
+  const isFirst = idx === 0
+  const used = state.dirs.filter((d) => !isPluginSyncDir(d) && (d.serverId === id || (d.serverId == null && isFirst)))
+  if (used.length) {
+    toast.warning('这台服务器正在被使用', `有 ${used.length} 个同步文件夹使用它，请先在这些文件夹的设置里改用其他服务器`)
+    return
+  }
+  state.servers.splice(idx, 1)
+  normalizeServers()
+  persist()
+}
+
+/** 目录生效的服务器条目（dirEngineCfg 与 UI 展示共用）：serverId 显式指向优先，缺省回落第一台（与调度器 serverEntryOf 同口径） */
+export function serverOfDir(d: SyncDir): DavServerEntry {
+  const hit = (d.serverId && state.servers.find((s) => s.id === d.serverId)) || null
+  return hit || state.servers[0] || state.server
+}
+
+
+
 // ---------- 派生 ----------
 
-const configured = computed(() => !!state.server.serverUrl.trim())
+/** 已配置任一服务器（多服务器形态：任一台填了地址即可同步 —— 各目录按 serverId 各自取用） */
+const configured = computed(() => state.servers.some((s) => String(s.serverUrl || '').trim()))
 const connStatus = computed<'connected' | 'disconnected' | 'unconfigured'>(() => {
   if (!configured.value) return 'unconfigured'
   return state.connected ? 'connected' : 'disconnected'
@@ -284,10 +406,79 @@ const insecureHttp = computed(() => {
   }
 })
 
+// ---------- 全局暂停自动同步（顶栏一键暂停） ----------
+
+/**
+ * 暂停剩余时间展示用的跳动时钟：仅暂停期间运转的 30s 周期 ref，驱动
+ * autoSyncPaused / pauseRemainingText 随时间翻转（到期自动显示为未暂停，
+ * 调度器侧由到期定时器自行恢复，渲染层不承担恢复动作）。
+ */
+const pauseTicker = ref(0)
+let pauseTickerTimer: ReturnType<typeof setInterval> | null = null
+function ensurePauseTicker(): void {
+  if (pauseTickerTimer) return
+  pauseTicker.value = Date.now()
+  pauseTickerTimer = setInterval(() => {
+    pauseTicker.value = Date.now()
+    if (!autoSyncPaused.value) stopPauseTicker()
+  }, 30000)
+}
+function stopPauseTicker(): void {
+  if (pauseTickerTimer) {
+    clearInterval(pauseTickerTimer)
+    pauseTickerTimer = null
+  }
+}
+
+/** 全局暂停到期时刻（已归一）：0 = 未暂停；-1 = 一直暂停；> 0 = 到期 epoch ms */
+const globalPauseUntil = computed(() => {
+  pauseTicker.value // 依赖跳动时钟：到期瞬间本计算自动翻转
+  const p = Number(state.prefs.globalPauseUntil)
+  if (!Number.isFinite(p) || p === 0) return 0
+  if (p === -1) return -1
+  return p > Date.now() ? p : 0
+})
+/** 自动同步是否处于全局暂停中（手动「立即同步」不受影响，见 scheduler.dirEligible） */
+const autoSyncPaused = computed(() => globalPauseUntil.value !== 0)
+/** 顶栏状态位的暂停文案（title 里带恢复时机） */
+const pauseStatusText = computed(() => {
+  const until = globalPauseUntil.value
+  if (until === -1) return '已暂停同步'
+  const remainMs = until - (pauseTicker.value || Date.now())
+  const min = Math.max(1, Math.round(remainMs / 60000))
+  const remain = min >= 60 ? `${Math.floor(min / 60)} 小时${min % 60 ? ` ${min % 60} 分` : ''}` : `${min} 分钟`
+  return `已暂停同步，约 ${remain} 后自动恢复`
+})
+
+/**
+ * 一键暂停自动同步（顶栏下拉）：durationMs = 暂停时长；0 = 一直暂停（手动恢复）。
+ * 持久化后调度器经 reload 感知：自动轮不排、watcher 摘除；手动「立即同步」不受影响。
+ */
+function pauseAutoSync(durationMs: number): void {
+  state.prefs.globalPauseUntil = durationMs > 0 ? Date.now() + durationMs : -1
+  ensurePauseTicker()
+  persist()
+}
+/** 恢复自动同步：清暂停标记；调度器经 reload 感知迁移并对有资格目录短抖动内补跑一轮 */
+function resumeAutoSync(): void {
+  if (state.prefs.globalPauseUntil === 0) return
+  state.prefs.globalPauseUntil = 0
+  stopPauseTicker()
+  persist()
+}
+
 // ---------- 连接 ----------
 
 /** 测试连接结果（附带档位与能力摘要，字段向后兼容） */
-type TestResult = { ok: boolean; latencyMs?: number; error?: string; tier?: DavTier | null; capabilities?: DavCapabilities | null }
+type TestResult = {
+  ok: boolean
+  latencyMs?: number
+  error?: string
+  tier?: DavTier | null
+  capabilities?: DavCapabilities | null
+  /** 云端配额（RFC 4331；服务器未返回时不携带 —— 展示层静默跳过） */
+  quota?: { available: number | null; used: number | null }
+}
 
 /**
  * 测试连接（设置页 / 主界面卡片按钮）。
@@ -328,6 +519,8 @@ async function testConnection(opts?: { notify?: boolean }): Promise<TestResult> 
   state.connChecked = true
   // 保存最近一次探测结果（档位展示来源；探测失败保留 null）
   if (result.capabilities) state.capabilities = result.capabilities
+  // 云端配额随连接测试刷新（服务器未返回 / 探测失败 → null，卡片不展示）
+  state.quota = result.quota ?? null
 
   if (notify) {
     if (result.ok) toast.success('连接成功', `服务器响应 ${result.latencyMs ?? 0} 毫秒`)
@@ -419,16 +612,18 @@ export function dirSyncPrefs(d: SyncDir) {
     adoptVerifyBudgetBytes: state.prefs.adoptVerifyBudgetBytes,
     leaseLock: o?.leaseLock ?? state.prefs.leaseLock,
     excludePatterns: o?.excludePatterns ?? state.prefs.excludePatterns,
+    // 勾选树「取消同步」的精确 rel（目录级字段）：与 glob 规则在引擎扫描层合并
+    excludeRels: o?.excludeRels ?? undefined,
   }
 }
 
 /**
- * 目录生效的引擎连接配置：全局 server 之上应用目录级网络层覆盖
- *（当前仅 ratePerSec 限速；显式数值直接覆盖全局 netOpts 与档案默认的分层口径，
- * 未设置时保持全局原样 —— 引擎 resolveNetOpts 按既有分层生效）。
+ * 目录生效的引擎连接配置：目录 serverId 指向的服务器条目之上应用目录级网络层
+ * 覆盖（当前仅 ratePerSec 限速；显式数值直接覆盖该服务器 netOpts 与档案默认的
+ * 分层口径，未设置时保持服务器配置原样 —— 引擎 resolveNetOpts 按既有分层生效）。
  */
 export function dirEngineCfg(d: SyncDir): DavConfig {
-  const cfg: DavConfig = { ...state.server }
+  const cfg: DavConfig = { ...serverOfDir(d) }
   if (d.overrides?.ratePerSec != null) {
     cfg.netOpts = { ...cfg.netOpts, ratePerSec: d.overrides.ratePerSec }
   }
@@ -631,6 +826,69 @@ async function syncAll() {
   }
 }
 
+/**
+ * 预演一次（「选择性同步」的配套入口，目录行「更多操作」菜单）：只扫描与规划的
+ * 零副作用轮 —— 不上传 / 不下载 / 不删除、不写基线，云端与电脑文件零改动。
+ * 调度器在线时经 syncNow(opts.dryRun) 排队（忙时明确拒绝）；无调度器形态直调
+ * 引擎注入 hints.dryRun（同一语义）。预演结果以同步记录（trigger='dry-run'）
+ * 落盘，结果弹窗经 listSyncLog 读取最新一条预演记录渲染（明细与真实轮同口径）。
+ * 调度器路径不发 round-end —— 目录行状态在轮前后保持不变；slot 进度事件会把
+ * 行置为 syncing，本函数收尾时按 slot 实际状态复位（空闲才复位，避免误清真实轮）。
+ * @returns { ok, error? } —— ok=false 时 error 为失败原因（含忙时拒绝 / 预演轮错误摘要）
+ */
+async function dryRunDir(dir: SyncDir): Promise<{ ok: boolean; error?: string }> {
+  if (!window.services) return { ok: false, error: '浏览器预览模式没有连接服务器的能力，无法预演' }
+  if (state.demo) return { ok: false, error: '演示模式没有真实文件，无法预演' }
+  if (!configured.value || dir.status === 'syncing') return { ok: false, error: '这个文件夹正在同步中，请等这一轮结束再试' }
+  const sched = window.services.scheduler
+  try {
+    if (sched) {
+      const r = await sched.syncNow(dir.id, { dryRun: true })
+      if (r && 'error' in r && r.error) return { ok: false, error: r.error }
+      return { ok: true }
+    }
+    // 无调度器形态（降级直调引擎）：注入预演 hints，与调度器路径同一语义
+    const prefs = dirSyncPrefs(dir)
+    await window.services.sync.syncDirectory(dirEngineCfg(dir), { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }, prefs, {
+      hints: { source: 'dry-run', dryRun: true },
+    })
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  } finally {
+    // slot 进度事件会把行置为 syncing：按调度器实际状态复位（预演轮不发 round-end，
+    // 若此刻有真实轮在飞则保持 syncing 交给 round-end 收尾）
+    const d = state.dirs.find((x) => x.id === dir.id)
+    if (d && d.status === 'syncing') {
+      const schedNow = window.services?.scheduler
+      let busy = false
+      try {
+        const snap = schedNow?.getSnapshot?.()
+        const slot = snap && snap.slots.find((s) => s.id === dir.id)
+        busy = !!slot && (slot.state === 'running' || slot.state === 'queued')
+      } catch (_) {
+        busy = false
+      }
+      if (!busy) {
+        d.status = 'idle'
+        d.progress = null
+      }
+    }
+  }
+}
+
+/** 读取某目录最新一条预演记录（trigger='dry-run'；预演结果弹窗的数据源） */
+async function latestDryRunRecord(dir: SyncDir): Promise<SyncLogEntry | null> {
+  if (!window.services) return null
+  try {
+    const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
+    const rounds = (await window.services.sync.listSyncLog(dirArg)) as SyncLogEntry[]
+    return (rounds || []).find((r) => r.trigger === 'dry-run') || null
+  } catch (_) {
+    return null
+  }
+}
+
 // ---------- 目录管理 ----------
 
 // ----------【实验：ZTools 插件同步】虚拟行 ----------
@@ -739,8 +997,11 @@ function disablePluginSync() {
   state.prefs.ztoolsPluginSyncPaused = false
 }
 
-/** 新增同步目录；overrides 可选（「覆盖全局设置」开启时传入，保证首次同步即用目录级参数） */
-function addDir(localPath: string, remotePath: string, mode: SyncMode, overrides: DirOverrides | null = null): SyncDir | null {
+/**
+ * 新增同步目录；overrides 可选（「覆盖全局设置」开启时传入，保证首次同步即用目录级参数）；
+ * serverId 可选（多服务器：缺省挂当前活跃的服务器）
+ */
+function addDir(localPath: string, remotePath: string, mode: SyncMode, overrides: DirOverrides | null = null, serverId?: string): SyncDir | null {
   if (!localPath || !remotePath) return null
   const dir: SyncDir = {
     id: uid(),
@@ -749,6 +1010,7 @@ function addDir(localPath: string, remotePath: string, mode: SyncMode, overrides
     remotePath: normalizeRemote(remotePath),
     mode,
     overrides,
+    serverId: serverId || state.activeServerId || null,
     status: 'idle',
     lastSyncAt: null,
     lastResult: null,
@@ -810,7 +1072,7 @@ function resetDirOverrides(id: string) {
  * 路径 / 方式变化会通过 dirs 的序列化 watch 触发 onDirsChanged，重挂文件监听并持久化。
  * 插件同步虚拟行 no-op —— 本地目录自动发现、远端按平台隔离，均不可修改。
  */
-function updateDir(id: string, patch: { localPath?: string; remotePath?: string; mode?: SyncMode; overrides?: DirOverrides | null }) {
+function updateDir(id: string, patch: { localPath?: string; remotePath?: string; mode?: SyncMode; overrides?: DirOverrides | null; serverId?: string | null }) {
   const d = state.dirs.find((x) => x.id === id)
   if (!d || isPluginSyncDir(d)) return
   if (patch.localPath !== undefined) {
@@ -820,6 +1082,7 @@ function updateDir(id: string, patch: { localPath?: string; remotePath?: string;
   if (patch.remotePath !== undefined) d.remotePath = normalizeRemote(patch.remotePath)
   if (patch.mode !== undefined) d.mode = patch.mode
   if (patch.overrides !== undefined) d.overrides = patch.overrides
+  if (patch.serverId !== undefined) d.serverId = patch.serverId
 }
 
 /**
@@ -937,6 +1200,18 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
   const dir = state.dirs.find((d) => d.id === ev.dirId)
   if (!dir) return
   const summary = ev.summary ?? null
+  // 预演轮（「预演一次」）：不进行行状态机 —— 计划值不写入 lastResult / 状态与
+  // 提示条都不动（结果由 DryRunModal 经 listSyncLog 的预演记录渲染）。只把 slot
+  // 进度事件置出的 syncing 复位（调度器不发 round-end，收尾由本守卫承担）
+  if (summary && (summary as { dryRun?: boolean }).dryRun) {
+    if (dir.status === 'syncing' && !dir.progress) {
+      dir.status = 'idle'
+      dir.errorMessage = null
+      dir.errorDetail = null
+    }
+    dir.progress = null
+    return
+  }
   const sched = window.services?.scheduler
   const disp = sched && typeof sched.summarizeRound === 'function' ? sched.summarizeRound(summary, ev.error, ev.cancelled) : null
   if (ev.cancelled) {
@@ -1358,14 +1633,29 @@ function normalizeLegacyIntervals(): void {
 async function init() {
   const persisted = loadPersisted()
   if (persisted) {
-    state.server = { ...state.server, ...persisted.server }
-    // 密码解密回内存（引擎调用需要明文）：解密失败返回空串 —— 界面显示空密码，
-    // 连接测试以 401 提示用户重输；无 preload（浏览器预览）时保持原值
+    // 服务器列表载入与迁移：servers[] 为权威形态；旧配置只有单份 server ——
+    // 迁移为唯一成员（id 固定 'srv-default'，与调度器 loadConfig 的迁移同款，
+    // 目录缺省 serverId 恰好指向它，行为与单服务器形态完全一致）。
     const sec = window.services?.secure
-    if (sec && typeof state.server.password === 'string') state.server.password = sec.openSecret(state.server.password)
+    const openPwd = (sv: DavServerEntry): DavServerEntry => {
+      const out = { ...sv }
+      if (sec && typeof out.password === 'string') out.password = sec.openSecret(out.password)
+      return out
+    }
+    let loaded: DavServerEntry[] = Array.isArray(persisted.servers) ? persisted.servers.filter((s) => s && typeof s === 'object') : []
+    if (!loaded.length && persisted.server && typeof persisted.server === 'object') {
+      loaded = [{ id: 'srv-default', name: '', ...persisted.server }]
+    }
+    loaded = loaded.map((sv) => openPwd(typeof sv.id === 'string' && sv.id ? sv : { ...sv, id: 'srv-default' }))
+    state.servers = loaded
+    normalizeServers(persisted.activeServerId)
     state.dirs = persisted.dirs || []
     state.prefs = { ...defaultPrefs(), ...(persisted.prefs || {}) }
+  } else {
+    normalizeServers()
   }
+  // 全局暂停恢复计时（暂停期间 30s 跳动驱动状态文案 / 到期翻转；未暂停不启动）
+  if (Number(state.prefs.globalPauseUntil) !== 0) ensurePauseTicker()
   // 旧版本间隔档位归一（<15 分钟 → 15）：在演示场景改写目录之前、绑定调度器
   // 之前执行 —— persist 落盘后调度器握手读到的即是归一后的配置
   normalizeLegacyIntervals()
@@ -1388,18 +1678,26 @@ async function init() {
     }
   )
 
-  // 监听目录启用状态 / 目录级设置 / 路径与同步方式的修改 / 列表增删：持久化
-  //（只取这些字段的序列化特征，同步进度等运行时字段变化不会触发；
+  // 监听目录启用状态 / 目录级设置 / 路径与同步方式的修改 / 使用的服务器 / 列表
+  // 增删：持久化（只取这些字段的序列化特征，同步进度等运行时字段变化不会触发；
   //  插件同步虚拟行不参与特征 —— 它不持久化，增删由 prefs 开关的 watch 驱动）
   watch(
     () =>
       state.dirs
         .filter((d) => !isPluginSyncDir(d))
-        .map((d) => `${d.id}~${dirEnabled(d) ? 1 : 0}~${JSON.stringify(d.overrides ?? null)}~${d.localPath}~${d.remotePath}~${d.mode}`)
+        .map((d) => `${d.id}~${dirEnabled(d) ? 1 : 0}~${JSON.stringify(d.overrides ?? null)}~${d.localPath}~${d.remotePath}~${d.mode}~${d.serverId ?? ''}`)
         .join('|'),
     onDirsChanged
   )
 
+  // 深度监听服务器列表变化（地址 / 账号 / netOpts / tls 的编辑与增删切换）：
+  // 修改后立即生效并持久化 —— 与 prefs 同款语义，调度器经 reload 重建连接配置
+  watch(
+    () => JSON.stringify(state.servers),
+    () => {
+      persist()
+    }
+  )
   // 【实验：ZTools 插件同步】开关 / 行级暂停 / 云端父目录变化 → 维护虚拟行
   //（增删 / 刷新 enabled 与发现结果，远端路径随父目录即时跟随）。行变化不直接
   // 持久化（虚拟行被 persist 过滤），但 prefs 本身的变化经上方 prefs 深 watch
@@ -1429,16 +1727,21 @@ async function init() {
 /** 演示场景数据（与设计稿 7 个画面一一对应） */
 function applyDemo(scene: string) {
   state.demo = true
+  const setDemoServer = (sv: Partial<DavServerEntry>) => {
+    const entry: DavServerEntry = { id: 'demo', name: '', serverUrl: '', username: '', password: '', ...sv }
+    state.servers = [entry]
+    normalizeServers(entry.id)
+  }
   if (scene === 'empty') {
-    state.server = { serverUrl: '', username: '', password: '' }
+    setDemoServer({ serverUrl: '', username: '', password: '' })
     state.dirs = []
     return
   }
-  state.server = {
+  setDemoServer({
     serverUrl: 'https://dav.example.com/remote.php/dav/files/user/',
     username: 'kai.wen',
     password: 'demo-password',
-  }
+  })
   state.connected = true
   state.connChecked = true
   // 演示能力档位：B 档让首页档位徽标（含悬浮图例）与设置页检测结果可见；真实数据来自探测
@@ -1626,6 +1929,23 @@ function outPlugin() {
   }
 }
 
+/**
+ * 在系统文件管理器中打开本地同步文件夹（目录行「更多操作」菜单）。
+ * 与 shellOpenExternal 同类的纯渲染层 UI 交互（host.mts 刻意不端口化的约定），
+ * 宿主缺失或打开失败尽力而为：能力缺失给一条提示，调用异常静默。
+ */
+function openLocalFolder(localPath: string): void {
+  try {
+    if (typeof window.ztools?.shellOpenPath === 'function') {
+      window.ztools.shellOpenPath(localPath)
+      return
+    }
+  } catch (_) {
+    /* 打开失败（路径已不存在等）：静默，用户可自行导航 */
+  }
+  toast.info('当前 ZTools 版本不支持在访达 / 资源管理器中打开文件夹')
+}
+
 export function useStore() {
   return {
     state,
@@ -1637,6 +1957,14 @@ export function useStore() {
     lastSyncAt,
     cloudBytes,
     insecureHttp,
+    globalPauseUntil,
+    autoSyncPaused,
+    pauseStatusText,
+    pauseAutoSync,
+    resumeAutoSync,
+    openLocalFolder,
+    dryRunDir,
+    latestDryRunRecord,
     init,
     testConnection,
     reprobe,
@@ -1676,5 +2004,10 @@ export function useStore() {
     openGuide,
     outPlugin,
     persist,
+    serverLabel,
+    setActiveServer,
+    addServer,
+    removeServer,
+    serverOfDir,
   }
 }

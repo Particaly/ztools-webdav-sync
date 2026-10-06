@@ -17,6 +17,8 @@
 //   远端不再存放任何状态文件；旧的 manifest / pending 日志逻辑已整体删除。
 import http from 'node:http'
 import https from 'node:https'
+import net from 'node:net'
+import tls from 'node:tls'
 import nodeFs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
@@ -140,6 +142,13 @@ interface EnginePrefs {
   adoptVerifyBudgetBytes?: number
   leaseLock: boolean
   excludePatterns?: string[]
+  /**
+   * 勾选树「取消同步」的精确 rel 列表（渲染层选择性同步树的落地形态，
+   * dir.overrides.excludeRels；目录级字段，无全局形态）。与 excludePatterns
+   * 在扫描层合并生效（compileSyncExcludes：字面精确匹配 + 祖先目录命中即
+   * 整棵子树排除）。
+   */
+  excludeRels?: string[]
 }
 
 /** syncDirectory 的回调句柄 */
@@ -160,12 +169,19 @@ interface SyncHandlers {
    *   'pull' = 「云端补齐本地」：云端新增 / 有变化的下载，本地缺失的恢复；本地
    *   多出的保留、本地改过的不覆盖，双侧都改走冲突流程；'push' = 「本地补齐
    *   云端」：按对称语义向云端收敛。'pull-full' = 「云端覆盖本地」/ 'push-full' =
-   *   「本地覆盖云端」：以选定侧为准把对侧完全恢复成它的样子 —— 缺失恢复 /
-   *   不一致覆盖（不做询问）/ 多余删除。四种都只沿选定方向传输；无基线差异不
-   *   产生删除；覆盖档的删除与常规删除同走删除安全闸（批量超阈值挂起等确认）。
-   *   仅对本轮生效，不落配置。
-   */
-  hints?: { source: string; dirtyPaths?: string[]; watcherKey?: string; op?: 'pull' | 'push' | 'pull-full' | 'push-full' }
+ *   「本地覆盖云端」：以选定侧为准把对侧完全恢复成它的样子 —— 缺失恢复 /
+ *   不一致覆盖（不做询问）/ 多余删除。四种都只沿选定方向传输；无基线差异不
+ *   产生删除；覆盖档的删除与常规删除同走删除安全闸（批量超阈值挂起等确认）。
+ *   仅对本轮生效，不落配置。
+ *   dryRun 为 true = 预演轮（「预演一次」入口）：只扫描与规划、零副作用 ——
+ *   不执行任何传输、不写基线 / WAL / 挂起 / 失败表 / scan-cache / meta（只读
+ *   存储壳拦截全部写方法），云端与本地用户文件零改动；计划动作按既有安全闸
+ *  （删除确认 / C 档 / 失败退避 / 大小写冲突等）过滤后计入 summary 与
+ *   __syncOps（明细与真实轮同口径），以 trigger 'dry-run' 落同步记录。冲突按
+ *   生效策略预判（'ask' 只计冲突不询问）；远端根不存在且基线为空（首次同步
+ *   常态）时按「云端为空」合成远端清单（不 MKCOL），全部本地文件规划为上传。
+ */
+  hints?: { source: string; dirtyPaths?: string[]; watcherKey?: string; op?: 'pull' | 'push' | 'pull-full' | 'push-full'; dryRun?: boolean }
 }
 
 /** 网络请求可选项（singleRequest / davRequest 的 opts） */
@@ -526,6 +542,149 @@ function authHeader(cfg: EngineCfg): Record<string, string> {
   return { Authorization: `Basic ${token}` }
 }
 
+// ---------- Digest 认证（401 挑战应答，与 Basic 共存） ----------
+//
+// 请求默认先带 Basic；服务器回 401 且携带 Digest 挑战（WWW-Authenticate: Digest …）
+// 时按 RFC 7616 计算应答头重试 —— 部分老 NAS / 路由器 / Apache 只支持 Digest，
+// 命中即「连不上」，这是它们的唯一通道。挑战参数按 origin+账号缓存复用：后续
+// 请求直接预带 Digest 头（省一次 401 往返），nonce 更换 / stale=true 时刷新重试。
+// 401 表示服务器未处理请求（未落地任何字节），对 PUT 重发安全，与 WAL 语义不冲突。
+
+/** 解析后的 Digest 挑战参数（WWW-Authenticate: Digest 头的值部分） */
+interface DigestChallenge {
+  realm: string
+  nonce: string
+  /** 服务器提供的 qop 列表（逗号分隔原串，如 "auth,auth-int"）；缺省 = RFC 2069 旧式 */
+  qop?: string
+  opaque?: string
+  /** 算法 token（缺省按 MD5）；带 '-sess' 后缀时 HA1 经 nonce+cnonce 再哈希 */
+  algorithm?: string
+  /** 服务器声明 nonce 过期但凭据有效（客户端应换 cnonce 重试，不必重新要凭据） */
+  stale?: boolean
+}
+
+/** 挑战缓存：origin|username → { ch, nc }；nc 为该 nonce 已消耗的序号（8 位十六进制输出） */
+const digestChallenges = new Map<string, { ch: DigestChallenge; nc: number }>()
+
+/** 缓存键：origin + 账号（与能力缓存同粒度 —— 同一服务器多账号各自应答） */
+function digestCacheKey(cfg: EngineCfg, url: URL): string {
+  return `${url.origin}|${(cfg && cfg.username) || ''}`
+}
+
+/**
+ * 解析 Digest 挑战参数：形如 realm="x", nonce="y", qop="auth", opaque="z" 的
+ * 逗号分隔键值对（值可带双引号，引号内逗号不分隔）。realm / nonce 缺失、引号
+ * 未闭合等畸形挑战返回 null（按无法应答处理，401 按原语义上抛）。
+ */
+function parseDigestChallenge(raw: string): DigestChallenge | null {
+  const s = String(raw || '')
+  const params: Record<string, string> = {}
+  let i = 0
+  while (i < s.length) {
+    while (i < s.length && (s[i] === ',' || s[i] === ' ' || s[i] === '\t')) i++
+    const eq = s.indexOf('=', i)
+    if (eq < 0) break
+    const key = s.slice(i, eq).trim().toLowerCase()
+    let val = ''
+    i = eq + 1
+    if (s[i] === '"') {
+      const end = s.indexOf('"', i + 1)
+      if (end < 0) return null
+      val = s.slice(i + 1, end)
+      i = end + 1
+    } else {
+      let j = i
+      while (j < s.length && s[j] !== ',') j++
+      val = s.slice(i, j).trim()
+      i = j
+    }
+    if (key) params[key] = val
+  }
+  if (!params.realm || !params.nonce) return null
+  return {
+    realm: params.realm,
+    nonce: params.nonce,
+    qop: params.qop,
+    opaque: params.opaque,
+    algorithm: params.algorithm,
+    stale: params.stale === 'true',
+  }
+}
+
+/** 算法 token → Node 哈希名（'-sess' 变体取基底；不支持的算法返回 null = 放弃应答） */
+function digestHashName(algorithm?: string): string | null {
+  const t = String(algorithm || 'MD5').trim().toUpperCase()
+  const base = t.replace(/-SESS$/, '')
+  const mapped = base === 'MD5' ? 'md5' : base === 'SHA-256' ? 'sha256' : base === 'SHA-512-256' ? 'sha512-256' : null
+  if (!mapped) return null
+  try {
+    crypto.createHash(mapped)
+  } catch (_) {
+    return null
+  }
+  return mapped
+}
+
+/**
+ * 计算 Digest Authorization 头的值（含 'Digest ' 前缀）。
+ * qop 协商：服务器提供 auth 则用 auth（带 nc / cnonce）；未提供 qop 按 RFC 2069
+ * 旧式应答（response = H(HA1:nonce:HA2)）；只提供 auth-int 时不支持（引擎传输
+ * 流式进行、无法在头里给出请求体哈希）返回 null。算法不支持 / 参数不全同 null。
+ * @param nc 该 nonce 的已消耗序号（调用方先递增再传入；输出补零至 8 位十六进制）
+ */
+function digestAuthorization(ch: DigestChallenge, nc: number, cnonce: string, username: string, password: string, method: string, uri: string): string | null {
+  const hashName = digestHashName(ch.algorithm)
+  if (!hashName || !ch.realm || !ch.nonce || !username) return null
+  const H = (s: string) => crypto.createHash(hashName).update(s).digest('hex')
+  const qopList = String(ch.qop || '').split(',').map((q) => q.trim()).filter(Boolean)
+  if (qopList.length && !qopList.includes('auth')) return null
+  const qop = qopList.includes('auth') ? 'auth' : ''
+  const sess = /-SESS$/i.test(String(ch.algorithm || ''))
+  const ha1Plain = H(`${username}:${ch.realm}:${password}`)
+  const ha1 = sess ? H(`${ha1Plain}:${ch.nonce}:${cnonce}`) : ha1Plain
+  const ha2 = H(`${method}:${uri}`)
+  const ncHex = String(nc).padStart(8, '0')
+  const response = qop === 'auth' ? H(`${ha1}:${ch.nonce}:${ncHex}:${cnonce}:${qop}:${ha2}`) : H(`${ha1}:${ch.nonce}:${ha2}`)
+  const parts = [
+    `username="${username}"`,
+    `realm="${ch.realm}"`,
+    `nonce="${ch.nonce}"`,
+    `uri="${uri}"`,
+    `response="${response}"`,
+    ...(qop === 'auth' ? [`qop=${qop}`, `nc=${ncHex}`, `cnonce="${cnonce}"`] : []),
+    ...(ch.algorithm ? [`algorithm=${String(ch.algorithm).trim().toUpperCase()}`] : []),
+    ...(ch.opaque ? [`opaque="${ch.opaque}"`] : []),
+  ]
+  return `Digest ${parts.join(', ')}`
+}
+
+/**
+ * 从响应头提取 Digest 挑战（WWW-Authenticate 可为数组 / 逗号并置多方案）；
+ * 服务器未提供 Digest 方案返回 null（Basic 专用服务器的 401 维持原语义）。
+ */
+function digestChallengeOf(headers: Record<string, any> | undefined): string | null {
+  const raw = headers && headers['www-authenticate']
+  if (raw == null) return null
+  const list = Array.isArray(raw) ? raw : [raw]
+  for (const v of list) {
+    const s = String(v)
+    if (/^digest\s+/i.test(s)) return s.replace(/^digest\s+/i, '')
+  }
+  return null
+}
+
+/**
+ * 为当前请求构建 Digest 应答头：消耗缓存条目的下一个 nc 序号。
+ * 挑战无效 / 算法不支持返回 null（调用方维持原请求形态）。
+ */
+function nextDigestHeader(cfg: EngineCfg, url: URL, method: string): string | null {
+  const entry = digestChallenges.get(digestCacheKey(cfg, url))
+  if (!entry || !cfg.username) return null
+  entry.nc++
+  const cnonce = crypto.randomBytes(8).toString('hex')
+  return digestAuthorization(entry.ch, entry.nc, cnonce, cfg.username, cfg.password || '', method, url.pathname + url.search)
+}
+
 /** rel 内部 key 统一 NFC（store.js 同名实现的本地引用，避免循环依赖） */
 const nfc = storage.nfc
 
@@ -554,6 +713,12 @@ const nfc = storage.nfc
  * 防止多字节中文文件名被网络块边界拆断）；条目在 <response> 闭合时即产出，
  * 不为整篇文档建树 —— Depth: infinity 大响应的内存驻留只与条目数相关。
  */
+/** 数字属性解析：非有限数字（缺失 / 服务器回了非数字文本）返回 undefined */
+function finiteNumOrNull(v: string): number | undefined {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : undefined
+}
+
 function createMultistatusStream(): any {
   const decoder = new StringDecoder('utf8')
   const parser = new SaxesParser({})
@@ -561,14 +726,16 @@ function createMultistatusStream(): any {
   let firstError: any = null
   let cur: any = null // 当前 <response> 的累积条目
   let capture: any = null // 正在收集文本的 prop：{ field, buf }
-  const FIELDS = new Set(['href', 'getcontentlength', 'getlastmodified', 'getetag', 'status'])
+  // quota-available-bytes / quota-used-bytes（RFC 4331）：集合条目可选携带的配额
+  // 属性 —— 云端剩余空间的展示与轮前预检的数据来源；不返回的服务器条目上缺省。
+  const FIELDS = new Set(['href', 'getcontentlength', 'getlastmodified', 'getetag', 'status', 'quota-available-bytes', 'quota-used-bytes'])
   parser.on('error', (e) => {
     if (firstError == null) firstError = e
   })
   parser.on('opentag', (node) => {
     const name = localName(node.name)
     if (name === 'response') {
-      if (!cur) cur = { href: '', isDir: false, size: 0, mtime: 0, etag: '', seen: new Set<any>() }
+      if (!cur) cur = { href: '', isDir: false, size: 0, mtime: 0, etag: '', quotaAvailable: undefined, quotaUsed: undefined, seen: new Set<any>() }
       return
     }
     if (!cur) return
@@ -595,6 +762,8 @@ function createMultistatusStream(): any {
       else if (capture.field === 'getcontentlength') cur.size = Number(v) || 0
       else if (capture.field === 'getlastmodified') cur.mtime = v ? Date.parse(v) || 0 : 0
       else if (capture.field === 'status') cur.status = v
+      else if (capture.field === 'quota-available-bytes') cur.quotaAvailable = finiteNumOrNull(v)
+      else if (capture.field === 'quota-used-bytes') cur.quotaUsed = finiteNumOrNull(v)
       else cur.etag = v
       capture = null
       return
@@ -608,7 +777,17 @@ function createMultistatusStream(): any {
       } catch (_) {
         /* 保留原值 */
       }
-      entries.push({ href, isDir: cur.isDir, size: cur.size, mtime: cur.mtime, etag: cur.etag, status: cur.status || '' })
+      entries.push({
+        href,
+        isDir: cur.isDir,
+        size: cur.size,
+        mtime: cur.mtime,
+        etag: cur.etag,
+        status: cur.status || '',
+        // 配额属性可选携带（服务器未返回 / 非 404 propstat 缺失时为 undefined）
+        ...(cur.quotaAvailable !== undefined ? { quotaAvailable: cur.quotaAvailable } : {}),
+        ...(cur.quotaUsed !== undefined ? { quotaUsed: cur.quotaUsed } : {}),
+      })
       cur = null
     }
   })
@@ -643,7 +822,9 @@ function localName(name: string): string {
 
 /**
  * 解析 WebDAV multistatus XML，返回条目数组（与命名空间前缀无关）。
- * 签名与输出形状与旧正则实现保持一致：[{ href, isDir, size, mtime, etag }]。
+ * 签名与输出形状与旧正则实现保持一致：[{ href, isDir, size, mtime, etag }]；
+ * 集合条目可选携带 quotaAvailable / quotaUsed（RFC 4331 配额属性，服务器未
+ * 返回时字段缺省 —— 云端剩余空间展示与轮前预检的数据来源）。
  * 畸形 XML 一律 throw（code='XML_PARSE'）——绝不静默返回部分结果。
  */
 function parseMultistatus(xml: string): any {
@@ -702,6 +883,49 @@ const NET_DEFAULTS = {
   stallMs: 60000, // 传输「无进展」判死：收到响应后持续无任何字节的阈值（每块数据都会重置）
   maxSockets: 8, // 每源（host:port）并发连接上限（keep-alive 池）
   ratePerSec: 0, // 每源每秒请求上限，0 = 不限制
+  uploadKBps: 0, // 上传带宽上限（KB/s），0 = 不限制
+  downloadKBps: 0, // 下载带宽上限（KB/s），0 = 不限制
+  proxyUrl: '', // HTTP 代理地址，空 = 直连
+}
+
+/**
+ * 解析后的代理目标（resolveNetOpts 产物；null = 直连）。http 代理 = 明文 TCP、
+ * https 代理 = TLS 连代理（少见的企业中间人形态）；代理认证取 URL userinfo。
+ */
+interface ProxyTarget {
+  protocol: string
+  hostname: string
+  port: number
+  /** 代理认证头（URL userinfo 存在时携带：Proxy-Authorization: Basic …） */
+  authHeader: Record<string, string>
+  origin: string
+}
+
+/** resolveNetOpts 的返回形态：必填化的 NetOpts + 解析好的代理目标 */
+type ResolvedNetOpts = Required<NetOpts> & { proxy: ProxyTarget | null }
+
+/**
+ * 解析代理地址：仅 http:// 与 https://；非法 / 缺省返回 null（按直连处理 ——
+ * 配置错误不应放大成连接失败，UI 侧负责在保存时提示格式）。
+ */
+function parseProxyUrl(raw: unknown): ProxyTarget | null {
+  const s = typeof raw === 'string' ? raw.trim() : ''
+  if (!s) return null
+  try {
+    const u = new URL(s)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    if (!u.hostname) return null
+    const auth: Record<string, string> = u.username
+      ? {
+          'Proxy-Authorization': `Basic ${Buffer.from(
+            `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password || '')}`
+          ).toString('base64')}`,
+        }
+      : {}
+    return { protocol: u.protocol, hostname: u.hostname, port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80), authHeader: auth, origin: u.origin }
+  } catch (_) {
+    return null
+  }
 }
 /** 重定向最大跟随次数：与常见浏览器/客户端默认一致，防重定向环 */
 const MAX_REDIRECTS = 3
@@ -827,7 +1051,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => nodeTimers.setTi
  * 服务器档案默认（坚果云等，见 SERVER_PROFILES）> NET_DEFAULTS（0）。0 是合法
  * 显式值，不能用 num() 的「>0」口径吞掉，单独处理。
  */
-function resolveNetOpts(cfg: EngineCfg): Required<NetOpts> {
+function resolveNetOpts(cfg: EngineCfg): ResolvedNetOpts {
   const raw = cfg && typeof cfg.netOpts === 'object' && cfg.netOpts ? cfg.netOpts : {}
   const num = (v: any, dflt: any) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : dflt)
   const profile = serverProfileFor(cfg && cfg.serverUrl)
@@ -835,6 +1059,7 @@ function resolveNetOpts(cfg: EngineCfg): Required<NetOpts> {
     profile && Number.isFinite(profile.netOpts.ratePerSec) && profile.netOpts.ratePerSec > 0
       ? profile.netOpts.ratePerSec
       : NET_DEFAULTS.ratePerSec
+  const proxyUrl = typeof raw.proxyUrl === 'string' ? raw.proxyUrl.trim() : ''
   return {
     connectTimeoutMs: num(raw.connectTimeoutMs, NET_DEFAULTS.connectTimeoutMs),
     idleTimeoutMs: num(raw.idleTimeoutMs, NET_DEFAULTS.idleTimeoutMs),
@@ -844,23 +1069,30 @@ function resolveNetOpts(cfg: EngineCfg): Required<NetOpts> {
       typeof raw.ratePerSec === 'number' && Number.isFinite(raw.ratePerSec) && raw.ratePerSec >= 0
         ? raw.ratePerSec
         : dfltRate,
+    // 带宽限速：0 = 不限制（显式 0 与缺省同义，无档案分层）
+    uploadKBps: num(raw.uploadKBps, NET_DEFAULTS.uploadKBps),
+    downloadKBps: num(raw.downloadKBps, NET_DEFAULTS.downloadKBps),
+    proxyUrl,
+    proxy: parseProxyUrl(proxyUrl),
   }
 }
 
 /**
- * 模块级 keep-alive 连接池：按「协议 + maxSockets + TLS 信任键」缓存 Agent，
- * Agent 内部再按 host:port 复用。TLS 信任配置不同的连接绝不共用 Agent
- *（信任开关 / CA 追加会改变 TLS 握手行为，共用会让先建的 Agent 决定后到的请求）。
+ * 模块级 keep-alive 连接池：按「协议 + maxSockets + TLS 信任键 + 代理源」缓存
+ * Agent，Agent 内部再按 host:port 复用。TLS 信任配置不同的连接绝不共用 Agent
+ *（信任开关 / CA 追加会改变 TLS 握手行为，共用会让先建的 Agent 决定后到的请求）；
+ * 代理配置不同同样分池（连接去向完全不同）。
  */
 const agentPool = new Map()
-function agentFor(protocol: string, maxSockets: number, tlsOpts?: TlsAgentOpts): http.Agent {
+function agentFor(protocol: string, maxSockets: number, tlsOpts?: TlsAgentOpts, proxy?: ProxyTarget | null): http.Agent {
   const mod = protocol === 'https:' ? https : http
   const tlsKey = protocol === 'https:' && tlsOpts && tlsOpts.key ? tlsOpts.key : ''
-  const key = `${protocol}|${maxSockets}|${tlsKey}`
+  const key = proxy ? `px|${protocol}|${maxSockets}|${tlsKey}|${proxy.origin}` : `${protocol}|${maxSockets}|${tlsKey}`
   let agent = agentPool.get(key)
   if (!agent) {
-    agent =
-      protocol === 'https:' && tlsKey && tlsOpts
+    agent = proxy
+      ? new TunnelAgent(proxy, protocol === 'https:', maxSockets, tlsKey ? tlsOpts : undefined, NET_DEFAULTS.connectTimeoutMs)
+      : protocol === 'https:' && tlsKey && tlsOpts
         ? new https.Agent({
             keepAlive: true,
             maxSockets,
@@ -871,6 +1103,137 @@ function agentFor(protocol: string, maxSockets: number, tlsOpts?: TlsAgentOpts):
     agentPool.set(key, agent)
   }
   return agent
+}
+
+/** 代理类失败的统一包装：一句话人话 + code='NETWORK'（可重试；配置错误的最终由重试耗尽暴露） */
+function proxyFail(detail: string): any {
+  const err: any = new Error(`无法通过代理服务器连接，请检查代理地址是否填写正确（${detail}）`)
+  err.status = 0
+  err.code = 'NETWORK'
+  err.permanent = false
+  err.detail = detail
+  return err
+}
+
+/**
+ * CONNECT 隧道代理 Agent（netOpts.proxyUrl 的落地；无外部依赖的 Node 原生实现）。
+ * 连接形态按「代理协议 × 目标协议」组合：
+ *   http 代理 + https 目标 —— 明文 TCP 到代理 → CONNECT 隧道 → TLS 端到端
+ *     （代理只见加密流，TLS 信任选项作用于隧道内的目标握手）；
+ *   http 代理 + http  目标 —— 不建隧道：普通 TCP 到代理，请求行改绝对 URI
+ *     （singleRequest 已改写 host/port/path，本 Agent 只负责把连接打到代理）；
+ *   https 代理（任意目标）—— 先 TLS 连上代理本身，再按目标协议走上述两种形态。
+ * keep-alive / maxSockets 语义继承 http.Agent：隧道建成后的 socket 照常入池复用。
+ */
+class TunnelAgent extends http.Agent {
+  /** 目标协议标记（Node 客户端校验 agent.protocol 与请求协议一致；@types 未公开父类同名属性，子类显式声明） */
+  declare protocol: string
+  declare defaultPort: number
+  private px: ProxyTarget
+  private targetHttps: boolean
+  private tlsOpts?: TlsAgentOpts
+  private connectTimeoutMs: number
+
+  constructor(px: ProxyTarget, targetHttps: boolean, maxSockets: number, tlsOpts: TlsAgentOpts | undefined, connectTimeoutMs: number) {
+    super({ keepAlive: true, maxSockets })
+    // Agent 的协议标记按目标协议对齐：Node 客户端会校验 agent.protocol 与请求
+    // 协议一致（http.Agent 默认 'http:'，直接服务 https 请求会被拒绝）
+    this.protocol = targetHttps ? 'https:' : 'http:'
+    this.defaultPort = targetHttps ? 443 : 80
+    this.px = px
+    this.targetHttps = targetHttps
+    this.tlsOpts = tlsOpts
+    this.connectTimeoutMs = connectTimeoutMs
+  }
+
+  createConnection(options: any, cb: (err: Error | null, socket?: any) => void): any {
+    const targetHost = String(options.host || options.hostname || '')
+    const targetPort = Number(options.port) || (this.targetHttps ? 443 : 80)
+    this.dial(targetHost, targetPort)
+      .then((sock) => cb(null, sock))
+      .catch((e) => cb(e))
+    // createConnection 的返回值语义（socket | void）与回调式并存；此处只用回调
+  }
+
+  /** 建立到目标的可用连接（连接代理 [+ CONNECT 隧道] [+ 目标 TLS]），全链路受建连超时约束 */
+  private async dial(targetHost: string, targetPort: number): Promise<any> {
+    const deadline = Date.now() + this.connectTimeoutMs
+    const wrap = (p: Promise<any>): Promise<any> =>
+      new Promise((resolve, reject) => {
+        const timer = nodeTimers.setTimeout(() => {
+          const err: any = new Error('连接代理服务器超时，请检查代理地址或网络')
+          err.status = 0
+          err.code = 'NETWORK'
+          err.permanent = false
+          err.detail = `${this.px.origin} → ${targetHost}:${targetPort}`
+          reject(err)
+        }, Math.max(1, deadline - Date.now()))
+        if (typeof timer === 'object' && timer && typeof (timer as any).unref === 'function') (timer as any).unref()
+        p.then(
+          (v) => {
+            nodeTimers.clearTimeout(timer)
+            resolve(v)
+          },
+          (e) => {
+            nodeTimers.clearTimeout(timer)
+            reject(e)
+          }
+        )
+      })
+    // 1. 连接代理本体（http 代理 = 明文 TCP；https 代理 = TLS）
+    let sock: any
+    if (this.px.protocol === 'https:') {
+      sock = await wrap(
+        new Promise((resolve, reject) => {
+          const s = tls.connect({ host: this.px.hostname, port: this.px.port, servername: this.px.hostname })
+          s.once('secureConnect', () => resolve(s))
+          s.once('error', (e: any) => reject(proxyFail(`${this.px.origin} ${e && e.message ? e.message : e}`)))
+        })
+      )
+    } else {
+      sock = await wrap(
+        new Promise((resolve, reject) => {
+          const s = net.connect({ host: this.px.hostname, port: this.px.port })
+          s.once('connect', () => resolve(s))
+          s.once('error', (e: any) => reject(proxyFail(`${this.px.origin} ${e && e.message ? e.message : e}`)))
+        })
+      )
+    }
+    // 2. http 目标：不建隧道（singleRequest 已按绝对 URI 改写请求行），直接可用
+    if (!this.targetHttps) return sock
+    // 3. https 目标：CONNECT 隧道 + 目标 TLS（信任选项作用于这一层握手）
+    const tunnel = await wrap(
+      new Promise<any>((resolve, reject) => {
+        const req = http.request({
+          createConnection: (): any => sock,
+          method: 'CONNECT',
+          path: `${targetHost}:${targetPort}`,
+          headers: { ...this.px.authHeader },
+        })
+        req.once('connect', (res: any, tun: any) => {
+          if (res.statusCode === 200) resolve(tun)
+          else {
+            tun.destroy()
+            reject(proxyFail(`隧道建立被拒绝（HTTP ${res.statusCode}）`))
+          }
+        })
+        req.once('error', (e: any) => reject(proxyFail(`${this.px.origin} ${e && e.message ? e.message : e}`)))
+        req.end()
+      })
+    )
+    return wrap(
+      new Promise((resolve, reject) => {
+        const ts = tls.connect({
+          socket: tunnel,
+          servername: targetHost,
+          ...(this.tlsOpts && this.tlsOpts.rejectUnauthorized === false ? { rejectUnauthorized: false } : {}),
+          ...(this.tlsOpts && this.tlsOpts.ca ? { ca: [this.tlsOpts.ca] } : {}),
+        })
+        ts.once('secureConnect', () => resolve(ts))
+        ts.once('error', (e: any) => reject(normalizeNetError(e, null)))
+      })
+    )
+  }
 }
 
 /** TLS Agent 选项的解析形态：key 为连接池分池键（信任开关 + CA 指纹），Agent 构造项按需携带 */
@@ -937,6 +1300,8 @@ function destroyNetPools(): void {
   for (const agent of agentPool.values()) agent.destroy()
   agentPool.clear()
   rateLimiters.clear()
+  byteBuckets.clear()
+  digestChallenges.clear()
 }
 
 /**
@@ -978,6 +1343,73 @@ function acquireRateSlot(origin: string, ratePerSec: number): Promise<void> {
   })
   bucket.chain = run.catch(() => {})
   return run
+}
+
+// ---------- 带宽限速（netOpts.uploadKBps / downloadKBps 的字节令牌桶） ----------
+//
+// 每源（origin）× 方向（上传 / 下载）各一只桶：同一服务器并发传输经串行链共享
+// 同一总额（限的是总量，不是单流）。取令牌按 ≤64KB 的小块进行，且「有多少取
+// 多少、取到就放行」—— 低限速下 socket 持续有小块流量，不会触发空闲 / 无进展
+// 超时；容量 = 1 秒速率，允许约 1 秒的突发吸收。
+
+/** 带宽桶的最小取块（字节）：低于 1 秒速率的限速仍按此粒度放行首块 */
+const BW_SLICE_BYTES = 64 * 1024
+
+/** 每源 × 方向的字节带宽桶（rate 单位为字节/秒） */
+const byteBuckets = new Map()
+
+/**
+ * 从带宽桶取至多 want 字节：先等桶补充到 ≥1 字节，再取 min(want, floor(tokens))。
+ * 返回实际取得的字节数（恒 ≥1）—— 调用方按返回值放行数据块，令牌渐补渐放。
+ */
+function takeBytes(origin: string, dirKey: 'up' | 'down', rateBps: number, want: number): Promise<number> {
+  const key = `${origin}|${dirKey}`
+  let bucket = byteBuckets.get(key)
+  if (!bucket) {
+    const cap = Math.max(rateBps, 4096)
+    bucket = { rate: rateBps, capacity: cap, tokens: cap, last: Date.now(), chain: Promise.resolve() }
+    byteBuckets.set(key, bucket)
+  }
+  const run = bucket.chain.then(async (): Promise<number> => {
+    for (;;) {
+      const now = Date.now()
+      bucket.tokens = Math.min(bucket.capacity, bucket.tokens + ((now - bucket.last) / 1000) * bucket.rate)
+      bucket.last = now
+      if (bucket.tokens < 1) {
+        await sleep(Math.max(5, Math.ceil((1 - bucket.tokens) * (1000 / bucket.rate))))
+        bucket.tokens = Math.max(bucket.tokens, 1)
+        continue
+      }
+      const take = Math.min(want, Math.floor(bucket.tokens))
+      bucket.tokens -= take
+      return take
+    }
+  })
+  bucket.chain = run.catch(() => {})
+  return run
+}
+
+/**
+ * 带宽限速 Transform：把数据块按 ≤64KB 小块经字节令牌桶放行（边取边 push）。
+ * 失败 / 销毁语义交由 pipeline 传播（与 hashTransform 同构）。
+ */
+function throttleTransform(origin: string, dirKey: 'up' | 'down', rateBps: number): Transform {
+  return new Transform({
+    async transform(chunk: any, _enc: any, cb: any) {
+      try {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        for (let off = 0; off < buf.length; ) {
+          const want = Math.min(buf.length - off, BW_SLICE_BYTES)
+          const got = await takeBytes(origin, dirKey, rateBps, want)
+          this.push(buf.subarray(off, off + got))
+          off += got
+        }
+        cb()
+      } catch (e) {
+        cb(e)
+      }
+    },
+  })
 }
 
 /**
@@ -1095,10 +1527,16 @@ function mapLocalWriteError(e: any, sinkFile: any): any {
  * backpressure 与错误销毁交由 pipeline：读流/写流错误都会终结请求而不是悬挂。
  * 非成功（非 2xx）响应不落盘、不喂 hash —— 重试 / 重定向不得污染最终内容与摘要。
  */
-function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, netOpts: Required<NetOpts>): Promise<DavResponse> {
+function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, netOpts: ResolvedNetOpts): Promise<DavResponse> {
   return new Promise((resolve, reject) => {
     const mod = url.protocol === 'https:' ? https : http
-    const headers = { ...authHeader(cfg), ...opts.headers }
+    const px = netOpts.proxy
+    const viaProxyHttp = !!(px && url.protocol !== 'https:')
+    // http 目标经代理：请求改打代理本体、请求行用绝对 URI（代理据此得知目标）；
+    // Host 头保持目标主机（Node 默认按连接对象取值，会错写成代理）。https 目标
+    // 经代理走 CONNECT 隧道（TunnelAgent 内处理），请求形态与直连完全一致。
+    const headers = { ...authHeader(cfg), ...(px ? px.authHeader : {}), ...opts.headers } as Record<string, any>
+    if (viaProxyHttp) headers.Host = url.host
     let bodyBuf: any = null
     if (opts.bodyFile) {
       // bodyFile 每次尝试都重新 stat + 建流：重试 / 重定向绝不能复用已消费的读流
@@ -1182,6 +1620,7 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
           if (!firstErrFrom) firstErrFrom = 'res'
         })
         const chain = [res]
+        if (netOpts.downloadKBps > 0) chain.push(throttleTransform(url.origin, 'down', netOpts.downloadKBps * 1024))
         if (h) chain.push(hashTransform(h))
         chain.push(sink)
         pipeline(chain, (err) => {
@@ -1210,11 +1649,11 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
     const req = mod.request(
       {
         method,
-        host: url.hostname,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
+        host: viaProxyHttp ? px!.hostname : url.hostname,
+        port: viaProxyHttp ? px!.port : url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: viaProxyHttp ? url.href : url.pathname + url.search,
         headers,
-        agent: agentFor(url.protocol, netOpts.maxSockets, tlsAgentOptsFor(cfg)),
+        agent: agentFor(url.protocol, netOpts.maxSockets, tlsAgentOptsFor(cfg), px),
         timeout: netOpts.idleTimeoutMs,
       },
       onResponse
@@ -1283,6 +1722,7 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
         if (!firstErrFrom) firstErrFrom = 'req'
       })
       const chain: any[] = [rs]
+      if (netOpts.uploadKBps > 0) chain.push(throttleTransform(url.origin, 'up', netOpts.uploadKBps * 1024))
       if (h) chain.push(hashTransform(h))
       chain.push(req)
       pipeline(chain, (err) => {
@@ -1322,7 +1762,7 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
  *  - 其余 4xx 不重试；本地 IO 类错误（LOCAL_IO，permanent）不重试。
  * 退避：500ms × 2^n ± 25% 抖动；429/503 优先采用 Retry-After（已截断 30s 上限，超限标记 capped）。
  */
-async function requestWithRetry(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, netOpts: Required<NetOpts>): Promise<DavResponse> {
+async function requestWithRetry(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, netOpts: ResolvedNetOpts): Promise<DavResponse> {
   const idempotent = IDEMPOTENT_METHODS.has(method)
   const breaker = cfg && cfg.__wdsyncBreaker
   let waitMs = 0
@@ -1392,8 +1832,36 @@ async function davRequest(cfg: EngineCfg, method: string, remotePath: string, op
   // 与其每次跟随重定向，不如一开始就按规范形态发起
   if (opts.isCollection && !startUrl.pathname.endsWith('/')) startUrl.pathname += '/'
   let current = startUrl
-  for (let redirects = 0; ; redirects++) {
-    const res = await requestWithRetry(cfg, method, current, opts, netOpts)
+  // Digest 预热：该 origin+账号已有缓存挑战时直接预带应答头（省一次 401 往返；
+  // 应答被拒时服务器回 401 + 新挑战，由下方挑战分支刷新缓存重试）
+  let curOpts = opts
+  const preheat = nextDigestHeader(cfg, current, method)
+  if (preheat) curOpts = { ...opts, headers: { ...opts.headers, Authorization: preheat } }
+  let redirects = 0
+  let authRetries = 0
+  for (;;) {
+    const res = await requestWithRetry(cfg, method, current, curOpts, netOpts)
+    // Digest 挑战应答：401 + Digest 挑战 → 更新缓存并带应答头重试（上限 2 次：
+    // Basic 降级 + nonce 更换各一次）。401 = 服务器未处理请求（未落地字节），
+    // 对任何方法（含 PUT）重发安全；nc 按缓存序号递增，stale 时沿用原 nonce 计数
+    if (res.status === 401 && authRetries < 2 && cfg && cfg.username) {
+      const rawChallenge = digestChallengeOf(res.headers)
+      const parsed = rawChallenge != null ? parseDigestChallenge(rawChallenge) : null
+      if (parsed) {
+        const dk = digestCacheKey(cfg, current)
+        const cached = digestChallenges.get(dk)
+        const nonceChanged = !cached || cached.ch.nonce !== parsed.nonce
+        if (nonceChanged || parsed.stale) {
+          digestChallenges.set(dk, { ch: parsed, nc: nonceChanged ? 0 : cached ? cached.nc : 0 })
+          const hdr = nextDigestHeader(cfg, current, method)
+          if (hdr) {
+            curOpts = { ...opts, headers: { ...opts.headers, Authorization: hdr } }
+            authRetries++
+            continue
+          }
+        }
+      }
+    }
     if (!REDIRECT_STATUS.has(res.status) || !res.headers || res.headers.location == null) {
       // 附带已跟随的重定向次数：能力探测据此观察「集合 URL 无尾斜杠是否被 301」
       // 一类服务器行为；其余调用方不受影响（新增字段）
@@ -1421,7 +1889,12 @@ async function davRequest(cfg: EngineCfg, method: string, remotePath: string, op
       err.detail = `${current.href} → ${next.href}`
       throw err
     }
+    // 重定向后的新 URL：Digest 应答头里的 uri 与路径绑定，回到无认证形态重走
+    //（同源重定向不换挑战缓存，401 时上方分支按新路径重建应答）
     current = next
+    curOpts = opts
+    authRetries = 0
+    redirects++
   }
 }
 
@@ -2439,6 +2912,57 @@ function compileExcludePatterns(patterns: string[] | null | undefined): ((rel: s
     if (full.some((re) => re.test(s))) return true
     return seg.some((re) => s.split('/').some((name) => re.test(name)))
   }
+}
+
+/**
+ * 勾选树「取消同步」的精确 rel 集合（渲染层选择性同步树落地到
+ * dir.overrides.excludeRels，经 prefs.excludeRels 透传引擎）。与 glob 规则的
+ * 差异：完全字面匹配（不做 * / ? 展开，文件名碰巧含通配符也不会误伤），子树
+ * 语义由 selfOrAncestorMatch 的祖先命中承担。返回 null 表示「无条目」。
+ */
+function compileExactRels(rels: string[] | null | undefined): Set<string> | null {
+  if (!Array.isArray(rels) || rels.length === 0) return null
+  const set = new Set<string>()
+  for (const r of rels) {
+    const s = String(r == null ? '' : r)
+    if (s && s !== '.' && s !== '/' && s.length <= EXCLUDE_PATTERN_LEN_MAX) set.add(s)
+  }
+  return set.size ? set : null
+}
+
+/**
+ * 「自身或任一祖先命中」包装：把一个匹配函数升级为「rel 本身或其任一祖先目录
+ * rel 命中即排除」。两层意义：
+ *   1. 勾选树精确 rel（compileExactRels）的子树语义 —— 取消勾选目录即整棵子树
+ *      不上行也不下行；
+ *   2. 修正 Depth:infinity 形态下全路径 glob（含 '/'）不排除后代的不一致：
+ *      逐目录形态靠「目录未入表 ⇒ 不入队递归」天然剪枝，单请求形态逐条目判定
+ *      时曾只匹配条目自身 —— 同一份规则在两种扫描形态下结果应当一致（祖先链
+ *      逐段上溯后过同一匹配函数，段级 glob 的既有行为不变 —— 它本就逐段命中）。
+ */
+function selfOrAncestorMatch(match: (rel: string) => boolean): (rel: string) => boolean {
+  return (rel: string) => {
+    let cur = String(rel || '')
+    for (;;) {
+      if (match(cur)) return true
+      const i = cur.lastIndexOf('/')
+      if (i < 0) return false
+      cur = cur.slice(0, i)
+    }
+  }
+}
+
+/**
+ * 本轮生效的排除匹配器（单一出口，两侧扫描共用）：用户 glob 规则
+ *（prefs.excludePatterns，compileExcludePatterns 口径）+ 勾选树精确 rel
+ *（prefs.excludeRels），二者任一命中（含祖先目录命中，见 selfOrAncestorMatch）
+ * 即排除。null = 无任何规则（零开销直通）。
+ */
+function compileSyncExcludes(patterns: string[] | null | undefined, exactRels: string[] | null | undefined): ((rel: string) => boolean) | null {
+  const glob = compileExcludePatterns(patterns)
+  const exact = compileExactRels(exactRels)
+  if (!glob && !exact) return null
+  return selfOrAncestorMatch((rel) => (glob ? glob(rel) : false) || (exact ? exact.has(String(rel || '')) : false))
 }
 
 /**
@@ -3617,6 +4141,20 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
     if ((before == null) !== (after == null) || (before && after && (before.size !== after.size || Math.abs(before.mtimeMs - after.mtimeMs) > 1000))) {
       throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
     }
+    // 计划内覆盖（expectedLocal 守卫已通过、目标仍存在）：先把本地旧版本移入
+    // 系统回收站再落地新内容 —— 与删除语义统一，被覆盖的旧版可从回收站找回
+    //（另一台设备误改 / 勒索加密 / 保存损坏时的最后一道本地保险）。回收站
+    // 失败绝不退化直接覆盖：放弃本次下载、旧版原地保留，按瞬时失败下一轮重试。
+    // before 为空（全新下载 / 冲突副本另存）不涉及覆盖，零开销不触发。
+    if (before) {
+      try {
+        await getHostPorts().trashItem(abs)
+      } catch (e: any) {
+        const err: any = new Error(`「${rel}」未下载：电脑上的旧版本无法移入回收站，已保留现有文件，下次同步重试`)
+        err.detail = (e && e.message) || String(e)
+        throw err
+      }
+    }
     await fsp.rename(tmp, abs)
     // rename 落地后 fsync 目标目录（POSIX）——让新目录项掉电级落盘；
     // Windows 无法打开目录句柄，fsyncDirIfPossible 内部跳过（store.js 已知边界）
@@ -4147,6 +4685,8 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
         errors: [e && e.message ? e.message : String(e)],
         errorsDropped: 0,
         failureClass: e.failureClass,
+        // 预演轮兜底路径同样带标记：调度器 planNext 不把预演失败计入退避
+        ...(handlers && handlers.hints && handlers.hints.dryRun === true ? { dryRun: true } : {}),
       }
     }
     throw e
@@ -4275,6 +4815,67 @@ function buildSyncLogEntry(opts: { handlers: any; at: number; summary: any; erro
  *   I6 引擎不依赖窗口 / Vue / store：进度、冲突、结果、错误全部经 handlers 回调外发，
  *      shouldAbort 由调用方注入（调度器位于 preload 的接口预留）
  */
+/**
+ * 预演轮（hints.dryRun）的只读存储壳：拦截全部写方法为 no-op（基线 / WAL /
+ * 挂起 / 删除快照 / 失败退避表 / scan-cache / 各落盘调用一概不动），读全部透传
+ * —— 规划管线按真实数据完整运行、产出「将要发生什么」的计划，而真实存储保持
+ * 原样。openDirStore 进程内缓存复用，壳必须挡住一切内存态写入；meta 对象上的
+ * 直写点由轮内 !dryRun 守卫逐点保护（根探测 / 根丢失分支 / deepVerify 时间戳），
+ * pendingIntents 交给浅拷贝（恢复与取代语义的内存态变更落在副本上，真表不动）。
+ * no-op 返回值对齐真实签名（布尔计数类回真值，避免「已满」类噪声日志）。
+ */
+const DRY_RUN_STORE_NOOP: Record<string, (...args: any[]) => any> = {
+  setEntry: () => Promise.resolve(),
+  deleteEntry: () => Promise.resolve(),
+  appendWalIntent: () => Promise.resolve(),
+  appendWalDone: () => Promise.resolve(),
+  appendWalAbort: () => Promise.resolve(),
+  setPending: () => Promise.resolve(true),
+  clearPending: () => Promise.resolve(),
+  setDeleteBatch: () => Promise.resolve(),
+  clearDeleteBatch: () => Promise.resolve(),
+  setDeleteScope: () => Promise.resolve(),
+  pruneDeleteScopes: () => Promise.resolve(0),
+  stampDeleteScopeChoices: () => Promise.resolve(0),
+  noteFailure: () => Promise.resolve(true),
+  clearFailure: () => Promise.resolve(),
+  ageFailures: () => Promise.resolve(),
+  ageOpenIntents: () => Promise.resolve(),
+  flush: () => Promise.resolve(),
+  compact: () => Promise.resolve(),
+  compactIfNeeded: () => Promise.resolve(),
+  truncateWal: () => Promise.resolve(),
+  saveMeta: () => Promise.resolve(),
+  savePendings: () => Promise.resolve(),
+  saveFailures: () => Promise.resolve(),
+  saveDecisionLog: () => Promise.resolve(),
+  saveScanCache: () => Promise.resolve(),
+}
+function makeDryRunStore(real: any): any {
+  const pendingCopy = new Map(real.pendingIntents)
+  return new Proxy(real, {
+    get(t: any, prop: any) {
+      if (prop === 'pendingIntents') return pendingCopy
+      const noop = DRY_RUN_STORE_NOOP[String(prop)]
+      if (noop) return noop
+      const v = Reflect.get(t, prop, t)
+      return typeof v === 'function' ? v.bind(t) : v
+    },
+  })
+}
+
+/** 本地磁盘预检的安全余量：可用空间低于「计划下载量 + 该余量」才拦（贴线的轮不误杀） */
+const LOCAL_DISK_MARGIN_BYTES = 64 * 1024 * 1024
+
+/** 字节数的人话（预检错误文案用；与渲染层 fmtBytes 口径一致的小型实现） */
+function humanBytes(n: number): string {
+  const v = Math.max(0, Number(n) || 0)
+  if (v < 1024) return `${Math.ceil(v)} B`
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(v < 10 * 1024 ? 1 : 0)} KB`
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(v < 10 * 1024 * 1024 ? 1 : 0)} MB`
+  return `${(v / 1024 / 1024 / 1024).toFixed(v < 10 * 1024 * 1024 * 1024 ? 1 : 0)} GB`
+}
+
 async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, handlers: SyncHandlers): Promise<any> {
   // onProgress 统一经时间节流（相位首事件与终态事件不受限，见
   // throttledProgress 注释）—— 数万文件轮次的逐文件 tick 不再以 kHz 级频率
@@ -4298,6 +4899,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   // 凌驾于 dir.mode 之上）；非法值按常规轮处理
   const rawOp = handlers && handlers.hints ? handlers.hints.op : undefined
   const opHint = rawOp === 'pull' || rawOp === 'push' || rawOp === 'pull-full' || rawOp === 'push-full' ? rawOp : null
+  /**
+   * 预演轮（「预演一次」入口，scheduler syncNow opts.dryRun / 渲染层直调注入）：
+   * 只扫描与规划、零副作用 —— 见 SyncHandlers.hints 的 dryRun 注释。只读存储壳
+   * 在下方 openDirStore 处套上；云端 / 本地用户文件与引擎持久状态全程不动。
+   */
+  const dryRun = !!(handlers && handlers.hints && handlers.hints.dryRun === true)
   const verifyMaxBytes = Number(prefs.verifyMaxBytes) > 0 ? Number(prefs.verifyMaxBytes) : DEFAULT_VERIFY_MAX_BYTES
   // 采纳内容确认的单轮总字节预算，默认 verifyMaxBytes × 4（见
   // ADOPT_VERIFY_BUDGET_FACTOR 的依据注释）；prefs.adoptVerifyBudgetBytes > 0 时覆盖
@@ -4339,6 +4946,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     dirsPrunedLocal: 0,
     dirsPrunedRemote: 0,
   }
+  // 预演标记随 summary 走（含错误路径的 err.summary）：调度器 planNext 据此不做
+  // 任何排程影响（不退避、不 follow-up），渲染层 round-end 据此不进行行状态机
+  if (dryRun) summary.dryRun = true
   /**
    * 逐文件操作明细的采集器（同步记录详尽视图的数据源，syncDirectory 轮末经
    * summary.__syncOps 读取 —— 同一数组引用贯穿全部退出路径）。只记录
@@ -4376,9 +4986,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
 
   onProgress({ phase: 'scan', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, stage: 'scan' })
 
-  // 清理上一轮崩溃残留的临时文件，再进入扫描 —— 避免清理与扫描器竞态
-  await cleanupOrphanTemps(dir.localPath)
-  const store = await storage.openDirStore({ localPath: dir.localPath, remotePath: dir.remotePath })
+  // 清理上一轮崩溃残留的临时文件，再进入扫描 —— 避免清理与扫描器竞态。
+  // 预演轮跳过（零本地写：残留临时文件留给真实轮清理，不影响规划正确性）
+  if (!dryRun) await cleanupOrphanTemps(dir.localPath)
+  const realStore = await storage.openDirStore({ localPath: dir.localPath, remotePath: dir.remotePath })
+  // 预演轮的只读存储壳（makeDryRunStore）：写方法全部 no-op，真实存储原样不动
+  const store: any = dryRun ? makeDryRunStore(realStore) : realStore
   if (!store.loadedOk) logNote('基线快照损坏：本轮按无基线保护模式执行（禁用删除传播）')
   // etag 跳过缓存：被跳过的子树要按基线合成远端条目，快照损坏
   //（loadedOk=false）时没有可信基线可合成 → 禁用跳过，强制全量列举
@@ -4400,7 +5013,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     if (errorNetCount + errorOtherCount > 0) {
       summary.failureClass = errorNetCount === 0 ? 'other' : errorOtherCount === 0 ? 'network' : 'mixed'
     }
-    summary.openIntents = Array.from(store.pendingIntents.values()).filter((p) => p.op === 'upload').length
+    summary.openIntents = Array.from(store.pendingIntents.values()).filter((p: any) => p.op === 'upload').length
     if (roundBreaker.open) {
       summary.breaker = { open: true, consecutive: roundBreaker.consecutive, reason: roundBreaker.reason }
     }
@@ -4412,7 +5025,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   //     标记下一轮再试。不依赖 prefs.leaseLock 开关 —— 这是修复动作：即便用户随后
   //     关闭了租约锁，也要把上一轮留下的远端残留清走。DELETE 走无熔断 cfg + 单次
   //     尝试（与释放同口径：熔断触发时网络可能仍可用）。
-  if (store.meta.lockLeftover) {
+  if (store.meta.lockLeftover && !dryRun) {
     try {
       const r = await davRequest({ ...cfg, __wdsyncBreaker: null }, 'DELETE', joinRemote(dir.remotePath, LOCK_NAME), { noRetry: true })
       if (r.status < 400 || r.status === 404) {
@@ -4427,11 +5040,21 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
   // 1. 确保远端根目录存在（目标为集合：URL 带尾斜杠发起）。
   //    扫描期失败的错误附带 failureClass（调度层跨轮退避的机器可读输入）——
   //    5xx/429/423 归 network（与 networkFailure 同口径），401/403/404 等配置类归 other
-  const rootProbe = await davRequest(cfg, 'PROPFIND', dir.remotePath, { isCollection: true, headers: { Depth: '0' } })
+  //    显式请求体附带 RFC 4331 配额属性（quota-available-bytes / quota-used-bytes）：
+  //    轮前配额预检的数据来源，零额外请求 —— 服务器不返回时字段缺省、预检静默跳过。
+  const rootProbe = await davRequest(cfg, 'PROPFIND', dir.remotePath, {
+    isCollection: true,
+    headers: { Depth: '0', 'Content-Type': 'application/xml' },
+    body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:quota-available-bytes/><d:quota-used-bytes/></d:prop></d:propfind>',
+  })
   // 根探测状态归一：部分网关 / 服务对缺失集合不回 HTTP 404，而是 207 + 集合自身
   // 条目携带 404 propstat（扫描层 listRemoteSafe 对同形态另有识别，此处归一后
   // 下游的决策闸 / 选择消费 / 重建逻辑全部按 404 复用）。解析失败按状态码原语义。
   let rootProbeStatus = rootProbe.status
+  /** 云端剩余空间（RFC 4331，集合条目 quota-available-bytes；未返回 / 非数字 = null） */
+  let quotaAvailable: number | null = null
+  /** 云端已用空间（同上；当前仅作观测字段随 testConnection 口径，预检只用可用量） */
+  let quotaUsed: number | null = null
   if (rootProbeStatus === 207 || rootProbeStatus === 200) {
     try {
       const probeItems = parseMultistatus(rootProbe.body ? rootProbe.body.toString('utf-8') : '')
@@ -4439,6 +5062,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         (it: any) => it && !relFromHref(cfg, dir.remotePath, it.href).replace(/\/+$/, '') && /404/.test(String(it.status || ''))
       )
       if (selfGone) rootProbeStatus = 404
+      // 集合自身条目的配额属性（rel 为空 = 集合自身；404 propstat 的条目无属性）
+      const selfItem = probeItems.find((it: any) => it && !relFromHref(cfg, dir.remotePath, it.href).replace(/\/+$/, ''))
+      if (selfItem) {
+        if (typeof selfItem.quotaAvailable === 'number' && Number.isFinite(selfItem.quotaAvailable)) quotaAvailable = selfItem.quotaAvailable
+        if (typeof selfItem.quotaUsed === 'number' && Number.isFinite(selfItem.quotaUsed)) quotaUsed = selfItem.quotaUsed
+      }
     } catch (_) {
       /* 畸形 body：按状态码判定（207 → 照常进入扫描，由扫描层给结论） */
     }
@@ -4473,10 +5102,18 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       summary,
     })
   }
+  // 预演轮「远端根尚不存在且基线为空」（首次同步的常态）标记：远端按空清单
+  // 合成预演（不 MKCOL、不扫描 404 根），全部本地文件规划为上传
+  const dryRunRootMissing = dryRun && rootProbeStatus === 404 && store.entries.size === 0
   if (rootProbeStatus === 404) {
     if (store.entries.size === 0) {
-      // 基线为空（首次同步 / 内容已和解）：无内容可保护，维持自动重建
-      await mkdirDeep(cfg, dir.remotePath)
+      // 基线为空（首次同步 / 内容已和解）：无内容可保护，维持自动重建。
+      // 预演轮不创建云端文件夹（零副作用）：按「云端为空」预演上传计划
+      if (!dryRun) await mkdirDeep(cfg, dir.remotePath)
+    } else if (dryRun) {
+      // 预演轮不消费任何决策标记（零副作用）：无论是否已有选择，一律按
+      // 「需要决策」停轮预演 —— 计划要等用户真实决策后才能成立
+      await stopForRootLost()
     } else {
       // ---- 远端根丢失决策闸（基线非空：本地有内容，去留必须由用户决定）----
       // 云端同步根消失可能是「用户在网页端删除了它」（此时自动重建 + 全量重传会
@@ -4586,9 +5223,10 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //    依赖 caps 的 Promise；能力缓存命中（常态，7 天 TTL）时它几乎零耗时，
     //    本地与远端扫描仍近似并行。冷缓存轮次探测与两路扫描并发（探测写全部
     //    落在自己的 .wdsync-probe- 随机目录，扫描层按前缀排除，互不干扰）。
-    //    用户排除规则（prefs.excludePatterns）在两侧扫描层统一生效。
+    //    用户排除规则（prefs.excludePatterns）与勾选树精确 rel（prefs.excludeRels）
+    //    在两侧扫描层统一生效（compileSyncExcludes：glob + 精确路径，含祖先目录命中）。
     //    本地扫描带节流进度回调（phase='scan' 的 filesDone 递增事件）。
-    const excludeMatcher = compileExcludePatterns(prefs.excludePatterns)
+    const excludeMatcher = compileSyncExcludes(prefs.excludePatterns, prefs.excludeRels)
     const capsPromise = getSyncCapabilities(cfg, dir.remotePath)
     // 本地脏路径快速核对：仅 watch 来源 hints、脏集非空
     // 且不超 DIRTY_SCAN_MAX、基线可信（loadedOk —— 合成依赖基线，快照损坏时必须
@@ -4634,6 +5272,12 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           scanCache.collections &&
           Object.keys(scanCache.collections).length > 0
         etagSkipUsed = usable
+        // 预演轮 + 远端根缺失（首次同步常态）：不 MKCOL、不扫描 —— 按「云端为空」
+        // 合成完整空清单，规划出「全部本地文件上传」的预演计划（与真实轮的
+        // 「建根 + 无基线恢复上传」结果一致）
+        if (dryRun && dryRunRootMissing) {
+          return Promise.resolve({ files: new Map(), complete: true, errors: [], probeResidue: [], depth: 'per-dir', collections: new Map(), skippedDirs: [] })
+        }
         return listRemoteSafe(cfg, dir.remotePath, prefs.ignoreHidden, excludeMatcher, {
           depthInfinity: c.depthInfinity,
           collectionEtasg: usable ? new Map(Object.entries(scanCache.collections)) : null,
@@ -4912,6 +5556,11 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     const plan: any[] = []
     for (const rel of rels) {
       await maybeYield() // 分片让出（三侧 key 并集的组装循环）
+      // 排除规则 / 勾选树命中的基线残留条目跳过规划：「本轮不可见」≠「两侧已删」
+      // —— 两侧扫描层已把它们挡在外面，唯一来源是基线；若按 l/r 皆空走 clean
+      // 出清基线，重新勾选后的内容分叉会被误判成冲突（跟踪丢失）。基线保持，
+      // 重新可见后按基线正常判变化。
+      if (excludeMatcher && excludeMatcher(rel)) continue
       const rEntry = remoteByNfc.get(rel)
       if (rEntry && rEntry.isDir) continue // 目录条目不参与文件决策（上传时自动建目录）
       const l = localByNfc.get(rel) || null
@@ -5021,7 +5670,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     }
     /** 同 rel 的其余开放意图由新意图取代（新者写 abort 了结旧者）。覆盖同轮瞬时重试与跨轮半截重传两条来源。 */
     const supersedeOpenIntents = async (rel: any, exceptId: any) => {
-      for (const other of Array.from(store.pendingIntents.values())) {
+      for (const other of Array.from(store.pendingIntents.values()) as any[]) {
         if (other.id !== exceptId && nfc(other.rel || '') === nfc(rel)) await store.appendWalAbort(other.id).catch(() => {})
       }
     }
@@ -5146,7 +5795,42 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
      * B 档写前查重的按 rel 剔除（与 transfers 同步 splice，下标始终对齐）。
      */
     const transferMeta: any[] = []
-    const pushTransfer = (rel: any, fn: any, kind: any, bytes = 0) => {
+    /**
+     * 预演轮的计划动作登记（pushTransfer 的 dry-run 分支）：不真正入队，按规划
+     * 结果直接落计数与明细 —— 与真实轮的执行点同口径（上传按两段提交点计、
+     * 冲突按条目计、删除按方向计、改名按方向计），供「预演结果」以同步记录的
+     * 形态只读展示。bytes 为该任务的传输字节估算（与 transferMeta 同源）。
+     */
+    const recordPlannedOp = (kind: any, rel: any, bytes = 0, planned?: { it?: any; from?: string }) => {
+      if (kind === 'upload') {
+        summary.uploaded++
+        summary.bytesUp += bytes || 0
+        recordSyncOp({ op: 'upload', rel, bytes: bytes || 0, added: !(planned && planned.it && planned.it.r && !planned.it.r.isDir) })
+      } else if (kind === 'download') {
+        summary.downloaded++
+        summary.bytesDown += bytes || 0
+        recordSyncOp({ op: 'download', rel, bytes: bytes || 0, added: !(planned && planned.it && planned.it.l) })
+      } else if (kind === 'delete-local' || kind === 'delete-remote') {
+        summary.deleted++
+        recordSyncOp({ op: kind, rel })
+      } else if (kind === 'conflict') {
+        summary.conflicts++
+        recordSyncOp({ op: 'conflict', rel })
+      } else if (kind === 'rename-remote' || kind === 'rename-local') {
+        if (kind === 'rename-remote') summary.renamedRemote++
+        else summary.renamedLocal++
+        recordSyncOp({ op: kind, rel, from: planned && planned.from })
+      }
+    }
+    const pushTransfer = (rel: any, fn: any, kind: any, bytes = 0, planned?: { it?: any; from?: string }) => {
+      // 预演轮：不执行（执行层零触达），按规划直接登记计划动作；transferMeta
+      // 照常登记 —— 传输前预检（配额 / 磁盘）按计划字节量判定，预演同样受益
+      if (dryRun) {
+        transferMeta.push({ rel, kind, bytes })
+        transferBytesTotal += bytes
+        recordPlannedOp(kind, rel, bytes, planned)
+        return
+      }
       transferMeta.push({ rel, kind, bytes })
       transferBytesTotal += bytes
       transfers.push(async () => {
@@ -5508,7 +6192,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
           return parked ? UPLOADED_PENDING : undefined
         },
         'upload',
-        it.l.size
+        it.l.size,
+        { it }
       )
     }
     for (const it of plan) {
@@ -5687,11 +6372,34 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               bytesDoneAcc += it.r.size
             }),
           'download',
-          it.r.size
+          it.r.size,
+          { it }
         )
         continue
       }
 
+      if (dryRun) {
+        // 预演：冲突按生效策略预判落地形态（不询问用户）—— 上次已选未落地的沿用
+        //（与真实轮 resolveChoiceInner 优先级 2 同口径）；固定策略直接展开；'ask'
+        // 只计冲突（真实轮会弹窗等待选择）。展开口径与真实轮执行期一致：local 的
+        // 上传（两段提交点计 uploaded / bytesUp）、remote 的下载（downloaded /
+        // bytesDown，无独立明细条目）、both 的副本下载（downloaded 计数、无独立
+        // 明细条目）+ 上传 —— 抽样对拍时与随后真实轮的计数逐项一致。
+        const pc = store.getPending(it.rel)
+        const prior = pc && !pc.kind && (pc.choice === 'local' || pc.choice === 'remote' || pc.choice === 'both') ? pc.choice : null
+        const plannedChoice = prior || (prefs.conflictStrategy !== 'ask' ? prefs.conflictStrategy : 'ask')
+        recordSyncOp({ op: 'conflict', rel: it.rel, ...(plannedChoice !== 'ask' ? { choice: plannedChoice } : {}) })
+        summary.conflicts++
+        if (plannedChoice === 'local' && it.l) recordPlannedOp('upload', it.rel, it.l.size, { it })
+        else if (plannedChoice === 'remote' && it.r && !it.r.isDir) {
+          summary.downloaded++
+          summary.bytesDown += it.r.size
+        } else if (plannedChoice === 'both' && it.l && it.r && !it.r.isDir) {
+          summary.downloaded++
+          recordPlannedOp('upload', it.rel, it.l.size, { it })
+        }
+        continue
+      }
       // conflict：根据策略解决（ask 时回调渲染层弹窗，支持「应用到本轮剩余」）。
       // 未解决（ask 无回调 / 回调返回非法值 / 选择所需的侧缺失）→ 该文件报错，其余文件不受影响。
       // 冲突解决产生的上传（choice=local 与 both 的第二段上传）同样走两段提交：
@@ -5766,7 +6474,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         },
         'conflict',
         // 冲突的落地动作要到执行期（用户选择）才知道方向：按两侧之和估算传输分母
-        (it.l ? it.l.size : 0) + (it.r ? it.r.size : 0)
+        (it.l ? it.l.size : 0) + (it.r ? it.r.size : 0),
+        { it }
       )
     }
 
@@ -5829,7 +6538,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               recordSyncOp({ op: 'delete-local', rel: it.rel })
               localDeletedRels.add(it.rel) // 空目录清理候选（本地侧祖先目录）
             }),
-          'delete-local'
+          'delete-local',
+          0,
+          { it }
         )
       } else {
         pushTransfer(
@@ -5866,7 +6577,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
               recordSyncOp({ op: 'delete-remote', rel: it.rel })
               remoteDeletedRels.add(it.rel) // 空目录清理候选（远端侧祖先目录）
             }),
-          'delete-remote'
+          'delete-remote',
+          0,
+          { it }
         )
       }
     }
@@ -6055,7 +6768,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             summary.renamedRemote++
             recordSyncOp({ op: 'rename-remote', rel: pair.newRel, from: pair.oldRel })
           }),
-        'rename-remote'
+        'rename-remote',
+        0,
+        { from: pair.oldRel }
       )
     }
     /**
@@ -6103,12 +6818,52 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
             summary.renamedLocal++
             recordSyncOp({ op: 'rename-local', rel: pair.newRel, from: pair.oldRel })
           }),
-        'rename-local'
+        'rename-local',
+        0,
+        { from: pair.oldRel }
       )
     }
     for (const p of renamePairs) {
       if (p.dir === 'local') pushRenameRemoteTransfer(p)
       else pushRenameLocalTransfer(p)
+    }
+
+    // ---- 传输前预检（云端配额 / 本地磁盘空间）----
+    // 位置：规划完成（计划字节量已知）、按需拿锁与执行之前 —— 不足时轮首报一条
+    // 明确错误整轮中止（预演轮同样预检，预演结果如实反映「真实轮会停在这里」），
+    // 而不是逐文件 507 / 下载中途 ENOSPC。
+    //   云端配额：取自轮首根探测的 RFC 4331 属性（零额外请求）。服务器未返回、
+    //   返回 0 / 负数（部分服务器把 0 当「无限制」误报）一律静默跳过 —— 预检只
+    //   提前给出结论，不改变无配额服务器的既有行为；上传字节量按 upload +
+    //   conflict 估算（conflict 的落地方向执行期才知，保守计入）。远端根缺失的
+    //   首轮同步拿不到配额属性（集合尚不存在），本轮跳过预检、下一轮起生效。
+    //   本地磁盘：statfs 空闲空间对比计划下载量（download + conflict 估算），
+    //   低于「计划量 + 安全余量」即中止；statfs 不可用（旧内核 / 权限）跳过预检。
+    if (!aborted && !shouldAbort()) {
+      const plannedUp = transferMeta.reduce((a, t) => a + (t.kind === 'upload' || t.kind === 'conflict' ? t.bytes || 0 : 0), 0)
+      if (quotaAvailable != null && quotaAvailable > 0 && plannedUp > quotaAvailable) {
+        throw syncFail(`云端空间不够：这次要上传约 ${humanBytes(plannedUp)}，云端只剩约 ${humanBytes(quotaAvailable)}。请清理云端空间后重试`, {
+          phase: 'plan',
+          failureClass: 'other',
+          summary,
+        })
+      }
+      const plannedDown = transferMeta.reduce((a, t) => a + (t.kind === 'download' || t.kind === 'conflict' ? t.bytes || 0 : 0), 0)
+      if (plannedDown > 0 && typeof fsp.statfs === 'function') {
+        try {
+          const s = await fsp.statfs(dir.localPath)
+          const free = Number(s.bavail) * Number(s.bsize)
+          if (Number.isFinite(free) && free - plannedDown < LOCAL_DISK_MARGIN_BYTES) {
+            throw syncFail(
+              `电脑磁盘空间不够：这次要下载约 ${humanBytes(plannedDown)}，这个文件夹所在的磁盘只剩约 ${humanBytes(Math.max(0, free))}。请清理磁盘空间后重试`,
+              { phase: 'plan', failureClass: 'other', summary }
+            )
+          }
+        } catch (e: any) {
+          if (e && e.phase === 'plan') throw e // 预检自身给出的结论原样上抛
+          /* statfs 失败（权限 / 文件系统不支持）：跳过本地预检，不阻断同步 */
+        }
+      }
     }
 
     // ---- 规划完成后、worker 执行前的两道闸（按需租约锁 → B 档新上传写前查重）----
@@ -6139,8 +6894,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 不拿锁，语义不变）；C 档轮次因规划层已剔除全部远端写，天然不再进入。
     // 规划期已取消（aborted）的轮次不再拿锁 —— 取消应尽快收场，不为一把
     // 马上要释放的锁发出 GET/PUT/回读共 4 个请求与 1.5s 写回静置。
+    // 预演轮不拿锁（锁文件本身是远端写，零副作用约束）。
     const hasRemoteWrite = transferMeta.some((t) => t.kind === 'upload' || t.kind === 'delete-remote' || t.kind === 'conflict' || t.kind === 'rename-remote')
-    if (hasRemoteWrite && !aborted && !shouldAbort() && prefs.leaseLock !== false) {
+    if (hasRemoteWrite && !dryRun && !aborted && !shouldAbort() && prefs.leaseLock !== false) {
       // 锁阶段进度（含 GET → PUT → 1.5s 写回静置 → 回读确认的完整窗口）：
       // UI 显示「正在确认租约锁…」。force 外发 —— 与 verify 终态事件同相位，不吃节流
       onProgress({ phase: 'plan', filesDone: 0, filesTotal: plan.length, bytesDone: 0, bytesTotal: 0, stage: 'lock', scanBytesTotal }, true)
@@ -6205,7 +6961,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 自然重试）。放在拿锁之后：静置 1.5s 的观察窗更贴近写入时刻，且让出轮（无任何写入）
     // 天然不触发查重。规划期已取消的轮次跳过查重（worker 池随即按取消收场，
     // 不再为已取消的传输发守护请求；取消引发的请求失败也不报噪声错误）。
-    if (bNewUploads.size > 0 && !shouldAbort()) {
+    // 预演轮无执行、无写入，查重无意义，跳过。
+    if (bNewUploads.size > 0 && !dryRun && !shouldAbort()) {
       /** 从执行队列按 rel 剔除一个任务（transfers 与 transferMeta 同下标同步 splice；字节分母同步扣减） */
       const dropTransferByRel = (rel: any) => {
         const i = transferMeta.findIndex((t) => t.rel === rel)
@@ -6447,7 +7204,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 且本轮没有因该保护跳过的删除（「本地未变 + 远端缺失」的待和解集合已清零：
     // 全部基线文件要么重新上传成功、要么两侧皆无）→ 清除标记，下一轮恢复正常删除传播。
     // 仍有跳过或本轮有失败 → 保守保留保护（下一轮干净轮次重新评估），并提示原因。
-    if (store.meta.rootRebuilt && !rootWasRebuilt && !aborted && !roundBreaker.open && caps.tier !== 'C' && store.loadedOk && errorNetCount + errorOtherCount === 0) {
+    // 预演轮不动任何 meta（零副作用：内存态变更会经缓存的 store 实例泄给真实轮）。
+    if (store.meta.rootRebuilt && !rootWasRebuilt && !dryRun && !aborted && !roundBreaker.open && caps.tier !== 'C' && store.loadedOk && errorNetCount + errorOtherCount === 0) {
       if (summary.deleteRootGuard === 0) {
         delete store.meta.rootRebuilt
       }
@@ -6470,6 +7228,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     if (
       store.meta.rootLostRemoval &&
       removalForced === 0 &&
+      !dryRun &&
       !aborted &&
       !roundBreaker.open &&
       caps.tier !== 'C' &&
@@ -6604,7 +7363,8 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //（无文件级错误且未取消 —— 恰为步骤 9 不抛错的补集，渲染层只对这种轮次弹警告
     // toast）时置位，随下方 persistPlannedLocalState 的 noiseDirty 通道一并保存；
     // 弹不到用户的轮次不消耗名额，下一轮继续携带，直到用户真正看到过一次。
-    if (tierBNoticePending && !aborted && summary.errors.length === 0) {
+    // 预演轮不消耗（预演不产生用户可见的警告 toast —— 渲染层对预演结果静默展示）。
+    if (tierBNoticePending && !dryRun && !aborted && summary.errors.length === 0) {
       serverNoise.noise.concurrencyWarned = true
       noiseDirty = true
     }
@@ -6613,7 +7373,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     //    共用 persistPlannedLocalState，见该函数注释）。快照损坏的轮次强制压缩：用本轮
     //    已验证的事实重建快照，下一轮恢复正常基线模式（否则 loadedOk 永远为 false，
     //    保护模式会不必要地持续到所有后续轮次）。
-    await persistPlannedLocalState()
+    //    预演轮跳过收尾（零副作用：不 flush / 不压缩 / 不写 meta；只读存储壳下的
+    //    这些调用本就是 no-op，显式跳过让 deepVerify 时间戳等 meta 直写也无从发生）。
+    if (!dryRun) await persistPlannedLocalState()
     // etag 跳过运行时异常收口（第二层防御的落点，见 noteEtagSkipAnomaly）：被跳过
     // 子树内出现与基线不一致的远端状态 → 提示用户，并把缓存 lastFullScanAt 归零
     //（0 = 立即过期），下一轮强制全量下降核对真实远端状态。这是「探测验证」之外
@@ -6661,6 +7423,10 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 空目录清理汇总（有清理动作才提示）
     if (summary.dirsPrunedLocal > 0 || summary.dirsPrunedRemote > 0) {
       pushWarning(`清理了因同步而变空的文件夹：电脑 ${summary.dirsPrunedLocal} 个、云端 ${summary.dirsPrunedRemote} 个`)
+    }
+    // 预演汇总（每轮一条，结果弹窗与同步记录共同携带）：如实说明预演的时效边界
+    if (dryRun) {
+      pushWarning('这是预演结果，没有改动任何文件。实际同步前文件内容可能又有变化，以真实同步为准')
     }
 
     // 9. 文件级失败 / 中止 → 以错误状态上报（已成功文件的基线保留，summary 附带）。
@@ -6751,10 +7517,27 @@ const services = {
       try {
         const r = await davRequest(cfg, 'PROPFIND', '', {
           headers: { Depth: '0', 'Content-Type': 'application/xml' },
-          body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
+          // resourcetype 之外附带 RFC 4331 配额属性（云端剩余空间展示；未支持的服务器按 404 propstat 缺省）
+          body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:quota-available-bytes/><d:quota-used-bytes/></d:prop></d:propfind>',
         })
         const latencyMs = Date.now() - started
         if (r.status === 207 || r.status === 200) {
+          // 配额属性（RFC 4331）：基址集合返回 quota-available-bytes / quota-used-bytes
+          // 时随结果带给渲染层（服务器卡片「云端剩余空间」展示）；未返回 / 解析失败
+          // 缺省 —— 无配额信息的服务器 UI 零行为变化。Depth:0 响应唯一条目即集合自身。
+          let quota: { available: number | null; used: number | null } | undefined
+          try {
+            const items = parseMultistatus(r.body ? r.body.toString('utf-8') : '')
+            const self = items && items[0]
+            if (self && (self.quotaAvailable !== undefined || self.quotaUsed !== undefined)) {
+              quota = {
+                available: typeof self.quotaAvailable === 'number' ? self.quotaAvailable : null,
+                used: typeof self.quotaUsed === 'number' ? self.quotaUsed : null,
+              }
+            }
+          } catch (_) {
+            /* 配额解析失败不影响连接结论 */
+          }
           // 附带档位与能力摘要：缓存优先（7 天 TTL），缺失才现场探测；探测异常不连坐。
           // 探测目标为调用方指定的远端路径（功能测试目录），缺省为基址
           let capabilities: any = null
@@ -6763,7 +7546,7 @@ const services = {
           } catch (_) {
             /* 探测失败不影响连接判定 */
           }
-          return { ok: true, latencyMs, tier: capabilities ? capabilities.tier : null, capabilities }
+          return { ok: true, latencyMs, tier: capabilities ? capabilities.tier : null, capabilities, ...(quota ? { quota } : {}) }
         }
         if (r.status === 401) return { ok: false, error: '用户名或密码不正确（坚果云请使用「应用密码」）', latencyMs }
         return { ok: false, error: `服务器返回了错误（HTTP ${r.status}）`, latencyMs }
@@ -6792,6 +7575,46 @@ const services = {
     },
     list: (cfg: any, remotePath: any, ignoreHidden: any) => listRemote(cfg, remotePath, ignoreHidden !== false),
     listDirs: (cfg: any, remotePath: any) => listDirs(cfg, remotePath),
+    /**
+     * 远端目录树清单（「选择性同步」勾选面板的数据源）：对远端同步根做一次完整
+     * 扫描（能力缓存支持 Depth:infinity 时单请求，否则逐目录），不做任何排除 ——
+     * 已被排除规则 / 勾选树挡掉的条目也要在树里可见（勾回去的前提）。能力缓存
+     * 冷启动时会现场探测（探测文件自清理，与首轮同步同一边界）。
+     * 扫描不完整（部分目录列举失败 / 根缺失）时 complete=false 并附 errors ——
+     * UI 据此禁用勾选树并提示（残缺清单上勾选会误判「未列出 = 已同步」）。
+     * @returns { complete, depth, entries: [{ rel, isDir, size }], errors: [{ rel, message }] }
+     */
+    async listTree(cfg: any, remotePath: any, ignoreHidden: any) {
+      try {
+        let depthInfinity = false
+        try {
+          // 只读缓存判定扫描形态（getCachedCapabilities 不发请求）：现场探测会在
+          // 远端创建探测目录、且缺失根会被探测期的 mkdirDeep 顺带创建 —— 勾选树是
+          // 纯浏览入口，不该有任何远端写副作用；无缓存按逐目录形态扫描（首轮同步
+          // 之后缓存必然已热，常态走单请求）。
+          const cached = await services.dav.getCachedCapabilities(cfg, String(remotePath || '/'))
+          depthInfinity = !!(cached && cached.depthInfinity)
+        } catch (_) {
+          /* 缓存不可读按逐目录形态 */
+        }
+        const scan = await listRemoteSafe(cfg, String(remotePath || '/'), ignoreHidden !== false, null, { depthInfinity })
+        const entries: any[] = []
+        for (const [rel, info] of scan.files) {
+          await maybeYield()
+          entries.push({ rel, isDir: !!info.isDir, size: info.isDir ? 0 : Number(info.size) || 0 })
+        }
+        // 树的构建与展示按稳定顺序：rel 字典序（目录与文件混排，UI 分层后各自有序）
+        entries.sort((a: any, b: any) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
+        return {
+          complete: scan.complete === true,
+          depth: scan.depth,
+          entries,
+          errors: (scan.errors || []).map((e: any) => ({ rel: e && e.rel, message: (e && e.message) || '' })),
+        }
+      } catch (e: any) {
+        return { complete: false, depth: 'per-dir', entries: [], errors: [{ rel: '.', message: (e && e.message) || String(e) }] }
+      }
+    },
     mkdirDeep: (cfg: any, remotePath: any) => mkdirDeep(cfg, remotePath),
     remove: (cfg: any, remotePath: any) => davRequest(cfg, 'DELETE', remotePath),
     /**
@@ -7044,6 +7867,14 @@ const services = {
       serverProfileFor,
       /** 生效网络参数解析（纯函数：显式 netOpts > 档案默认 > NET_DEFAULTS） */
       resolveNetOpts,
+      /** Digest 挑战解析（纯函数直检：引号 / 逗号 / 畸形形态） */
+      parseDigestChallenge,
+      /** Digest 应答计算（纯函数直检：RFC 2617 标准向量 / qop 协商 / 算法映射） */
+      digestAuthorization,
+      /** Digest 挑战缓存（e2e 断言挑战复用与 nc 递增；Map 形态直读） */
+      digestChallenges,
+      /** 带宽字节桶（e2e 断言限速生效后的桶状态） */
+      byteBuckets,
       /** saxes 解析器直检：畸形 XML 抛错 / 前缀变体 / 流式块边界 */
       parseMultistatus,
       createMultistatusStream,
@@ -7067,6 +7898,10 @@ const services = {
       isJunkRel,
       /** 用户排除规则编译（glob → 匹配函数；纯函数，null = 无有效规则） */
       compileExcludePatterns,
+      /** 勾选树精确 rel 集合编译（纯函数；null = 无条目） */
+      compileExactRels,
+      /** 本轮生效排除匹配器（glob + 勾选树精确 rel，含祖先目录命中；纯函数直检） */
+      compileSyncExcludes,
       /** Windows 文件名/路径预检（纯函数：段级校验 + rel/win32 长度预算） */
       checkWinSegment,
       checkWindowsRel,

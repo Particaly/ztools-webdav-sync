@@ -23,6 +23,7 @@ export type {
   ConflictInfo,
   DavCapabilities,
   DavConfig,
+  DavServerEntry,
   DavTier,
   DecisionLogEntry,
   DeleteBatch,
@@ -86,6 +87,13 @@ export interface DirOverrides {
   deepVerify?: boolean
   /** 用户排除规则（glob 数组，口径与 prefs.excludePatterns 一致） */
   excludePatterns?: string[]
+  /**
+   * 选择性同步树「取消同步」的精确 rel 列表（渲染层勾选树的落地形态；目录级
+   * 字段，无全局形态）。引擎侧字面精确匹配 + 祖先目录命中即整棵子树排除
+   *（compileSyncExcludes），与 excludePatterns 在扫描层合并生效 —— 文件名含
+   * 通配符字面也不会误伤。空数组 = 树上全部勾选（无排除）。
+   */
+  excludeRels?: string[]
 }
 
 /** 同步目录配置 + 运行时状态（渲染层自有形态：配置之上叠加 UI 运行态字段） */
@@ -139,8 +147,13 @@ export interface SyncDir {
   /** 最近一次同步扫描到的总字节数（用于估算云端占用） */
   lastBytesTotal?: number
   /**
-   * 目录级服务器覆盖（调度器「每 origin 并发 1」的分组键）：现有 UI 不写入，
-   * 缺省跟随全局 server —— 行为与单服务器形态完全一致（预留多服务器支持）。
+   * 该目录使用的服务器（store.servers 成员的 id；多账号 / 多服务器形态）。
+   * 缺省 = 添加时活跃的服务器；调度器按 id 解析条目，失配回落第一台。
+   */
+  serverId?: string | null
+  /**
+   * 目录级服务器地址覆盖（历史遗留字段，现有 UI 不写 —— 多服务器形态走
+   * serverId）：调度器「每 origin 并发 1」的分组键，行为与单服务器形态一致。
    */
   serverUrl?: string | null
   /**

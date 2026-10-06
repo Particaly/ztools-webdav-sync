@@ -505,6 +505,10 @@ export async function teardownShard(ctx) {
     '.wdsync-test-shallowinf',
     '.wdsync-test-root404prop',
     '.wdsync-test-etagprop',
+    // 选择性同步 / 预演 / 配额档（ST 分片用；正常路径由各节自己的 finally 清理，此处兜底）
+    '.wdsync-test-quota',
+    // Digest 认证档（NET 分片用；同上兜底）
+    '.wdsync-test-digest',
   ]
   for (const flag of allFlags) {
     await fsp.rm(path.join(ctx.ROOT, flag), { force: true }).catch(() => {})

@@ -3,7 +3,8 @@ import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import RemoteDirModal from '../components/RemoteDirModal.vue'
 import { AppButton, AppIconButton, AppInput, AppSelect, AppSwitch, InfoTip } from '../components/ui'
-import { useStore, defaultPrefs, tierLabel, tierHint } from '../composables/store'
+import { useStore, defaultPrefs, tierLabel, tierHint, serverLabel } from '../composables/store'
+import type { DavServerEntry } from '../env.d'
 import { toast } from '../composables/toast'
 import { intervalOptions, strategyOptions, concurrencyOptions } from '../composables/options'
 import { fmtBytes, fmtRelTime } from '../composables/format'
@@ -12,6 +13,32 @@ const store = useStore()
 const s = store.state
 
 const showDirPicker = ref(false)
+
+// ---------- 服务器列表（多账号 / 多服务器） ----------
+
+/** 服务器下拉选项（展示名 = 显式名称 > 地址 host > 序号） */
+const serverOptions = computed(() => s.servers.map((sv: DavServerEntry, i: number) => ({ value: sv.id, label: serverLabel(sv, i) })))
+
+/** 活跃服务器（下拉切换：连接指示按新服务器归零，目录的 serverId 不受影响） */
+const activeServerModel = computed<string>({
+  get: () => s.activeServerId,
+  set: (v) => store.setActiveServer(v),
+})
+
+/** 添加服务器：空白条目入列并切换为活跃（立即开始填写） */
+function addServer() {
+  store.addServer()
+  toast.info('已添加服务器', '填写地址与账号后点「测试连接」验证')
+}
+
+/**
+ * 删除当前服务器：最后一台不可删（改为提示清空）；仍有同步目录使用时明确
+ * 拒绝 —— 静默把这些目录改连另一台服务器是危险操作（远端路径不存在会触发
+ * 「云端文件夹丢失」保护）。删除的只是配置，不动电脑与云端文件。
+ */
+function removeActiveServer() {
+  store.removeServer(s.activeServerId)
+}
 
 /**
  * 明文 http 警告的显隐：地址是明文 http 且未被当前地址关闭过。关闭（不再显示）
@@ -202,6 +229,57 @@ const rateHint = computed(() => {
   return `已识别为${p.label}：该服务对请求频率有配额限制，已自动限速为每秒 ${p.netOpts.ratePerSec} 次请求；填 0 可解除`
 })
 
+/**
+ * 上传带宽上限（KB/s）：空 / 0 = 不限制。写回当前服务器 netOpts.uploadKBps
+ *（同一服务器的全部上传共享该总额；跨服务器互不影响）。
+ */
+const uploadKBpsInput = computed<string>({
+  get: () => {
+    const v = s.server.netOpts?.uploadKBps
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? String(v) : ''
+  },
+  set: (val) => {
+    const t = String(val ?? '').trim()
+    const n = Number(t)
+    const apply = (v: number | undefined) => {
+      s.server.netOpts = { ...s.server.netOpts, uploadKBps: v }
+    }
+    if (t === '' || !Number.isFinite(n) || n <= 0) apply(undefined)
+    else apply(Math.min(10_000_000, Math.floor(n)))
+  },
+})
+
+/** 下载带宽上限（KB/s）：口径同 uploadKBps，方向为下载 */
+const downloadKBpsInput = computed<string>({
+  get: () => {
+    const v = s.server.netOpts?.downloadKBps
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? String(v) : ''
+  },
+  set: (val) => {
+    const t = String(val ?? '').trim()
+    const n = Number(t)
+    const apply = (v: number | undefined) => {
+      s.server.netOpts = { ...s.server.netOpts, downloadKBps: v }
+    }
+    if (t === '' || !Number.isFinite(n) || n <= 0) apply(undefined)
+    else apply(Math.min(10_000_000, Math.floor(n)))
+  },
+})
+
+/** HTTP 代理地址：写回当前服务器 netOpts.proxyUrl（留空 = 直连） */
+const proxyUrlInput = computed<string>({
+  get: () => s.server.netOpts?.proxyUrl ?? '',
+  set: (val) => {
+    s.server.netOpts = { ...s.server.netOpts, proxyUrl: String(val ?? '').trim() }
+  },
+})
+
+/** 代理地址形态校验：非空且不是 http(s):// 开头时提示（引擎对非法地址按直连处理） */
+const proxyInvalid = computed(() => {
+  const v = proxyUrlInput.value.trim()
+  return v !== '' && !/^https?:\/\/\S+$/i.test(v)
+})
+
 /** 深度校验开关（prefs.deepVerify 可选布尔 → AppSwitch 必填 model 的适配） */
 const deepVerifyModel = computed<boolean>({
   get: () => s.prefs.deepVerify === true,
@@ -368,6 +446,25 @@ function save() {
               </span>
             </div>
             <div class="flex flex-col gap-[10px] px-[14px] py-[11px]">
+              <!-- 服务器列表（多账号 / 多服务器）：下方全部字段编辑当前选中的服务器；
+                   各同步文件夹在添加时记住使用的服务器，切换选中只影响这里的编辑视图 -->
+              <div class="flex flex-col gap-[6px]">
+                <div class="flex items-center gap-[3px]">
+                  <span class="text-[11px] font-medium text-ink-2">服务器</span>
+                  <InfoTip text="可以添加多台 WebDAV 服务器（如坚果云 + 家用 NAS）：每个同步文件夹使用添加时选定的服务器，凭据与设置互不影响" />
+                </div>
+                <div class="flex gap-2 items-center">
+                  <AppSelect
+                    v-if="s.servers.length > 1"
+                    v-model="activeServerModel"
+                    :options="serverOptions"
+                    class="flex-1 min-w-0"
+                  />
+                  <span v-else class="flex-1 min-w-0 truncate text-[12px] text-ink-1">{{ serverOptions[0]?.label || '未命名' }}</span>
+                  <AppButton :disabled="s.servers.length <= 1" title="删除当前服务器" @click="removeActiveServer">删除</AppButton>
+                  <AppButton variant="primary" @click="addServer">添加</AppButton>
+                </div>
+              </div>
               <div class="flex flex-col gap-[6px]">
                 <span class="text-[11px] font-medium text-ink-2">服务器地址</span>
                 <AppInput
@@ -423,6 +520,35 @@ function save() {
                     <AppButton @click="removeCa">移除</AppButton>
                   </template>
                   <AppButton v-else @click="importCa">导入…</AppButton>
+                </div>
+              </div>
+              <!-- 带宽限速与代理（当前服务器的网络层配置）：限速限的是这台服务器的
+                   传输总量（上传 / 下载各自独立）；代理用于公司内网等直连不可达的场景 -->
+              <div class="flex gap-[10px]">
+                <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
+                  <div class="flex items-center gap-[3px]">
+                    <span class="text-[11px] font-medium text-ink-2">上传限速</span>
+                    <InfoTip text="上传到这台服务器的总带宽上限（KB/s），同一服务器的多个文件夹共享该额度；留空或 0 表示不限制" />
+                  </div>
+                  <AppInput v-model="uploadKBpsInput" sm type="number" placeholder="不限" />
+                </div>
+                <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
+                  <div class="flex items-center gap-[3px]">
+                    <span class="text-[11px] font-medium text-ink-2">下载限速</span>
+                    <InfoTip text="从这台服务器下载的总带宽上限（KB/s），口径同上传限速" />
+                  </div>
+                  <AppInput v-model="downloadKBpsInput" sm type="number" placeholder="不限" />
+                </div>
+              </div>
+              <div class="flex flex-col gap-[6px]">
+                <div class="flex items-center gap-[3px]">
+                  <span class="text-[11px] font-medium text-ink-2">代理服务器</span>
+                  <InfoTip text="公司内网等无法直连云端时可填 HTTP 代理（如 http://127.0.0.1:7890，可带 user:pass@ 认证）；https 连接经隧道端到端加密，代理看不到内容；留空 = 直连" />
+                </div>
+                <AppInput v-model="proxyUrlInput" icon="globe" mono sm placeholder="留空 = 直连" />
+                <div v-if="proxyInvalid" class="flex items-start gap-[5px]">
+                  <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
+                  <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">代理地址需以 http:// 或 https:// 开头，当前填写不会被使用</span>
                 </div>
               </div>
               <div class="flex flex-col gap-[6px]">

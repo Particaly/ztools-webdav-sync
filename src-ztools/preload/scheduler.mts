@@ -50,7 +50,7 @@ declare global {
 
 // ---------- 调度器类型 ----------
 
-/** 规范化后的目录配置（loadConfig 产物；渲染层 SyncDir 的调度侧子集 + serverUrl 覆盖） */
+/** 规范化后的目录配置（loadConfig 产物；渲染层 SyncDir 的调度侧子集 + serverId/serverUrl 覆盖） */
 export interface SchedulerDirCfg {
   id: string
   localPath: string
@@ -58,13 +58,34 @@ export interface SchedulerDirCfg {
   mode: 'two-way' | 'upload' | 'download'
   enabled: boolean
   overrides: Record<string, unknown> | null
-  /** 目录级服务器覆盖（每 origin 并发的分组键）；缺省回落全局 server */
+  /** 目录使用的服务器（servers[] 成员的 id；null = 跟随第一台 —— 旧配置迁移前的缺省） */
+  serverId: string | null
+  /**
+   * 目录级服务器地址覆盖（历史遗留的裸地址覆盖；优先于 serverId 指向的服务器
+   * 地址 —— 引擎按 origin+账号分池凭据，地址不同即不同池，互不串扰）。现有 UI
+   * 不写该字段（多服务器形态走 serverId），保留为手改配置与既有写入测试的兼容路径
+   */
   serverUrl: string | null
+}
+
+/**
+ * 规范化后的服务器条目（loadConfig 产物；渲染层 servers[] 的调度侧视图）。
+ * 密码已解密回内存（openSecret）；netOpts / tls 原样透传给引擎
+ */
+export interface SchedulerServerCfg {
+  id: string
+  serverUrl?: string
+  username?: string
+  password?: string
+  netOpts?: Record<string, unknown>
+  tls?: Record<string, unknown>
+  [k: string]: unknown
 }
 
 /** 规范化后的调度配置（dbStorage 单文档的调度侧视图） */
 export interface SchedulerConfig {
-  server: { serverUrl?: string; username?: string; password?: string; netOpts?: Record<string, unknown> } | null
+  /** 服务器列表（多账号 / 多服务器；旧单 server 配置迁移为唯一成员，id 固定 'srv-default'） */
+  servers: SchedulerServerCfg[]
   dirs: SchedulerDirCfg[]
   prefs: Partial<Prefs>
 }
@@ -172,6 +193,8 @@ interface QueueJob {
    * 绝不退化为常规轮传播删除。
    */
   op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null
+  /** 预演轮（syncNow opts.dryRun）：随 job 传入轮体，经引擎 hints.dryRun 生效的零副作用轮 */
+  dryRun?: boolean
 }
 
 /** 在飞轮登记（全局并发控制的 origin 分组） */
@@ -204,6 +227,8 @@ interface RoundOutcome {
   cancelled?: boolean
   skipped?: boolean
   concurrent?: boolean
+  /** 预演轮（syncNow opts.dryRun）：结果不做任何排程影响、不发 round-end */
+  dryRun?: boolean
 }
 
 /** manual-requests.jsonl 的行（req / claim / receipt 三元组的单行形态） */
@@ -272,6 +297,9 @@ const CLOCK_JUMP_FACTOR = 5
 const JUMP_CATCHUP_MIN_MS = 5000
 const JUMP_CATCHUP_MAX_MS = 10000
 const JUMP_GRACE_MS = 60000
+/** 全局暂停恢复后的补跑抖动（有资格的空闲目录在该区间内到期，吸收暂停期间积压） */
+const RESUME_CATCHUP_MIN_MS = 2000
+const RESUME_CATCHUP_MAX_MS = 6000
 /** lost 后重选延迟基数（±30% 抖动） */
 const LOST_REELECT_BASE_MS = 30000
 /** 竞争失败后的选举重试基数 */
@@ -458,6 +486,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
   const heldDirLocks = new Map<string, { renew: TimerEntry }>()
   /** 目录锁键缓存：dirId → h（deviceId / origin 参与键，配置不变则不变） */
   const dirLockHashCache = new Map<string, string>()
+  /** 全局暂停到期定时器（-1 一直暂停时不持有；kit 登记，cleanup 统一清扫） */
+  let pauseExpiryTimer: TimerEntry | null = null
+  /** 全局暂停生效中（迁移检测：false→true 进暂停排到期重读，true→false 恢复补跑） */
+  let globalPauseActive = false
 
   // ---------- 计时器工具（登记 + owner 守卫 + 统一清扫） ----------
   //
@@ -602,9 +634,35 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
   const manualPath = (): string => path.join(schedDir(), 'manual-requests.jsonl')
   const dirLockPath = (h: string): string => path.join(schedDir(), 'locks', `${h}.lock`)
 
-  /** 服务已配置（服务器地址已填）：所有目录参与调度 / 挂 watcher 的公共前提 */
+  /**
+   * 目录生效的服务器条目（多服务器解析）：目录 serverId 显式指向优先；缺省 /
+   * 失配（该服务器已被删除）回落第一台 —— 与渲染层 dirEngineCfg 同一口径。
+   * 无任何服务器（含地址全空）返回 null。
+   */
+  function serverEntryOf(slot: DirSlot | null): SchedulerServerCfg | null {
+    const list = (config && config.servers) || []
+    if (slot && slot.dir && slot.dir.serverId) {
+      const hit = list.find((s) => s.id === slot.dir.serverId)
+      if (hit) return hit
+    }
+    return list.length ? list[0] : null
+  }
+
+  /** 服务已配置（至少一台服务器有地址）：目录参与调度 / 挂 watcher 的公共前提 */
   function serverConfigured(): boolean {
-    return !!(config && config.server && config.server.serverUrl)
+    const list = (config && config.servers) || []
+    return list.some((s) => typeof s.serverUrl === 'string' && s.serverUrl)
+  }
+
+  /**
+   * 目录是否有资格参与自动调度（自身服务器已配置 + 目录启用 + 生效自动同步开 +
+   * 未全局暂停）。多服务器形态下按目录各自的服务器判定 —— 未配置的那台只挡
+   * 自己的目录，不再拖累其他服务器的目录
+   */
+  function dirEligible(slot: DirSlot): boolean {
+    const entry = serverEntryOf(slot)
+    const urlOk = !!((slot.dir && slot.dir.serverUrl) || (entry && entry.serverUrl))
+    return urlOk && slot.dir.enabled !== false && autoSyncOf(slot) && !globalPaused()
   }
 
   /**
@@ -624,14 +682,27 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     return Number.isFinite(m) && m > 0 ? m * 60000 : 0
   }
 
-  /** 目录是否有资格参与自动调度（服务器已配置 + 目录启用 + 生效自动同步开） */
-  function dirEligible(slot: DirSlot): boolean {
-    return serverConfigured() && slot.dir.enabled !== false && autoSyncOf(slot)
+  /** 目录是否有资格参与自动调度（dirEligible 见上方多服务器版本） */
+
+  /**
+   * 全局暂停自动同步生效中（prefs.globalPauseUntil，顶栏一键暂停）：
+   * > 0 的未来时刻 = 暂停至该时刻；-1 = 一直暂停（只能手动恢复）；
+   * 0 / 缺省 / 已过期 = 未暂停。只拦自动调度（经 dirEligible 收敛到 interval /
+   * backoff / follow-up / startup / watcher 全部入口），手动 syncNow 不受影响。
+   */
+  function globalPaused(): boolean {
+    const p = Number(config && config.prefs && config.prefs.globalPauseUntil)
+    if (!Number.isFinite(p) || p === 0) return false
+    if (p === -1) return true
+    return p > now()
   }
 
-  /** 目录生效的服务器 URL（目录级 serverUrl 覆盖优先；缺省全局 server —— 现有 UI 只写全局） */
+  /**
+   * 目录生效的服务器 URL：历史遗留的目录级 serverUrl 覆盖优先（手改配置路径），
+   * 缺省取目录 serverId 指向的服务器（多服务器），再回落第一台。
+   */
   function serverUrlOf(slot: DirSlot): string {
-    return (slot.dir && slot.dir.serverUrl) || (config && config.server && config.server.serverUrl) || ''
+    return (slot.dir && slot.dir.serverUrl) || (serverEntryOf(slot) || {}).serverUrl || ''
   }
 
   /** 目录生效的服务器 origin（并发分组键：同 origin 的轮串行） */
@@ -660,13 +731,17 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     return h
   }
 
-  /** 引擎连接配置（目录级 serverUrl 覆盖优先；目录级限速经 netOpts.ratePerSec 注入） */
+  /**
+   * 引擎连接配置：目录 serverId 指向的服务器条目展开（地址 / 账号 / netOpts /
+   * tls 各自独立，多服务器互不串凭据）；历史遗留的目录级 serverUrl 覆盖地址；
+   * 目录级限速经 netOpts.ratePerSec 注入
+   */
   function cfgOf(slot: DirSlot) {
-    const base: Record<string, unknown> = { ...(config && config.server ? config.server : {}) }
+    const base: Record<string, unknown> = { ...(serverEntryOf(slot) || {}) }
     if (slot && slot.dir && slot.dir.serverUrl) base.serverUrl = slot.dir.serverUrl
     const o = (slot && slot.dir && slot.dir.overrides) || {}
     if (o.ratePerSec != null) {
-      // 目录级限速是显式覆盖：直接改写 netOpts.ratePerSec，全局显式值与档案默认
+      // 目录级限速是显式覆盖：直接改写 netOpts.ratePerSec，服务器显式值与档案默认
       //（如坚果云自动限速）都不再生效 —— resolveNetOpts 只认 cfg.netOpts 的显式键
       const net = typeof base.netOpts === 'object' && base.netOpts ? { ...(base.netOpts as Record<string, unknown>) } : {}
       net.ratePerSec = o.ratePerSec
@@ -691,6 +766,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       // 用户排除规则：数组形态透传给引擎扫描层（compileExcludePatterns）；
       // 目录级覆盖整体替换全局规则（数组语义「全集」，不做两表合并）
       excludePatterns: Array.isArray(o.excludePatterns) ? o.excludePatterns : Array.isArray(p.excludePatterns) ? p.excludePatterns : undefined,
+      // 勾选树「取消同步」的精确 rel（目录级字段，无全局形态）：与 excludePatterns
+      // 在引擎扫描层合并生效（compileSyncExcludes —— 字面精确匹配，祖先目录命中即整棵子树）
+      excludeRels: Array.isArray(o.excludeRels) ? o.excludeRels : undefined,
     }
   }
 
@@ -718,7 +796,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     } catch (e: any) {
       return { error: `dbStorage 读取失败：${(e && e.message) || e}` }
     }
-    if (raw == null) return { config: { server: null, dirs: [], prefs: {} } }
+    if (raw == null) return { config: { servers: [], dirs: [], prefs: {} } }
     if (typeof raw === 'string') {
       try {
         raw = JSON.parse(raw)
@@ -727,12 +805,23 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       }
     }
     if (!raw || typeof raw !== 'object') return { error: '配置格式不识别' }
-    const server = raw.server && typeof raw.server === 'object' ? { ...raw.server } : null
+    // 服务器列表（多账号 / 多服务器）：servers[] 为权威形态；旧配置只有单份
+    // server —— 迁移为唯一成员（id 固定 'srv-default'，与渲染层 store 的迁移同款，
+    // 目录缺省 serverId 恰好指向它，行为与单服务器形态完全一致）。
     // 密码经凭据混淆（AES-256-GCM）落盘：读取时解密回内存供引擎使用。解密失败
     //（密钥文件丢失 / 密文损坏 / 值本就不是密文格式）返回 ''—— 按密码为空处理，
     // 连接将以 401 失败提示用户重输，绝不把密文当明文送去认证。混淆语义见
     // store.js「凭据混淆」节（防随手窥视，非强加密）。
-    if (server && typeof server.password === 'string') server.password = store.openSecret(server.password)
+    const openServer = (s: any): SchedulerServerCfg => {
+      const out: SchedulerServerCfg = { ...s }
+      if (typeof out.id !== 'string' || !out.id) out.id = 'srv-default'
+      if (typeof out.password === 'string') out.password = store.openSecret(out.password)
+      return out
+    }
+    const servers: SchedulerServerCfg[] = (Array.isArray(raw.servers) ? raw.servers : [])
+      .filter((s: any) => s && typeof s === 'object')
+      .map(openServer)
+    if (!servers.length && raw.server && typeof raw.server === 'object') servers.push(openServer(raw.server))
     const dirs = Array.isArray(raw.dirs)
       ? raw.dirs
           .filter((d: any) => d && typeof d === 'object' && d.localPath && d.remotePath)
@@ -743,8 +832,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
             mode: d.mode === 'upload' || d.mode === 'download' ? d.mode : 'two-way',
             enabled: d.enabled !== false,
             overrides: d.overrides && typeof d.overrides === 'object' ? d.overrides : null,
-            // 目录级服务器覆盖（每 origin 并发的分组键；现有 UI 不写该字段 ——
-            // 缺省回落全局 server。写入测试多 origin 验收）
+            // 目录使用的服务器（servers[] 成员 id；旧配置 / 缺省 = null 跟随第一台）
+            serverId: d.serverId ? String(d.serverId) : null,
+            // 目录级服务器地址覆盖（历史遗留路径；现有 UI 不写 —— 多服务器形态走 serverId）
             serverUrl: d.serverUrl ? String(d.serverUrl) : null,
           }))
           // 实验功能「ZTools 插件同步」的固定 id 由下方合成项独占：历史数据里若
@@ -768,10 +858,11 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         mode: 'two-way',
         enabled: prefs.ztoolsPluginSyncPaused !== true,
         overrides: null,
+        serverId: null,
         serverUrl: null,
       })
     }
-    return { config: { server, dirs, prefs } }
+    return { config: { servers, dirs, prefs } }
   }
 
   /**
@@ -863,12 +954,71 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       ensureIntervalSchedule(slot)
     }
     rebuildWatchers()
+    syncPauseWatch()
     if (!suspended) {
       startTick()
       if (leaderState !== 'leader') startElection()
     }
     emit({ type: 'config-applied', dirsCount: prevSlots.size })
     return { applied: true }
+  }
+
+  // ---------- 全局暂停（prefs.globalPauseUntil，顶栏一键暂停） ----------
+
+  /**
+   * 暂停状态迁移的收敛点（applyConfig 末尾调用）：进入暂停 → 摘除 watcher 与
+   * 自动类预订已由 dirEligible=false 的既有分支完成，这里只安排「到期重读」；
+   * 退出暂停（手动恢复 / 到期）→ 补跑预订 + 重挂 watcher。
+   * 到期定时器是唯一「配置内容未变也需要动作」的路径 —— applyConfig 按 configV
+   * 自检会跳过未变配置，暂停到期只能自己驱动（refreshConfig 后重新判定迁移，
+   * 用户可能在暂停期间又改了到期时刻 / 干脆续了暂停）。
+   */
+  function syncPauseWatch(): void {
+    const paused = globalPaused()
+    const was = globalPauseActive
+    globalPauseActive = paused
+    if (pauseExpiryTimer) {
+      pauseExpiryTimer.dispose()
+      pauseExpiryTimer = null
+    }
+    if (!paused) {
+      if (was) resumeAfterPause()
+      return
+    }
+    const p = Number(config && config.prefs && config.prefs.globalPauseUntil)
+    if (p > 0) {
+      // 有到期时刻：到点重读配置再判迁移。-1 = 一直暂停，无到期定时器 ——
+      // 手动恢复经 persist → reload → applyConfig 走本函数的恢复分支
+      pauseExpiryTimer = kit.after(() => {
+        pauseExpiryTimer = null
+        void refreshConfig({})
+          .catch(() => {})
+          .then(() => {
+            if (!destroyed) syncPauseWatch()
+          })
+      }, Math.max(1000, p - now() + 500))
+    }
+  }
+
+  /**
+   * 恢复自动调度后的补跑：有资格、空闲且按 interval 排程的目录在短抖动内到期
+   *（吸收暂停期间的积压变更）。只动预订状态，不直接入队 —— 非leader 实例 /
+   * 挂起态下 tick 不跑，预订挂在 slot 上，上位 / 恢复后自然发射。退避、让出、
+   * follow-up 与 watch 重排（rerunPending）等既有语义优先，一律不覆盖。
+   */
+  function resumeAfterPause(): void {
+    for (const slot of slots.values()) {
+      if (!dirEligible(slot)) continue
+      if (slot.state === 'running' || slot.state === 'queued') continue
+      if (slot.rerunPending || slot.nextDueKind === 'watch') continue // 有轮末等待者：交还 rerun 语义
+      if (slot.backoffUntil > now()) continue // 退避期内：维持 backoff 预订语义
+      if (intervalMsOf(slot) <= 0) continue // 不排定时的目录（仅 watch 驱动）不补跑
+      slot.nextDueAt = now() + jitterRange(RESUME_CATCHUP_MIN_MS, RESUME_CATCHUP_MAX_MS)
+      slot.nextDueKind = 'interval'
+      if (slot.state === 'idle') slot.state = 'scheduled'
+    }
+    rebuildWatchers()
+    if (!suspended && ready) startTick()
   }
 
   /**
@@ -1552,8 +1702,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    *        覆盖档；仅 op 手动轮携带，随 job 传入轮体）。
    *        注意：目录忙时走 rerunPending 路径会丢弃 op —— 调用方（syncNow）须
    *        先对忙目录拒绝 op 轮，保证此处只在空闲态接收 op
+   * @param dryRun 预演轮（「预演一次」入口）：hints.dryRun 注入引擎的零副作用轮；
+   *        忙时重排同样无法携带 —— syncNow 已对忙目录拒绝，此处只在空闲态接收
    */
-  function enqueue(slot: DirSlot, kind: string, front: boolean, resolve?: (r: RoundResolveValue) => void, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null): void {
+  function enqueue(slot: DirSlot, kind: string, front: boolean, resolve?: (r: RoundResolveValue) => void, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null, dryRun?: boolean): void {
     if (destroyed || suspended) {
       if (resolve) resolve({ error: '调度器未运行' })
       return
@@ -1566,7 +1718,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     }
     slot.state = 'queued'
     slot.progress = null
-    const job = { slot, kind, resolve, enqueuedAt: now(), op: op || null }
+    const job = { slot, kind, resolve, enqueuedAt: now(), op: op || null, dryRun: !!dryRun }
     if (front) {
       let idx = 0
       while (idx < queue.length && now() - queue[idx].enqueuedAt >= FAIRNESS_STARVE_MS) idx++
@@ -1649,7 +1801,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       }
       if (picked < 0) return
       const job = queue.splice(picked, 1)[0]
-      void startRound(job.slot, job.kind, job.resolve, job.op)
+      void startRound(job.slot, job.kind, job.resolve, job.op, job.dryRun)
     }
   }
 
@@ -1699,8 +1851,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    * mixed 计入退避的取舍：mixed 含网络类成分，服务器可能整体不可达，保守计入。
    */
   function planNext(slot: DirSlot, o: RoundOutcome): void {
-    if (o.skipped || o.concurrent || o.cancelled) {
-      // 未真正执行（锁竞争让路 / 引擎被其他入口占用 / 用户取消）：不动任何计数
+    if (o.skipped || o.concurrent || o.cancelled || o.dryRun) {
+      // 未真正执行（锁竞争让路 / 引擎被其他入口占用 / 用户取消 / 预演轮）：
+      // 不动任何计数 —— 预演没有改变任何文件，排程语义与轮前完全一致
       ensureIntervalSchedule(slot)
       return
     }
@@ -1776,15 +1929,17 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    * 没有真正跑过，渲染层状态不该被打扰。
    */
   function settleRound(slot: DirSlot, kind: string, outcome: RoundOutcome): void {
-    const { summary = null, error = null, cancelled = false, skipped = false, concurrent = false } = outcome || {}
+    const { summary = null, error = null, cancelled = false, skipped = false, concurrent = false, dryRun = false } = outcome || {}
     const hadRerun = slot.rerunPending
     slot.state = 'idle'
     slot.progress = null
     slot.cancelRequested = false
     // 真实轮对目录做了全量对比同步，退避期合并的 watch 变化已被吸收；skipped /
-    // concurrent 轮没有真正同步，保留 watchHeld 待下一轮吸收
-    if (!skipped && !concurrent) slot.watchHeld = false
-    if (!skipped) {
+    // concurrent / 预演轮没有真正同步，保留 watchHeld 待下一轮吸收
+    if (!skipped && !concurrent && !dryRun) slot.watchHeld = false
+    // 预演轮不发 round-end、不触发挂起提醒与注册表对账（零打扰 —— 渲染层行状态机、
+    // 待处理面板、系统通知通道都不被「预演一次」惊动；结果经 syncNow 返回值送达）
+    if (!skipped && !dryRun) {
       slot.lastRound = {
         endedAt: now(),
         summary: summary || null,
@@ -1844,7 +1999,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
           .catch(() => {})
       }
     }
-    planNext(slot, { summary, error, cancelled, skipped, concurrent })
+    planNext(slot, { summary, error, cancelled, skipped, concurrent, dryRun })
     // rerunPending → +2s 重排一次（watch 语义合并）
     if (slot.rerunPending) {
       slot.rerunPending = false
@@ -1879,8 +2034,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    * 目录锁：所有轮（自动 / 手动 / 委托代跑）都持同一目录锁，与兜底路径互斥。
    * @param op 一次性单向操作（'pull' / 'push' 补齐档 / 'pull-full' / 'push-full'
    *        覆盖档；仅 op 手动 / 委托轮携带，经引擎 hints.op 生效；自动轮恒缺省）
+   * @param dryRun 预演轮：hints.dryRun 注入引擎的零副作用轮（结果不做任何排程
+   *        影响、不发 round-end —— 渲染层行状态机与通知通道都不被预演打扰）
    */
-  async function startRound(slot: DirSlot, kind: string, resolve?: (r: RoundResolveValue) => void, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null): Promise<void> {
+  async function startRound(slot: DirSlot, kind: string, resolve?: (r: RoundResolveValue) => void, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null, dryRun?: boolean): Promise<void> {
     const jobRec = { slot, kind, origin: originOf(slot) }
     runningJobs.push(jobRec) // 同步注册：泵在首个 await 前即可见到本 job 占用的 origin
     try {
@@ -1895,17 +2052,19 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       slot.state = 'running'
       slot.progress = null
       emitSlot(slot, true)
-      // manual 身份重判（执行前，不沿用发起时判断）
+      // manual 身份重判（执行前，不沿用发起时判断）。预演轮非 leader 也不委托
+      //（不转发冲突、零远端写，本地跑与 leader 跑语义一致）
       if (kind === 'manual' && !(leaderState === 'leader' && ownerRef.valid && (await leaderLockIsMine()))) {
-        const r = await delegateManual(slot, op) // 内部已 settleRound
+        const r = dryRun ? await runDryRoundLocal(slot) : await delegateManual(slot, op) // 内部已 settleRound
         if (resolve) resolve(r)
         return
       }
-      const outcome = await executeRound(slot, kind, op)
+      const outcome = await executeRound(slot, kind, op, dryRun)
+      if (dryRun) (outcome as any).dryRun = true
       settleRound(slot, kind, outcome)
       if (resolve) resolve(outcome)
     } catch (e: any) {
-      settleRound(slot, kind, { error: e })
+      settleRound(slot, kind, { error: e, ...(dryRun ? { dryRun: true } : {}) })
       if (resolve) resolve({ error: e })
     } finally {
       const i = runningJobs.indexOf(jobRec)
@@ -1921,8 +2080,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    * 即中止（在途轮在文件边界以取消语义收场）。
    * @param op 一次性单向操作（'pull' / 'push' 补齐档 / 'pull-full' / 'push-full'
    *        覆盖档；经引擎 hints.op 注入本轮规划）
+   * @param dryRun 预演轮：hints.dryRun 注入引擎（source 一并改为 'dry-run'，
+   *        同步记录落预演触发；脏路径快照不携带 —— 预演恒全量扫描）
    */
-  async function executeRound(slot: DirSlot, kind: string, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null): Promise<RoundOutcome> {
+  async function executeRound(slot: DirSlot, kind: string, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null, dryRun?: boolean): Promise<RoundOutcome> {
     const isAuto =
       kind === 'interval' || kind === 'startup' || kind === 'watch' || kind === 'follow-up' || kind === 'yield-retry' || kind === 'backoff'
     const h = await dirLockHashFor(slot)
@@ -1970,8 +2131,15 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       const summary = await engine.syncDirectory(cfgOf(slot), slot.dir, prefsOf(slot), {
         onProgress: progressAt,
         shouldAbort: () => slot.cancelRequested || !ownerRef.valid,
-        onConflict: kind === 'manual' && rendererOnline ? (info: ConflictInfo) => forwardConflict(slot, info) : () => 'defer',
-        hints: { source: kind, dirtyPaths: dirty || undefined, watcherKey: wrec ? wrec.watcherId : undefined, op: op || undefined },
+        // 预演轮不转发冲突（引擎侧不询问），回调仅为防御性兜底
+        onConflict: !dryRun && kind === 'manual' && rendererOnline ? (info: ConflictInfo) => forwardConflict(slot, info) : () => 'defer',
+        hints: {
+          source: dryRun ? 'dry-run' : kind,
+          dirtyPaths: dryRun ? undefined : dirty || undefined,
+          watcherKey: dryRun ? undefined : wrec ? wrec.watcherId : undefined,
+          op: dryRun ? undefined : op || undefined,
+          dryRun: dryRun || undefined,
+        },
       })
       // concurrent:true（引擎 ROUND_IN_FLIGHT 被其他入口占用，如测试直调引擎）：
       // 不得丢触发 —— 置 rerunPending（settleRound 轮末 +2s 重排一次）
@@ -2020,8 +2188,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    * delegateManual 统一收尾）。
    * @param op 一次性单向操作（'pull' / 'push' 补齐档 / 'pull-full' / 'push-full'
    *        覆盖档；经引擎 hints.op 注入本轮规划）
+   * @param dryRun 预演轮（本地直跑形态；冲突一律 defer 的既有语义对预演无意义 ——
+   *        引擎预演不询问）
    */
-  async function fallbackRun(slot: DirSlot, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null): Promise<RoundResolveValue> {
+  async function fallbackRun(slot: DirSlot, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null, dryRun?: boolean): Promise<RoundResolveValue> {
     const h = await dirLockHashFor(slot)
     // 锁等待期间发 lockwait 进度（与 executeRound 同口径；节流由发射器承担）
     const progressAt = makeProgressEmitter(slot)
@@ -2044,7 +2214,11 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         onProgress: progressAt,
         shouldAbort: () => slot.cancelRequested,
         onConflict: () => 'defer',
-        hints: { source: 'manual', op: op || undefined },
+        hints: {
+          source: dryRun ? 'dry-run' : 'manual',
+          op: dryRun ? undefined : op || undefined,
+          dryRun: dryRun || undefined,
+        },
       })
       if (summary && summary.concurrent) {
         // 兜底路径撞上本进程内其他入口的在飞轮（如测试直调引擎）：不丢触发，
@@ -2057,6 +2231,21 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     } finally {
       await releaseDirLock(h)
     }
+  }
+
+  /**
+   * 预演轮的本地直跑（非 leader 也不委托 —— 预演不转发冲突、零远端写，本地跑
+   * 与 leader 跑语义一致）：fallbackRun 拿目录锁执行后按 settleRound 收尾
+   *（slot 状态 / 等待者唤醒与普通轮同一管线；round-end 与排程影响被 dryRun 抑制）。
+   */
+  async function runDryRoundLocal(slot: DirSlot): Promise<RoundResolveValue> {
+    const r = await fallbackRun(slot, null, true)
+    settleRound(slot, 'manual', {
+      summary: r.summary || null,
+      error: r.error == null ? null : r.error instanceof Error ? r.error : new Error(String(r.error)),
+      dryRun: true,
+    })
+    return r
   }
 
   // ---------- watcher（仅 leader 注册；触发即插队） ----------
@@ -2171,6 +2360,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
      *        本端多出与改动；覆盖档以选定侧为准镜像对侧 —— 缺失恢复 / 不一致
      *        覆盖 / 多余删除）。目录忙（queued/running）时明确拒绝 —— 忙时的
      *        rerun 重排轮无法携带 op，放行会退化成常规轮，违背按钮语义
+     * @param opts.dryRun 预演（「预演一次」入口）：零副作用轮，引擎 hints.dryRun
+     *        生效 —— 返回 summary 带 dryRun 标记（计划值），同步记录落 trigger
+     *        'dry-run'；不触发排程影响 / round-end / 通知；忙时同样拒绝；非 leader
+     *        不委托（本地直跑，预演无冲突转发语义）
      */
     async syncNow(dirId, opts) {
       if (!ready) {
@@ -2178,8 +2371,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         notReady.detail = notReadyReason || '配置未加载'
         throw notReady
       }
-      if (!config || !config.server || !config.server.serverUrl) throw new Error('还没有设置服务器，请先到「设置」里填写')
+      if (!config || !serverConfigured()) throw new Error('还没有设置服务器，请先到「设置」里填写')
       const op = opts && (opts.op === 'pull' || opts.op === 'push' || opts.op === 'pull-full' || opts.op === 'push-full') ? opts.op : null
+      const dryRun = !!(opts && opts.dryRun === true)
       const targets: DirSlot[] = dirId
         ? slots.has(dirId)
           ? [slots.get(dirId) as DirSlot]
@@ -2187,18 +2381,18 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         : Array.from(slots.values()).filter((s) => s.dir.enabled !== false)
       if (dirId && !targets[0]) throw new Error('找不到这个同步文件夹')
       if (!targets.length) throw new Error(dirId ? '找不到这个同步文件夹' : '没有正在开启的同步文件夹')
-      if (op && targets.some((s) => s.state === 'queued' || s.state === 'running')) {
+      if ((op || dryRun) && targets.some((s) => s.state === 'queued' || s.state === 'running')) {
         throw new Error('这个文件夹正在同步中，请等这一轮结束再试')
       }
       const results: RoundResolveValue[] = []
       for (const slot of targets) {
         const mineNow = leaderState === 'leader' && ownerRef.valid && (await leaderLockIsMine())
         if (mineNow) {
-          // op 轮的忙检查已在本函数入口完成：此处到 enqueue 之间无 await（单线程
+          // op / 预演轮的忙检查已在本函数入口完成：此处到 enqueue 之间无 await（单线程
           // 事件循环内原子），不会出现「检查空闲 → 入队时已忙」的竞态窗口
-          results.push(await new Promise<RoundResolveValue>((resolve) => enqueue(slot, 'manual', true, resolve, op)))
+          results.push(await new Promise<RoundResolveValue>((resolve) => enqueue(slot, 'manual', true, resolve, op, dryRun)))
         } else {
-          results.push(await delegateManual(slot, op))
+          results.push(dryRun ? await runDryRoundLocal(slot) : await delegateManual(slot, op))
         }
       }
       if (dirId) {

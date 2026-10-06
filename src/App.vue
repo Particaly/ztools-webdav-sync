@@ -8,6 +8,7 @@ import RootLostModal from './components/RootLostModal.vue'
 import PendingCenterModal from './components/PendingCenterModal.vue'
 import AppToasts from './components/ui/AppToasts.vue'
 import { useStore } from './composables/store'
+import { installEscRouter } from './composables/esc'
 
 const store = useStore()
 
@@ -21,6 +22,9 @@ watch(
 )
 
 onMounted(async () => {
+  // 全局 ESC 退层路由最先就位：window 捕获阶段先于宿主 preload 的冒泡监听，
+  // 弹窗 / 子页面的 ESC 由插件消费（回退首页），仅首页无弹窗时交还宿主回搜索框
+  installEscRouter()
   await store.init()
   // 插件生命周期钩子（onPluginOut / onPluginEnter）由 preload 侧先注册持有槽位
   // （宿主为单回调槽位、后注册会覆盖），并经调度器订阅转发 plugin-out / plugin-enter

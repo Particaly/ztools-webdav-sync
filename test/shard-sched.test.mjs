@@ -1730,6 +1730,129 @@ const mountScZtools = () => {
     }
   })
 
+  // ---- SC13（快，假时钟）：全局暂停自动同步 —— dirEligible 门控（自动轮不排 /
+  //      新目录 startup 不发射）/ 到期自动恢复补跑 / 手动恢复补跑 / 手动
+  //      syncNow 不受影响 / -1 一直暂停无到期定时器 ----
+
+  await section('SC13：全局暂停自动同步（假时钟）', async () => {
+    mountScZtools() // 幂等：fast/slow 过滤下 SC1 可能未运行
+    // 真私有存储根（绝不 switchDevice 到全局）：调度器的 leader.lock / 目录锁
+    // 全部落在这里。freshStore 会把全局当前根切过去（跟随 store.storageRoot 的
+    // 存活实例都能到达），因此这里直接建独立目录注入 —— 前序节遗留的存活实例
+    // 只会跟随全局当前根，永远到不了本节的私有根，leader 选举零竞争（该干扰
+    // 曾以「心跳发现锁已被其他实例接管」的 becomeLost 偶发打断本节）。
+    // 引擎的基线 / 能力缓存仍走全局根（按 localPath / remotePath 键隔离，不串）。
+    const sc13Root = path.join(os.tmpdir(), `wdsync-sc13-root-${Date.now()}-${process.pid}`)
+    await fsp.mkdir(path.join(sc13Root, 'scheduler'), { recursive: true })
+    const clock = makeFakeClock()
+    const SC13_LOCAL = await tmpLocal('sc13')
+    await fsp.writeFile(path.join(SC13_LOCAL, 'a.txt'), 'sc13-a')
+    // 初始未暂停、autoSync 关（slot idle，无任何轮）：先把 leader 选出来再测门控
+    setSCConfig([{ id: 'd1', localPath: SC13_LOCAL, remotePath: '/sc13', mode: 'two-way' }], { autoSync: false, intervalMin: 1 })
+    const sched = createTestSched({ now: clock.now, timers: clock.timers, storageRoot: () => sc13Root })
+    const events = []
+    sched.subscribe((ev) => events.push(ev))
+    const roundEnds = () => events.filter((e) => e.type === 'round-end')
+    try {
+      await sched.init()
+      const elected = await pumpUntil(clock, () => sched.getSnapshot().leader.isLeader === true, 8000, 8000)
+      check('SC13 instance elected leader', elected, JSON.stringify(sched.getSnapshot().leader))
+
+      // ① 暂停 + autoSync 开（reload 出现新目录）：dirEligible 门控 —— slot 保持
+      //    idle、新目录 startup 轮不发射、interval 不预订
+      setSCConfig([{ id: 'd1', localPath: SC13_LOCAL, remotePath: '/sc13', mode: 'two-way' }], {
+        autoSync: true,
+        intervalMin: 1,
+        globalPauseUntil: clock.now() + 30 * 1000,
+      })
+      await sched.reload()
+      let slot = sched.getSnapshot().slots[0]
+      check(
+        'SC13 pause gates eligibility: new-dir slot stays idle, no startup/interval booking',
+        slot && slot.state === 'idle' && slot.nextDueAt == null,
+        JSON.stringify(slot && { state: slot.state, due: slot.nextDueAt })
+      )
+      // 大步长注意：步进必须 < HEARTBEAT_MS(5s)，否则假时钟下心跳两次写入的间隔
+      // 超过 leader 锁 TTL(15s)，leader 会按设计自判 lost —— 调度决策全停。
+      // 暂停时长用 30s 而非分钟级：缩小假时钟推进窗口，降低跨节僵尸实例
+      // （前序节遗留的真实时钟选举重试）在本节运行期抢走 leader 锁的偶发干扰。
+      await clock.advance(5 * 1000, 4000)
+      check('SC13 no auto rounds fire while paused', roundEnds().length === 0, `rounds=${roundEnds().length}`)
+
+      // ② 到期自动恢复：过期定时器（kit.after，假时钟驱动）触发重读 → 迁移判定
+      //    → 有资格空闲目录短抖动（2–6s）内补跑预订 → 真实轮跑完。
+      //    先大步长跨过到期点，再用 pumpUntil 消费补跑预订 —— pumpUntil 边推进
+      //    假时钟（tick 得以发射）边让出真实时间（轮体真实 IO 得以推进）；
+      //    waitReal 纯真实等待不会动假时钟，tick（假定时器）永远不会触发。
+      await clock.advance(30 * 1000, 4000)
+      const resumeOk = await pumpUntil(clock, () => roundEnds().length >= 1, 20000, 60000)
+      slot = sched.getSnapshot().slots[0]
+      check(
+        'SC13 pause expiry re-arms a catch-up round (2-6s jitter, interval kind) that runs',
+        resumeOk && roundEnds()[0] && roundEnds()[0].error == null,
+        JSON.stringify({ resumeOk, round: roundEnds()[0] || null })
+      )
+
+      // ③ 暂停中手动 syncNow 不受影响（用户显式动作）
+      setSCConfig([{ id: 'd1', localPath: SC13_LOCAL, remotePath: '/sc13', mode: 'two-way' }], {
+        autoSync: true,
+        intervalMin: 1,
+        globalPauseUntil: clock.now() + 30 * 1000,
+      })
+      await sched.reload()
+      slot = sched.getSnapshot().slots[0]
+      check(
+        'SC13 re-pause clears the interval booking',
+        slot.state === 'idle' && slot.nextDueAt == null,
+        JSON.stringify({ state: slot.state, due: slot.nextDueAt })
+      )
+      let manualErr = null
+      let manualRes = null
+      try {
+        manualRes = await sched.syncNow('d1')
+      } catch (e) {
+        manualErr = e
+      }
+      check(
+        'SC13 manual syncNow works while paused',
+        !manualErr && manualRes && manualRes.ok === true && roundEnds().length === 2,
+        JSON.stringify({ err: manualErr && manualErr.message, res: manualRes, rounds: roundEnds().length })
+      )
+
+      // ④ -1 一直暂停：无到期定时器（推进时钟不恢复、不报错）；手动恢复（清 0）
+      //    经 reload 迁移 → 短抖动补跑
+      setSCConfig([{ id: 'd1', localPath: SC13_LOCAL, remotePath: '/sc13', mode: 'two-way' }], {
+        autoSync: true,
+        intervalMin: 1,
+        globalPauseUntil: -1,
+      })
+      await sched.reload()
+      await clock.advance(8 * 1000, 4000)
+      slot = sched.getSnapshot().slots[0]
+      check(
+        'SC13 indefinite pause never auto-resumes',
+        slot.state === 'idle' && roundEnds().length === 2,
+        JSON.stringify({ state: slot.state, rounds: roundEnds().length })
+      )
+      setSCConfig([{ id: 'd1', localPath: SC13_LOCAL, remotePath: '/sc13', mode: 'two-way' }], { autoSync: true, intervalMin: 1 })
+      await sched.reload()
+      slot = sched.getSnapshot().slots[0]
+      check(
+        'SC13 manual resume books a 2-6s catch-up round',
+        slot.state === 'scheduled' && slot.nextDueKind === 'interval' && slot.nextDueAt != null && slot.nextDueAt - clock.now() <= 6500 && slot.nextDueAt - clock.now() > 0,
+        `state=${slot.state} kind=${slot.nextDueKind} in=${slot.nextDueAt == null ? '-' : slot.nextDueAt - clock.now()}`
+      )
+      // capFake 放宽到 120s：200ms 步进下 ≈6s 真实时间，覆盖冷缓存轮的真实 IO 时长
+      const resume2 = await pumpUntil(clock, () => roundEnds().length >= 3, 25000, 120000)
+      check('SC13 resumed catch-up round runs', resume2 && roundEnds()[2] && roundEnds()[2].error == null, JSON.stringify(roundEnds()[2] || {}))
+    } finally {
+      sched.cleanup()
+      await fsp.rm(SC13_LOCAL, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(sc13Root, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'sc13'), { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
 afterAll(async () => {
   // SC 系列收尾（原 DS1 前 gap 的节外语句迁移至此）：摘假 ztools、清 SC_DB
   delete global.window.ztools

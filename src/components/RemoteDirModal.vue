@@ -13,7 +13,8 @@ interface DirEntry {
 /**
  * 远端目录选择弹窗：从服务器根目录逐级浏览 WebDAV 目录树并选中一个目录，
  * 供「设置 - 默认 WebDAV 目录」与「添加同步目录 - WebDAV 目录」的浏览入口复用。
- * 连接配置取自全局 store 的当前值（允许使用尚未保存的输入）；
+ * 连接配置：传入 server 用之（添加目录弹窗按表单选定的服务器浏览），缺省取
+ * 全局 store 的当前活跃服务器（允许使用尚未保存的输入）；
  * 无 preload 的浏览器预览环境使用内置演示目录树。
  * 点选列表条目进入下一级，「选择当前目录」通过 pick 事件把当前路径回传给使用方。
  */
@@ -25,8 +26,10 @@ const props = withDefaults(
     title?: string
     /** 弹窗副标题：说明本次选择的用途（同步位置 / 功能测试目录等） */
     subtitle?: string
+    /** 连接配置（多服务器形态由调用方指定；缺省 = 活跃服务器） */
+    server?: import('../env.d').DavConfig | null
   }>(),
-  { initialPath: '', title: '选择云端文件夹', subtitle: '选择云端的一个文件夹作为同步位置' }
+  { initialPath: '', title: '选择云端文件夹', subtitle: '选择云端的一个文件夹作为同步位置', server: null }
 )
 
 const emit = defineEmits<{ pick: [path: string]; close: [] }>()
@@ -79,7 +82,8 @@ async function load() {
   shownCount.value = MAX_SHOWN // 换目录重置限长展开
   try {
     if (window.services) {
-      subDirs.value = await window.services.dav.listDirs({ ...store.state.server }, currentPath.value)
+      const cfg = props.server || store.state.server
+      subDirs.value = await window.services.dav.listDirs({ ...cfg }, currentPath.value)
     } else {
       // 纯浏览器预览：模拟一次网络往返后返回演示树数据
       await new Promise((r) => setTimeout(r, 200))
