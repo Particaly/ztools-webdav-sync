@@ -79,7 +79,12 @@ export async function setupShard({ shard, port }) {
   const ROOT = path.join(HERE, `.dav-root-${shard}`)
   const PORT = port
   await fsp.rm(ROOT, { recursive: true, force: true })
-  const server = spawn(process.execPath, [path.join(HERE, 'dav-server.mjs'), String(PORT), ROOT], { stdio: 'pipe' })
+  const server = spawn(process.execPath, [path.join(HERE, 'dav-server.mjs'), String(PORT), ROOT], {
+    stdio: 'pipe',
+    // 父进程死亡看门狗的注入 pid：worker 被强杀等未走 afterAll 的路径下，
+    // dav-server 自行退出（防端口残留；见 dav-server.mjs 顶部说明）
+    env: { ...process.env, WDSYNC_DAV_EXIT_WITH: String(process.pid) },
+  })
   process.on('exit', () => {
     try {
       server.kill()
@@ -490,6 +495,8 @@ export async function teardownShard(ctx) {
     '.wdsync-test-dedupfail',
     '.wdsync-test-throttle',
     '.wdsync-test-casepair',
+    // 改名同步（MOVE）标记（正常路径由 RN 节自己的 finally 清理，此处兜底防异常泄漏）
+    '.wdsync-test-nomove',
     // etag 子树跳过与 depth-infinity 的探测标记（正常路径由
     // B3 / ES / DP 各节自己的 finally 清理，此处兜底防异常路径泄漏给后续节）
     '.wdsync-test-depthlog',

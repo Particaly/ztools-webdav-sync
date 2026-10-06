@@ -1,7 +1,10 @@
 /**
  * 迷你 WebDAV 服务器：仅用于本地端到端测试同步引擎。
  * 支持 OPTIONS / PROPFIND(depth 0/1/infinity) / GET / PUT / MKCOL / DELETE / MOVE。
- * 用法：node test/dav-server.mjs [port] [rootDir]
+ * 用法：node test/dav-server.mjs [port] [rootDir] [certPem] [keyPem]
+ *       （certPem / keyPem 同时给出时以 https 提供服务 —— 自签名证书链路用例）。
+ * MOVE 语义：Destination 兼容绝对 URL 与裸路径；源缺失 404；Overwrite:F 且目标
+ * 已存在 412（绝不静默覆盖）；成功 201（目标父目录自动补齐）。
  *
  * 行为开关分两类（均放 ROOT 下标记文件，用完删除）：
  *
@@ -116,6 +119,10 @@
  *                              PROPFIND 应答：对它的 GET/PUT/DELETE 走默认 404（引擎
  *                              正常应跳过它们，任何访问都是行为泄漏，测试据此断言）。
  *
+ * 改名同步（MOVE）相关标记：
+ *   .wdsync-test-nomove   —— MOVE 一律 405：模拟不支持 MOVE 的服务器（能力探测应判
+ *                              moveSupported=false，改名回落「删除+重新上传」语义）。
+ *
  * Depth:infinity 单请求扫描相关标记：
  *   .wdsync-test-noinfinity —— 对一切 Depth:infinity PROPFIND 返回 403（与 profile
  *                              无关）：模拟「能力缓存称支持、服务器实际拒绝」—— 引擎
@@ -169,6 +176,7 @@
  *   p9（递归列举）  —— PROPFIND Depth: infinity 返回递归 multistatus（其余同 p1）。
  */
 import http from 'node:http'
+import https from 'node:https'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -178,6 +186,23 @@ import { fileURLToPath } from 'node:url'
 const port = Number(process.argv[2]) || 5360
 const ROOT = process.argv[3] || path.join(path.dirname(fileURLToPath(import.meta.url)), '.dav-root')
 fs.mkdirSync(ROOT, { recursive: true })
+
+// 父进程死亡看门狗：spawn 方经 WDSYNC_DAV_EXIT_WITH 注入自己的 pid，本进程每 2s
+// 探活 —— 父进程已死（测试 worker 被强杀等任何未走 afterAll 清理的路径）即自行退出，
+// 绝不残留占用端口。探活失败（ESRCH）= 父已亡；EPERM 等按仍存活处理（保守）。
+{
+  const parentPid = Number(process.env.WDSYNC_DAV_EXIT_WITH) || 0
+  if (parentPid > 0) {
+    const t = setInterval(() => {
+      try {
+        process.kill(parentPid, 0)
+      } catch (e) {
+        if (e && e.code === 'ESRCH') process.exit(0)
+      }
+    }, 2000)
+    if (typeof t.unref === 'function') t.unref()
+  }
+}
 
 const HREF_ROOT = '/dav/'
 /** 限流档位：前 N 次 PUT/GET 拒绝（N 取 3：恰好等于引擎的最大重试次数，第 4 次放行） */
@@ -259,6 +284,9 @@ const getfailSubstring = () => flagContent('.wdsync-test-getfail')
 const blackholeOn = () => hasFlag('.wdsync-test-blackhole')
 /** casepair 档：目录列举发现同名文件时额外虚拟列出首字母大小写翻转的孪生条目 */
 const casepairName = () => flagContent('.wdsync-test-casepair')
+// ---- 改名同步（MOVE）标记 ----
+/** nomove：MOVE 一律 405 —— 模拟不支持 MOVE 的服务器（改名回落删传语义用例） */
+const noMoveOn = () => hasFlag('.wdsync-test-nomove')
 // ---- Depth:infinity 单请求扫描标记 ----
 /** noinfinity：一切 Depth:infinity PROPFIND 一律 403（模拟能力缓存过期的服务器拒绝） */
 const noInfinityOn = () => hasFlag('.wdsync-test-noinfinity')
@@ -682,7 +710,7 @@ async function mkdirpDeep(absDir) {
   await fsp.mkdir(absDir, { recursive: true })
 }
 
-const server = http.createServer(async (req, res) => {
+const requestHandler = async (req, res) => {
   const urlPath = req.url.split('?')[0]
   // 4.0.3：客户端销毁连接后，响应流可能异步抛错（write-after-destroy 等）—— 测试
   // 服务器吞掉响应流错误，让「连接被中断」只体现在 reqlog 的 !ABORT 行上
@@ -1028,14 +1056,38 @@ const server = http.createServer(async (req, res) => {
       await fsp.rm(abs, { recursive: true, force: true })
       res.writeHead(204).end()
     } else if (req.method === 'MOVE') {
-      const dest = toLocal(req.headers.destination?.split('?')[0] || '')
+      // nomove 标记：MOVE 一律 405 —— 模拟不支持 MOVE 的服务器（探测期判
+      // moveSupported=false，改名回落删传语义的用例）
+      if (noMoveOn()) {
+        res.writeHead(405).end()
+        return
+      }
+      // Destination 兼容绝对 URL（RFC 4918 要求）与裸路径两种形态
+      const destRaw = String(req.headers.destination || '').split('?')[0]
+      let destPath = destRaw
+      try {
+        destPath = new URL(destRaw).pathname
+      } catch {
+        /* 裸路径：按原值 */
+      }
+      const dest = toLocal(destPath)
       if (!dest) {
         res.writeHead(403).end()
-      } else {
-        await mkdirpDeep(path.dirname(dest))
-        await fsp.rename(abs, dest)
-        res.writeHead(201).end()
+        return
       }
+      // 源不存在：404（客户端按「可能已移动过」幂等收口 —— 核对目标代替盲试）
+      if (!(await fsp.stat(abs).catch(() => null))) {
+        res.writeHead(404).end()
+        return
+      }
+      // Overwrite:F 且目标已存在：412 —— 绝不静默覆盖他机新出现的内容
+      if (String(req.headers.overwrite || '').toUpperCase() === 'F' && (await fsp.stat(dest).catch(() => null))) {
+        res.writeHead(412).end()
+        return
+      }
+      await mkdirpDeep(path.dirname(dest))
+      await fsp.rename(abs, dest)
+      res.writeHead(201).end()
     } else {
       res.writeHead(405).end()
     }
@@ -1046,7 +1098,16 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'text/plain' }).end(String(e && e.message ? e.message : e))
     }
   }
-})
+}
+
+// TLS 形态：node dav-server.mjs <port> <root> <cert.pem> <key.pem> —— 自签名 /
+// 自建 CA 证书服务器的连接链路用例（默认 http）。证书与密钥路径都存在才启用。
+const TLS_CERT = process.argv[4]
+const TLS_KEY = process.argv[5]
+const useTls = Boolean(TLS_CERT && TLS_KEY && fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY))
+const server = useTls
+  ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, requestHandler)
+  : http.createServer(requestHandler)
 
 // keep-alive 空闲超时对齐真实服务器（nginx 默认 75s / 常见网关 30s+），而非 Node 默认 5s：
 // 引擎端 keep-alive 池复用「恰好被服务器关闭」的 socket 时会收到 ECONNRESET（上传按
@@ -1054,5 +1115,5 @@ const server = http.createServer(async (req, res) => {
 server.keepAliveTimeout = 30000
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`mini-dav listening at http://127.0.0.1:${port}${HREF_ROOT} root=${ROOT}`)
+  console.log(`mini-dav listening at ${useTls ? 'https' : 'http'}://127.0.0.1:${port}${HREF_ROOT} root=${ROOT}`)
 })

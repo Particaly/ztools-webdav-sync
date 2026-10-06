@@ -68,6 +68,15 @@ const insecureHttpVisible = computed(
 function dismissInsecureHttp() {
   store.state.prefs.insecureHttpDismissedFor = store.state.server.serverUrl
 }
+
+/**
+ * 「已信任此服务器证书」提示行：https 地址 + 信任开关开启时出现（不可关闭 ——
+ * 信任是持续生效的安全放宽，主界面应常驻可见，与浏览器的「不安全」标记同取向）。
+ */
+const tlsTrustVisible = computed(() => {
+  const s = store.state.server
+  return /^https:\/\//i.test(s.serverUrl.trim()) && s.tls?.trustServerCertificate === true
+})
 </script>
 
 <template>
@@ -113,6 +122,12 @@ function dismissInsecureHttp() {
       <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click.stop="dismissInsecureHttp">
         <AppIcon name="close" :size="10" />
       </AppIconButton>
+    </div>
+    <!-- 已信任证书提示：连接不再校验证书真伪（自签名 NAS 场景的持续安全放宽），
+         常驻可见不可关闭 —— 与设置页的信任开关同源（server.tls.trustServerCertificate） -->
+    <div v-if="tlsTrustVisible" class="flex items-center gap-[5px]" title="已开启「信任此服务器证书」：连接不再校验服务器证书真伪，仅建议在自己可控的 NAS / 内网设备上使用。可在「设置 → WebDAV」关闭">
+      <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0" />
+      <span class="flex-1 min-w-0 text-[11px] text-warning-icon truncate">已信任此服务器的证书：连接不再校验证书真伪，请确认服务器可控</span>
     </div>
   </section>
 </template>

@@ -80,6 +80,7 @@ function syncTaskText(p: DirProgress): string {
       if (p.currentOp === 'upload') return name ? `正在上传 ${name}` : '正在上传文件…'
       if (p.currentOp === 'download') return name ? `正在下载 ${name}` : '正在下载文件…'
       if (p.currentOp === 'delete-local' || p.currentOp === 'delete-remote') return name ? `正在删除 ${name}` : '正在删除文件…'
+      if (p.currentOp === 'rename-remote' || p.currentOp === 'rename-local') return name ? `正在同步改名 ${name}` : '正在同步改名…'
       if (p.currentOp === 'conflict') return name ? `正在处理冲突 ${name}` : '正在处理冲突…'
       return '正在同步文件…'
     }
@@ -433,6 +434,7 @@ function onCancelSync() {
       <span class="sep" />
       <span class="inline-flex items-center gap-[5px] text-[11px] font-medium text-success-deep"><AppIcon name="upload" :size="12" class="text-success" />上传 {{ summary.uploaded }} 个</span>
       <span class="inline-flex items-center gap-[5px] text-[11px] font-medium text-success-deep"><AppIcon name="download" :size="12" class="text-success" />下载 {{ summary.downloaded }} 个</span>
+      <span v-if="(summary.renamedRemote ?? 0) + (summary.renamedLocal ?? 0) > 0" class="inline-flex items-center gap-[5px] text-[11px] font-medium text-success-deep"><AppIcon name="check-circle" :size="12" bg="var(--green-bg)" class="text-success" />改名 {{ (summary.renamedRemote ?? 0) + (summary.renamedLocal ?? 0) }} 个</span>
       <span class="inline-flex items-center gap-[5px] text-[11px] font-medium text-success-deep">
         <AppIcon name="check-circle" :size="12" bg="var(--green-solid)" class="text-success-solid" v-if="summary.conflicts === 0" />
         {{ summary.conflicts === 0 ? '无冲突' : `${summary.conflicts} 个冲突` }}

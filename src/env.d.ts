@@ -49,6 +49,7 @@ export type {
   SyncNowResult,
   SyncProgress,
   SyncSummary,
+  TlsOpts,
   WalIntent,
   ZToolsApi,
   ZtoolsPluginsSyncDesc,
@@ -122,7 +123,7 @@ export interface SyncDir {
     verifyDone?: number
     verifyTotal?: number
     stage?: 'scan' | 'plan' | 'verify' | 'lockwait' | 'lock' | 'transfer' | 'finalize'
-    currentOp?: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict'
+    currentOp?: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict' | 'rename-remote' | 'rename-local'
     currentFile?: string
     scanBytesTotal?: number
   } | null

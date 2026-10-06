@@ -116,6 +116,7 @@ export function roundBrief(r: SyncLogEntry): { label: string; count: number }[] 
   if (r.uploaded > 0) chips.push({ label: '上传', count: r.uploaded })
   if (r.downloaded > 0) chips.push({ label: '下载', count: r.downloaded })
   if (r.deleted > 0) chips.push({ label: '删除', count: r.deleted })
+  if ((r.renamed ?? 0) > 0) chips.push({ label: '改名', count: r.renamed! })
   if (r.conflicts > 0) chips.push({ label: '冲突', count: r.conflicts })
   return chips
 }
@@ -126,6 +127,8 @@ export function opLineText(o: SyncLogOp): string {
   if (o.op === 'download') return `${o.added ? '新增' : '更新'}了电脑文件`
   if (o.op === 'delete-local') return '删除了电脑文件'
   if (o.op === 'delete-remote') return '删除了云端文件'
+  if (o.op === 'rename-remote') return '在云端改名（内容未重传）'
+  if (o.op === 'rename-local') return '在电脑上改名（内容未重新下载）'
   // 冲突条目：一句话写明选择与其落地动作 —— 本身即两侧改动的完整描述
   if (o.choice === 'local') return '冲突：保留电脑版本（已上传覆盖云端）'
   if (o.choice === 'remote') return '冲突：保留云端版本（已下载覆盖本地）'
@@ -134,13 +137,15 @@ export function opLineText(o: SyncLogOp): string {
 }
 
 /** 详尽视图的分组标题（云端 = 线上 / 本地 = 线下 / 冲突 / 提示 / 错误） */
-export function groupOps(ops: SyncLogOp[]): { cloudUp: SyncLogOp[]; cloudDel: SyncLogOp[]; localDown: SyncLogOp[]; localDel: SyncLogOp[]; conflicts: SyncLogOp[] } {
-  const g = { cloudUp: [] as SyncLogOp[], cloudDel: [] as SyncLogOp[], localDown: [] as SyncLogOp[], localDel: [] as SyncLogOp[], conflicts: [] as SyncLogOp[] }
+export function groupOps(ops: SyncLogOp[]): { cloudUp: SyncLogOp[]; cloudDel: SyncLogOp[]; cloudRename: SyncLogOp[]; localDown: SyncLogOp[]; localDel: SyncLogOp[]; localRename: SyncLogOp[]; conflicts: SyncLogOp[] } {
+  const g = { cloudUp: [] as SyncLogOp[], cloudDel: [] as SyncLogOp[], cloudRename: [] as SyncLogOp[], localDown: [] as SyncLogOp[], localDel: [] as SyncLogOp[], localRename: [] as SyncLogOp[], conflicts: [] as SyncLogOp[] }
   for (const o of ops) {
     if (o.op === 'upload') g.cloudUp.push(o)
     else if (o.op === 'delete-remote') g.cloudDel.push(o)
+    else if (o.op === 'rename-remote') g.cloudRename.push(o)
     else if (o.op === 'download') g.localDown.push(o)
     else if (o.op === 'delete-local') g.localDel.push(o)
+    else if (o.op === 'rename-local') g.localRename.push(o)
     else g.conflicts.push(o)
   }
   return g

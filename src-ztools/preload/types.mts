@@ -7,13 +7,33 @@
 // 约束（Node 类型剥离 + esbuild 双通道都要吃）：只允许可擦除语法
 //（interface / type / import type），不得出现 enum / namespace / import =。
 
-/** WebDAV 连接配置（渲染层持久化的 server 段；netOpts 见 NetOpts） */
+/** WebDAV 连接配置（渲染层持久化的 server 段；netOpts 见 NetOpts、tls 见 TlsOpts） */
 export interface DavConfig {
   serverUrl: string
   username: string
   password: string
   /** 网络层调优（可选，缺省用 preload 内置常量）：连接 / 空闲 / 无进展超时、每源连接数与限速 */
   netOpts?: NetOpts
+  /** TLS 信任选项（可选）：自签名证书 NAS（群晖 / QNAP 等）的连接通道 */
+  tls?: TlsOpts
+}
+
+/**
+ * TLS 信任选项：默认（未设置）按系统标准校验证书链与主机名 —— 自签名证书的
+ * 服务器会直接连接失败。两条放宽通道（互不冲突，可同时使用）：
+ *   trustServerCertificate —— 完全信任该服务器（跳过证书校验，传输仍加密）；
+ *   caPem                 —— 追加信任自建 CA 的根证书（仍做完整校验，安全性更好）。
+ * 两者都只作用于当前服务器配置，不影响其他连接。
+ */
+export interface TlsOpts {
+  /**
+   * 信任此服务器的证书：跳过证书链与主机名校验（连接仍加密，但无法防御
+   * 中间人假冒服务器）。仅建议在服务器是自己可控的 NAS / 内网设备
+   *（群晖、QNAP 等使用自签名证书的场景）时开启。
+   */
+  trustServerCertificate?: boolean
+  /** 追加信任的 CA 根证书（PEM 格式文本，可含多段）：用于校验自建 CA 签发的服务器证书 */
+  caPem?: string
 }
 
 /**
@@ -72,6 +92,13 @@ export interface DavCapabilities {
   conditional: { ifMatch: boolean; ifNoneMatch: boolean }
   /** PROPFIND Depth: infinity 是否可用（单请求递归扫描的开关） */
   depthInfinity: boolean
+  /**
+   * MOVE 方法是否可用（改名同步的开关）：探测期实测（探测文件改名后清理）。
+   * 缺省 undefined = 未探测（旧缓存 / 探测期不可写）—— 按「可用」乐观处理，
+   * 运行时 MOVE 失败（405/501）会持久降级为 false 并回落删传语义；
+   * false = 该服务器不支持 MOVE，改名按「删除 + 重新上传」处理。
+   */
+  moveSupported?: boolean
   /** 集合 etag 深层传播（探测实测：修改二层深度的探测文件后，父集合与祖先集合的 etag 都变化）。true 时逐目录扫描可按「子集合 etag 未变」跳过其 PROPFIND */
   etagPropagation: boolean
   /** getlastmodified 精度：'s' 秒级 / 'ms' 毫秒级 */
@@ -106,6 +133,14 @@ export interface SyncSummary {
   deferredConflicts: number
   /** 规划期直接收敛（无传输）的文件数：无基线 adopt / hash 消歧采纳 / touch 刷新之外的情形 */
   adopted: number
+  /**
+   * 改名同步（零重传 / 零下载）：本地改名经远端 MOVE 落地的文件数 ——
+   * 配对条件为「旧路径消失 + 新路径出现 + 内容哈希与尺寸一致」，见引擎 computeRenamePairs。
+   * 缺省 0（让出轮 / 扫描失败轮的最小摘要与旧版本记录不带）。
+   */
+  renamedRemote?: number
+  /** 改名同步：远端改名在本机以本地改名落地的文件数（对端 MOVE 后本机跟随改名，零下载）；缺省 0 */
+  renamedLocal?: number
   bytesUp: number
   bytesDown: number
   totalFiles: number
@@ -360,7 +395,7 @@ export interface SyncProgress {
    */
   stage?: 'scan' | 'plan' | 'verify' | 'lockwait' | 'lock' | 'transfer' | 'finalize'
   /** 当前正在处理的任务类别（transfer 阶段；与 transferMeta 的 kind 同口径） */
-  currentOp?: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict'
+  currentOp?: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict' | 'rename-remote' | 'rename-local'
   /** 当前正在处理的文件相对路径（transfer 阶段展示「正在上传 / 下载 …」用；并发时为最后领取者） */
   currentFile?: string
   /** 本轮扫描到的全部文件字节（两侧并集；云端占用估算用，非传输量） */
@@ -656,9 +691,11 @@ export interface DecisionLogEntry {
  */
 export interface SyncLogOp {
   /** 操作类型（两侧口径见接口注释） */
-  op: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict'
-  /** 文件相对路径（nfc 归一） */
+  op: 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'conflict' | 'rename-remote' | 'rename-local'
+  /** 文件相对路径（nfc 归一；改名条目为新路径） */
   rel: string
+  /** 改名前的原路径（op='rename-remote' / 'rename-local' 时存在） */
+  from?: string
   /** 是否成功落地；缺省 true（失败条目仅来自批量校验提交失败等「明确失败」路径） */
   ok?: boolean
   /** 失败原因（ok=false 时的一句话，已截断） */
@@ -706,6 +743,8 @@ export interface SyncLogEntry {
   conflicts: number
   /** 规划期直接收敛（无传输）的文件数 */
   adopted: number
+  /** 改名同步的文件数（renamedRemote + renamedLocal，详尽视图按 ops 细分方向）；缺省 0（旧版本记录） */
+  renamed?: number
   /** 本轮挂起等用户处理的冲突数（后台轮 defer） */
   deferredConflicts: number
   /** 登记待确认删除的文件数（确认前零删除） */

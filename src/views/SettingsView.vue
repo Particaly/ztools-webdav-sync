@@ -27,6 +27,56 @@ function dismissInsecureHttp() {
   s.prefs.insecureHttpDismissedFor = s.server.serverUrl
 }
 
+// ---------- 证书信任（自签名 NAS 的 https 连接通道） ----------
+
+/** 服务器地址是 https 连接：证书信任设置只对加密连接有意义（http 无证书可谈） */
+const isHttps = computed(() => /^https:\/\//i.test(s.server.serverUrl.trim()))
+
+/** 「信任此服务器证书」开关（server.tls.trustServerCertificate → AppSwitch 必填 model） */
+const trustCertModel = computed<boolean>({
+  get: () => s.server.tls?.trustServerCertificate === true,
+  set: (v) => {
+    s.server.tls = { ...s.server.tls, trustServerCertificate: v }
+  },
+})
+
+/** 是否已导入 CA 证书（server.tls.caPem 非空即视为已导入） */
+const caImported = computed(() => !!s.server.tls?.caPem?.trim())
+
+/**
+ * 导入 CA 证书：文件选择器（.pem / .crt 等文本格式）→ preload 读取（256KB 上限）
+ * → 简单校验含 PEM 证书段后写入 server.tls.caPem。导入后按「系统信任的 CA +
+ * 导入的 CA」一并校验服务器证书 —— 校验照常进行，只是多了自建根，比信任开关安全。
+ */
+async function importCa() {
+  let picked: string | null = null
+  try {
+    const r = window.ztools?.showOpenDialog?.({ title: '选择 CA 证书文件（PEM 格式）', properties: ['openFile'] })
+    picked = Array.isArray(r) && r.length > 0 ? r[0] : null
+  } catch {
+    picked = null
+  }
+  if (!picked) return
+  let text: string | null = null
+  try {
+    text = (await window.services?.fsx?.readTextFile?.(picked)) ?? null
+  } catch {
+    text = null
+  }
+  if (!text || !/BEGIN CERTIFICATE/.test(text)) {
+    toast.error('导入失败', '无法读取证书内容：请选择 PEM 格式（.pem / .crt）的证书文件')
+    return
+  }
+  s.server.tls = { ...s.server.tls, caPem: text.trim() }
+  toast.success('CA 证书已导入', '之后会连同系统证书一起校验服务器证书')
+}
+
+/** 移除已导入的 CA 证书（回到仅系统信任的默认校验） */
+function removeCa() {
+  const { caPem: _dropped, ...rest } = s.server.tls ?? {}
+  s.server.tls = rest
+}
+
 /** 插件同步云端文件夹选择器显隐（实验卡片区「浏览…」入口） */
 const showPluginDirPicker = ref(false)
 
@@ -345,6 +395,34 @@ function save() {
                 <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
                   <span class="text-[11px] font-medium text-ink-2">密码</span>
                   <AppInput v-model="s.server.password" icon="lock" type="password" sm placeholder="应用密码" />
+                </div>
+              </div>
+              <!-- 证书信任（仅 https 地址显示）：自签名证书 NAS（群晖 / QNAP 等）的连接
+                   通道。信任开关 = 跳过校验（附安全提示）；CA 导入 = 追加信任自建根（校验照常） -->
+              <div v-if="isHttps" class="flex flex-col gap-[6px]">
+                <div class="pref-row flex items-center gap-3">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">信任此服务器证书</span>
+                    <InfoTip text="服务器使用自签名证书（群晖、QNAP 等 NAS 常见）导致无法连接时可打开。打开后连接不再校验证书真伪，仅建议用于自己可控的服务器" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppSwitch v-model="trustCertModel" />
+                </div>
+                <div v-if="trustCertModel" class="flex items-start gap-[5px]">
+                  <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
+                  <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">已开启信任：连接不再校验服务器证书。若网络中有人假冒服务器，账号密码与文件内容可能被窃取，请仅在可控网络中使用</span>
+                </div>
+                <div class="pref-row flex items-center gap-3">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">CA 证书</span>
+                    <InfoTip text="自建 CA 签发证书的服务器可导入 CA 根证书（PEM 格式）：照常完整校验证书链，比「信任此服务器证书」更安全" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <template v-if="caImported">
+                    <span class="text-[11px] font-medium text-success-deep shrink-0">已导入</span>
+                    <AppButton @click="removeCa">移除</AppButton>
+                  </template>
+                  <AppButton v-else @click="importCa">导入…</AppButton>
                 </div>
               </div>
               <div class="flex flex-col gap-[6px]">

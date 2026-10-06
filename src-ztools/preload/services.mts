@@ -847,17 +847,89 @@ function resolveNetOpts(cfg: EngineCfg): Required<NetOpts> {
   }
 }
 
-/** 模块级 keep-alive 连接池：按「协议 + maxSockets」缓存 Agent，Agent 内部再按 host:port 复用 */
+/**
+ * 模块级 keep-alive 连接池：按「协议 + maxSockets + TLS 信任键」缓存 Agent，
+ * Agent 内部再按 host:port 复用。TLS 信任配置不同的连接绝不共用 Agent
+ *（信任开关 / CA 追加会改变 TLS 握手行为，共用会让先建的 Agent 决定后到的请求）。
+ */
 const agentPool = new Map()
-function agentFor(protocol: string, maxSockets: number): http.Agent {
+function agentFor(protocol: string, maxSockets: number, tlsOpts?: TlsAgentOpts): http.Agent {
   const mod = protocol === 'https:' ? https : http
-  const key = `${protocol}|${maxSockets}`
+  const tlsKey = protocol === 'https:' && tlsOpts && tlsOpts.key ? tlsOpts.key : ''
+  const key = `${protocol}|${maxSockets}|${tlsKey}`
   let agent = agentPool.get(key)
   if (!agent) {
-    agent = new mod.Agent({ keepAlive: true, maxSockets })
+    agent =
+      protocol === 'https:' && tlsKey && tlsOpts
+        ? new https.Agent({
+            keepAlive: true,
+            maxSockets,
+            ...(tlsOpts.rejectUnauthorized === false ? { rejectUnauthorized: false } : {}),
+            ...(tlsOpts.ca ? { ca: [tlsOpts.ca] } : {}),
+          })
+        : new mod.Agent({ keepAlive: true, maxSockets })
     agentPool.set(key, agent)
   }
   return agent
+}
+
+/** TLS Agent 选项的解析形态：key 为连接池分池键（信任开关 + CA 指纹），Agent 构造项按需携带 */
+interface TlsAgentOpts {
+  key: string
+  rejectUnauthorized?: boolean
+  ca?: string
+}
+
+/**
+ * 从连接配置解析 TLS Agent 选项（https 专用；http 与未配置返回空 key = 默认 Agent）。
+ * - trustServerCertificate → rejectUnauthorized:false（跳过校验，仍加密）；
+ * - caPem（PEM 文本）→ 追加信任的 CA（校验照常，只是多了自建根）。
+ * key 用「信任开关 + CA 内容哈希前 16 位」：不同信任配置各自分池，同配置共享池。
+ */
+function tlsAgentOptsFor(cfg: EngineCfg): TlsAgentOpts {
+  const tls: any = cfg && (cfg as any).tls
+  if (!tls || typeof tls !== 'object') return { key: '' }
+  const trust = tls.trustServerCertificate === true
+  const caPem = typeof tls.caPem === 'string' ? tls.caPem.trim() : ''
+  if (!trust && !caPem) return { key: '' }
+  const caKey = caPem ? crypto.createHash('sha256').update(caPem).digest('hex').slice(0, 16) : ''
+  return {
+    key: `${trust ? '1' : '0'}|${caKey}`,
+    ...(trust ? { rejectUnauthorized: false } : {}),
+    ...(caPem ? { ca: caPem } : {}),
+  }
+}
+
+/** 自签名 / 无法验证链的 Node TLS 错误码（跨 Node 版本的既有命名） */
+const SELF_SIGNED_TLS_CODES = new Set(['DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'])
+
+/**
+ * TLS 握手失败的友好映射（自签名 / 过期 / 域名不匹配 / 协议不符四类）。
+ * 命中返回已分类错误（code='TLS'、permanent=true —— 确定性失败，重试与熔断都无意义；
+ * 归因 'other' 而非 network：与 401 同属配置类问题，调度层不该按网络故障退避），
+ * 非 TLS 错误返回 null 交回 normalizeNetError 的既有包装。
+ */
+function normalizeTlsError(e: any): any | null {
+  const code = String((e && e.code) || '')
+  const selfSigned = SELF_SIGNED_TLS_CODES.has(code)
+  const expired = code === 'CERT_HAS_EXPIRED' || code === 'CERT_NOT_YET_VALID' || code === 'ERR_TLS_CERT_NOT_YET_VALID' || code === 'ERR_CERT_NOT_YET_VALID'
+  const nameMismatch = code === 'ERR_TLS_CERT_ALTNAME_INVALID'
+  const proto = code === 'EPROTO' || code === 'ERR_SSL_WRONG_VERSION_NUMBER' || code === 'ERR_SSL_UNKNOWN_PROTOCOL' || code === 'UNSUPPORTED_PROTOCOL'
+  if (!selfSigned && !expired && !nameMismatch && !proto) return null
+  const err: any = new Error(
+    selfSigned
+      ? '无法安全连接：服务器使用的证书无法通过验证（自签名）。群晖、QNAP 等 NAS 常用自签名证书 —— 确认服务器是自己可控的设备后，可在「设置 → WebDAV」打开「信任此服务器证书」再试'
+      : expired
+        ? '无法安全连接：服务器证书已过期或尚未生效。请先在服务器上更新证书；若服务器是自己可控的设备，也可在「设置 → WebDAV」打开「信任此服务器证书」再试'
+        : nameMismatch
+          ? '无法安全连接：证书与服务器地址不匹配。请核对地址是否写错（证书只对特定域名有效）；若确需连接，可在「设置 → WebDAV」打开「信任此服务器证书」再试'
+          : '无法建立加密连接：服务器可能不支持 HTTPS，或地址的 http:// 与 https:// 写反了，请检查服务器地址'
+  )
+  err.status = 0
+  err.code = 'TLS'
+  err.permanent = true
+  err.detail = `${code} ${(e && e.reason) || (e && e.message) || ''}`
+  return err
 }
 
 /** 销毁全部自建 Agent 与限速器（插件退出 / 测试收尾调用，避免存活 socket 阻止进程退出） */
@@ -954,7 +1026,9 @@ function classifyStatus(status: number, headers: Record<string, any>): { code: s
 
 /** 网络层错误统一包装：已分类的错误原样透传，其余包装为 status=0 / code='NETWORK' / permanent=false */
 function normalizeNetError(e: any, url: any): any {
-  if (e && (e.code === 'NETWORK' || e.code === 'LOCAL_IO' || e.code === 'REDIRECT' || e.code === 'ABORTED')) return e
+  if (e && (e.code === 'NETWORK' || e.code === 'LOCAL_IO' || e.code === 'REDIRECT' || e.code === 'ABORTED' || e.code === 'TLS')) return e
+  const tls = normalizeTlsError(e) // TLS 握手失败是确定性配置问题：映射成人话 + 指引信任开关
+  if (tls) return tls
   const err: any = new Error('网络连接失败，请检查网络和服务器地址')
   err.status = 0
   err.code = 'NETWORK'
@@ -1140,7 +1214,7 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname + url.search,
         headers,
-        agent: agentFor(url.protocol, netOpts.maxSockets),
+        agent: agentFor(url.protocol, netOpts.maxSockets, tlsAgentOptsFor(cfg)),
         timeout: netOpts.idleTimeoutMs,
       },
       onResponse
@@ -1702,8 +1776,8 @@ const PROBE_PREFIX = '.wdsync-probe-'
  * 探测目录（探测只产生第一层残留），绝不递归其他内容。
  */
 const PROBE_RESIDUE_MIN_AGE_MS = 10 * 60 * 1000
-/** 探测请求总量软上限（典型序列约 12 个）：超限立即降级收尾，绝不拖垮轮次 */
-const PROBE_MAX_REQUESTS = 16
+/** 探测请求总量软上限（典型序列约 14 个、含 MOVE 实测至多 18 个）：超限立即降级收尾，绝不拖垮轮次 */
+const PROBE_MAX_REQUESTS = 20
 const PROBE_BODY = 'wdsync-capability-probe'
 const PROBE_PROPFIND_BODY =
   '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:getetag/></d:prop></d:propfind>'
@@ -1799,6 +1873,8 @@ function effectiveCaps(common: any, write: any): any {
     etag: { ...common.etag },
     conditional: { ...common.conditional },
     depthInfinity: !!common.depthInfinity,
+    // 缺省 undefined = 未探测（旧缓存）：按「可用」乐观处理，运行时 405/501 降级兜底
+    moveSupported: common.moveSupported === false ? false : true,
     etagPropagation: !!common.etagPropagation,
     mtimePrecision: common.mtimePrecision || 'ms',
     collectionRedirect: !!common.collectionRedirect,
@@ -1819,6 +1895,27 @@ function effectiveCaps(common: any, write: any): any {
     }
   }
   return eff
+}
+
+/**
+ * 把「服务器不支持 MOVE（405/501）」持久降级进能力缓存（best-effort）。
+ * 同步期 MOVE 被明确拒绝时调用：下一轮起改名配对被 moveSupported=false 挡住，
+ * 自然回落「删除 + 重新上传」的既有语义；降级写入失败无害 —— 下一轮的 MOVE
+ * 会再试一次并被同一路径捕获。探测期未测到（旧缓存 / 探测期不可写）的场景
+ * 由这条运行时通道兜底。
+ */
+async function persistMoveUnsupported(cfg: EngineCfg): Promise<void> {
+  try {
+    const state = await storage.openServerState(originOf(cfg), (cfg && cfg.username) || '')
+    const cached = state.getCachedCapabilities(PROBE_TTL_MS)
+    if (cached && cached.moveSupported !== false) {
+      const toSave = { ...cached, moveSupported: false }
+      toSave.notes = [...(toSave.notes || []), '同步期 MOVE 被拒绝（405/501）：改名已回落为删除+重新上传']
+      await state.saveCapabilities(toSave)
+    }
+  } catch (_) {
+    /* 降级失败：下一轮 MOVE 再试一次，无害 */
+  }
 }
 
 /**
@@ -1853,6 +1950,8 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
       etag: { present: false, weak: false, stable: false },
       conditional: { ifMatch: false, ifNoneMatch: false },
       depthInfinity: false,
+      // MOVE 支持（改名同步）：默认乐观 true，探测期若可写会实测改写（第 6.5 步）
+      moveSupported: true,
       etagPropagation: false,
       mtimePrecision: 'ms',
       collectionRedirect: false,
@@ -2071,9 +2170,9 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
   //     因此只能实测到「文件→父集合」与「父集合→祖先集合」两级，两级都传播才判 true
   //     （保守：观测不到 = 不支持）。写入内容必须变化（PROBE_BODY + '-prop'）：mtime 型
   //     etag 服务器对同内容重传也视为写入，但内容变化对内容哈希型（dedup）服务器同样
-  //     成立，两种 etag 实现都覆盖。请求预算：本步 4 个 PROPFIND + 1 个 PUT，全序列
-  //     恰好 16 个 = PROBE_MAX_REQUESTS（第 2 步的根列举走 davRequest 不计软预算），
-  //     仍在上限内；预算耗尽会抛错，被下方 try/catch 吞成 notes（etagPropagation 保持 false）。
+  //     成立，两种 etag 实现都覆盖。请求预算：本步 4 个 PROPFIND + 1 个 PUT，加上
+  //     6.5 步的 MOVE 实测至多 2 个 —— 全序列 ≤ 18 < PROBE_MAX_REQUESTS(20)；
+  //     预算耗尽会抛错，被下方 try/catch 吞成 notes（etagPropagation 保持 false）。
   if (wrote && needCommon && common.etag.present) {
     try {
       /**
@@ -2135,6 +2234,28 @@ async function runCapabilityProbe(cfg: EngineCfg, pathKey: string, cachedCommon:
       if (!nested && (d.status === 207 || d.status === 200)) notes.push('Depth: infinity 响应未包含嵌套条目，按不支持处理')
     } catch (e: any) {
       notes.push(`Depth: infinity 探测失败：${(e && e.message) || e}`)
+    }
+  }
+
+  // 6.5 MOVE 支持（改名同步的开关）：把探测文件改名一次实测。2xx = 支持；
+  //     405/501 = 明确不支持（false，改名回落删传）；其余失败保守保持乐观 true
+  //    （运行时 405/501 有持久降级兜底，见 persistMoveUnsupported）。
+  //     仅在本路径可写时测（不可写 = C 档，改名方向本就不触发）。
+  if (dirReady && wrote) {
+    try {
+      const mv = await req('MOVE', fileRel, { headers: { Destination: remoteUrl(cfg, joinRemote(nestedRel, 'probe-moved.txt')), Overwrite: 'F' } })
+      if (mv.status >= 200 && mv.status < 300) {
+        common.moveSupported = true
+        // 改名成功后把文件改回原名，后续步骤（etag 观测等）与清理路径不受影响
+        await req('MOVE', joinRemote(nestedRel, 'probe-moved.txt'), { headers: { Destination: remoteUrl(cfg, fileRel), Overwrite: 'F' } }).catch(() => {})
+      } else if (mv.status === 405 || mv.status === 501) {
+        common.moveSupported = false
+        notes.push(`MOVE 不被支持（HTTP ${mv.status}）：改名同步将按删除+重新上传处理`)
+      } else {
+        notes.push(`MOVE 探测：HTTP ${mv.status}（按支持处理，运行时失败会自动回落）`)
+      }
+    } catch (e: any) {
+      notes.push(`MOVE 探测失败：${(e && e.message) || e}（按支持处理，运行时失败会自动回落）`)
     }
   }
 
@@ -2974,6 +3095,142 @@ function entryFrom(l: any, r: any, lhash: string | null, extra: { origName?: str
   if (extra.origName) entry.origName = extra.origName
   if (extra.conflictCopy) entry.conflictCopy = true
   return entry
+}
+
+// ---------- 改名检测（旧路径消失 + 新路径出现 + 内容指纹一致 ⇒ 判定改名） ----------
+//
+// 动机：本地把一个多 GB 的文件改名，旧语义 = delete-remote（删云端旧名）+ upload
+//（全量重传新名）—— 改个名的代价是整个重新上传。基线已持有内容哈希（lhash），
+// 「旧路径消失 + 新路径出现 + 哈希与尺寸一致」可高置信判定改名：
+//   本地改名（two-way / upload 模式）→ 云端发 MOVE 改名，零重传；
+//   远端改名（two-way / download 模式，对端设备已 MOVE）→ 本地同名跟随，零下载。
+//
+// 正确性论证（为何配对总是内容安全）：配对要求新旧内容指纹一致，因此无论「真改名」
+// 还是「删旧建新（同内容）」，MOVE 后的云端终态与删传语义的终态完全相同 —— 启发式
+// 错判的代价只是元数据差异（mtime 保留 vs 服务端当前时间），不会丢内容。反向风险
+//（不同内容被误判为相同）由 lhash 强校验挡住（本地侧）与 etag/mtime 等价比对挡住
+//（远端侧 —— 与引擎判定「远端未变」的既有口径相同）。
+//
+// 回落语义（任一条件不满足即不配对，走既有删传）：
+//   基线不可信（loadedOk=false）/ 一次性单向轮 / 根重建或移除执行窗口 /
+//   冲突副本基线 / 大小写冲突文件 / 该 rel 有挂起决策或删除范围决策或开放 WAL 意图 /
+//   该 rel 处于失败退避期 / 基线无 lhash（本地侧无从强校验）/ 服务器不支持 MOVE
+//  （caps.moveSupported === false，仅本地改名方向需要）/ download 模式不传播本地
+//   改名、upload 模式不跟随远端改名（与删除传播的模式语义一致）。
+// MOVE 执行失败（405/501）时持久降级 moveSupported=false，下一轮自然回落删传。
+
+/** 改名配对结果：dir='local'（本地改名 → 云端 MOVE）| 'remote'（远端改名 → 本地改名跟随） */
+interface RenamePair {
+  oldRel: string
+  newRel: string
+  dir: 'local' | 'remote'
+  /** 旧路径的基线条目（配对的指纹依据；新基线由它改造而来） */
+  m: BaselineEntry
+}
+
+/**
+ * 规划期改名配对（本地改名与远端改名两个方向独立进行）。
+ * 输入为规划第一遍之后的 plan 条目（it.flags 已含 lChanged / rChanged）。
+ * 多对多同内容时按 rel 排序贪心一对一匹配（终态与匹配方案无关，见上方正确性论证）。
+ * @param opts.plan 规划条目数组（元素 { rel, l, r, m, flags }）
+ * @param opts.store 目录存储（get / getPending / matchDeleteScope / getFailure / pendingIntents / meta / loadedOk）
+ * @param opts.caseSkip 大小写冲突跳过集合
+ * @param opts.mode 同步模式
+ * @param opts.oneshot 本轮是否一次性单向操作（true = 不配对）
+ * @param opts.moveSupported caps.moveSupported !== false（本地改名方向用）
+ * @param opts.forceUploads 半截强制重传集合（命中的 rel 不配对）
+ * @param opts.localTol 本地 mtime 容差（未用，保留签名稳定性）
+ */
+async function computeRenamePairs(opts: {
+  plan: any[]
+  store: any
+  caseSkip: Set<string>
+  mode: SyncMode
+  oneshot: boolean
+  moveSupported: boolean
+  forceUploads: Set<string>
+  localTol: number
+}): Promise<RenamePair[]> {
+  const { plan, store, caseSkip, mode, forceUploads } = opts
+  if (!store || !store.loadedOk || opts.oneshot) return []
+  if (store.meta && (store.meta.rootRebuilt || store.meta.rootLostRemoval)) return []
+  const moveSupported = opts.moveSupported !== false
+  /** 任一「旧 / 新路径不适格」的判定：挂起决策、删除范围决策、失败退避、开放意图、强制重传、大小写冲突 */
+  const ineligible = (rel: string): boolean => {
+    if (caseSkip.has(rel) || forceUploads.has(rel)) return true
+    const pd = store.getPending(rel)
+    if (pd && (pd.kind === 'delete' || pd.kind === 'root-lost')) return true
+    if (pd && pd.choice) return true // 已决策未落地的冲突：交既有流程，不抢跑
+    if (typeof store.matchDeleteScope === 'function' && store.matchDeleteScope(rel)) return true
+    const fr = typeof store.getFailure === 'function' ? store.getFailure(rel) : null
+    if (fr && fr.retryAtMs > Date.now()) return true
+    for (const p of store.pendingIntents.values()) {
+      if (nfc(p.rel || '') === nfc(rel)) return true
+    }
+    return false
+  }
+  const localOld: any[] = [] // 本地改名：旧路径（本地消失、远端未变）
+  const localNew: any[] = [] // 本地改名：新路径（本地新文件、远端没有）
+  const remoteOld: any[] = [] // 远端改名：旧路径（远端消失、本地未变）
+  const remoteNew: any[] = [] // 远端改名：新路径（远端新文件、本地没有）
+  for (const it of plan) {
+    if (!it || ineligible(it.rel)) continue
+    const { l, r, m } = it
+    const flags = it.flags || {}
+    if (m) {
+      if (m.conflictCopy) continue
+      // 本地改名（two-way / upload 模式）：本地消失 + 远端仍在基线状态（rChanged=false）
+      if (mode !== 'download' && !l && r && !r.isDir && flags.rChanged === false) localOld.push(it)
+      // 远端改名（two-way / download 模式）：远端消失 + 本地仍在基线状态（lChanged=false）
+      if (mode !== 'upload' && l && !r && flags.lChanged === false) remoteOld.push(it)
+    } else {
+      // 新路径候选（无基线）：恰好一侧存在才有配对资格 —— localNew = 本地新文件
+      //（远端没有，否则是 newBoth 收敛 / 冲突语义），remoteNew 对称
+      if (!l) {
+        if (mode !== 'upload' && r && !r.isDir) remoteNew.push(it)
+      } else if (!r) {
+        if (mode !== 'download') localNew.push(it)
+      }
+    }
+  }
+  const pairs: RenamePair[] = []
+  // ---- 方向一：本地改名 → 云端 MOVE（要求基线 lhash 强校验 + 服务器支持 MOVE）----
+  if (moveSupported && localOld.length && localNew.length) {
+    /** 旧路径候选按基线尺寸分桶（旧路径本地已消失，尺寸以基线 lsize 为准；桶内再按 lhash 匹配） */
+    const bySize = new Map<number, any[]>()
+    for (const it of localOld) {
+      if (it.m.lhash == null) continue // 基线无 lhash：无法强校验内容，不配对（回落删传）
+      const size = it.m.lsize
+      if (!bySize.has(size)) bySize.set(size, [])
+      bySize.get(size)!.push(it)
+    }
+    const hashOf = new Map<string, string | null>() // 新路径 rel → 计算出的 sha256（失败 null）
+    for (const nit of localNew) {
+      const candidates = bySize.get(nit.l.size)
+      if (!candidates || !candidates.length) continue
+      let hash = hashOf.get(nit.rel)
+      if (!hashOf.has(nit.rel)) {
+        hash = await hashFile(nit.l.abs).catch(() => null)
+        hashOf.set(nit.rel, hash)
+        await maybeYield() // 大文件哈希是全量读盘循环，分片让出（与既有规划循环同规格）
+      }
+      if (hash == null) continue
+      const idx = candidates.findIndex((oit: any) => oit.m.lhash === hash)
+      if (idx < 0) continue
+      const oit = candidates.splice(idx, 1)[0]
+      pairs.push({ oldRel: oit.rel, newRel: nit.rel, dir: 'local', m: oit.m })
+    }
+  }
+  // ---- 方向二：远端改名 → 本地跟随（等价于「新远端条目相对旧基线未变」的指纹比对）----
+  if (remoteOld.length && remoteNew.length) {
+    for (const nit of remoteNew) {
+      const idx = remoteOld.findIndex((oit: any) => oit.m.rsize === nit.r.size && !remoteChangedVs(nit.r, oit.m))
+      if (idx < 0) continue
+      const oit = remoteOld.splice(idx, 1)[0]
+      pairs.push({ oldRel: oit.rel, newRel: nit.rel, dir: 'remote', m: oit.m })
+    }
+  }
+  return pairs
 }
 
 /** 查询单个远端条目属性；区分「已不存在」与「查询失败」，网络异常直接抛出 */
@@ -3948,6 +4205,7 @@ function buildSyncLogEntry(opts: { handlers: any; at: number; summary: any; erro
     deleted: Number(summary.deleted) || 0,
     conflicts: Number(summary.conflicts) || 0,
     adopted: Number(summary.adopted) || 0,
+    renamed: (Number(summary.renamedRemote) || 0) + (Number(summary.renamedLocal) || 0),
     deferredConflicts: Number(summary.deferredConflicts) || 0,
     deleteHeld: Number(summary.deleteHeld) || 0,
     bytesUp: Number(summary.bytesUp) || 0,
@@ -4057,6 +4315,10 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
      */
     deferredConflicts: 0,
     adopted: 0,
+    /** 改名同步（零重传 / 零下载）：本地改名经云端 MOVE 落地 */
+    renamedRemote: 0,
+    /** 改名同步：远端改名在本机以本地改名跟随落地 */
+    renamedLocal: 0,
     bytesUp: 0,
     bytesDown: 0,
     totalFiles: 0,
@@ -5154,6 +5416,33 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       emitPlan(true) // verify 池收尾：最终 verifyDone / 字节数必然送达（节流豁免）
     }
 
+    // ---- 改名配对（规划两遍之间：依赖第一遍的 lChanged / rChanged 事实）----
+    // 「旧路径消失 + 新路径出现 + 内容指纹一致」⇒ 判定改名：本地改名走云端 MOVE
+    //（零重传），远端改名走本地跟随（零下载）。配对成员两侧都跳过常规决策
+    //（delete-* / upload / download 均不再入队，整对由一条改名任务承担）—— 因此
+    // 大批量改名不会触发批量删除闸（改名不是删除）。回落条件见 computeRenamePairs 头注释。
+    const renamePairs = await computeRenamePairs({
+      plan,
+      store,
+      caseSkip,
+      mode,
+      oneshot: opHint != null,
+      moveSupported: caps.moveSupported !== false,
+      forceUploads,
+      localTol,
+    })
+    /** 配对任一侧的 rel → 所属配对（规划第二遍据此跳过常规决策） */
+    const renamePairByRel = new Map<any, RenamePair>()
+    for (const p of renamePairs) {
+      renamePairByRel.set(p.oldRel, p)
+      renamePairByRel.set(p.newRel, p)
+    }
+    if (renamePairs.length) {
+      logNote(
+        `改名检测：${renamePairs.length} 个文件按改名同步（云端 MOVE ${renamePairs.filter((p) => p.dir === 'local').length} 个、本地跟随 ${renamePairs.filter((p) => p.dir === 'remote').length} 个）`
+      )
+    }
+
     // ---- 规划第二遍（串行回填）：verify 结果 → 决策 → 生成传输任务 ----
     const jobOf = new Map(verifyJobs.map((j) => [j.it, j]))
 
@@ -5228,6 +5517,9 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
         aborted = true
         break
       }
+      // 改名配对成员：常规决策（delete-* / upload / download / 冲突）全部跳过 ——
+      // 整对由下方改名任务承担；配对不成立的回落路径不会走到这里
+      if (renamePairByRel.has(it.rel)) continue
       const { l, r, m } = it
       const flags = it.flags || {}
       const job = jobOf.get(it)
@@ -5688,6 +5980,137 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
       if (!deleteThresholdTripped && undecidedMembers.size === 0) store.clearDeleteBatch()
     }
 
+    // ---- 改名任务入队（删除安全闸之后：配对成员从未进入 deletePlanItems，闸门与改名无交集）----
+    /**
+     * 本地改名 → 云端 MOVE（零重传）。守卫与删除同款（A 档源 If-Match / B 档复查），
+     * 另带 Overwrite:F —— 目标路径若在他机新出现即 412 拒绝，绝不覆盖；源已 404 时
+     * 核对目标确实存在且尺寸一致才按成功收尾（重试撞上「已移动」的幂等收口）。
+     * MOVE 成功后取目标新指纹（etag / mtime 可能因 MOVE 变化）写基线，旧条目随迁删除。
+     * 405/501 = 服务器不支持 MOVE：持久降级能力缓存，本轮按错误跳过 —— 下一轮自然
+     * 回落「删除 + 重新上传」的既有语义（配对被 moveSupported=false 挡住）。
+     */
+    const pushRenameRemoteTransfer = (pair: RenamePair) => {
+      const oldIt = planByRel.get(pair.oldRel)
+      const newIt = planByRel.get(pair.newRel)
+      if (!oldIt || !newIt) return
+      pushTransfer(
+        pair.newRel,
+        () =>
+          runOp(newIt, 'move-remote', async (commitSet: any) => {
+            // 与上传同口径的 Windows 文件名预检：改名会把新名送上服务器，非法名从源头挡
+            const badName = checkWindowsRel(pair.newRel, dir && dir.localPath)
+            if (badName) throw badFilenameError(pair.newRel, badName)
+            const srcRemote = joinRemote(dir.remotePath, pair.oldRel)
+            const headers: Record<string, any> = {
+              Destination: remoteUrl(cfg, joinRemote(dir.remotePath, pair.newRel)),
+              Overwrite: 'F',
+            }
+            const dg = deleteGuards(oldIt.r)
+            if (dg.recheck) await recheckRemoteUnchanged(cfg, srcRemote, dg.recheck, pair.oldRel)
+            if (dg.ifMatch) headers['If-Match'] = dg.ifMatch
+            const res = await davRequest(cfg, 'MOVE', srcRemote, { headers })
+            if (res.status === 412) {
+              const err: any = new Error(`「${pair.newRel}」暂未改名：云端的文件刚被其他设备修改，下次同步会重新判断`)
+              err.code = 'PRECONDITION'
+              err.status = 412
+              err.permanent = true
+              err.detail = 'HTTP 412（MOVE Overwrite:F 拒绝或 If-Match 不匹配）'
+              throw err
+            }
+            if (res.status === 405 || res.status === 501) {
+              await persistMoveUnsupported(cfg)
+              // status 置 0（而非 405）：405 会进 classifyOpFailure 的 permanent 表 →
+              // 记失败退避，下一轮新路径的上传也被退避跳过，回落删传被无故拖慢。
+              // 这里的语义是「下轮改走删传」，不是「这个文件持续失败」。
+              const err: any = new Error(`「${pair.newRel}」未能按改名同步（这个服务器不支持改名操作），下次同步会改为删除后重新上传`)
+              err.status = 0
+              err.code = 'MOVE_UNSUPPORTED'
+              err.permanent = true
+              err.detail = `MOVE HTTP ${res.status}`
+              throw err
+            }
+            // 404 = 源已不在：可能是上一次 MOVE 实际成功但响应丢失（重试场景）——
+            // 核对目标存在且尺寸一致即按成功收尾，否则按失败交下一轮重新规划
+            const movedOk = res.status === 201 || res.status === 204 || res.status === 200
+            if (!movedOk && res.status !== 404) {
+              const err: any = new Error(`「${pair.newRel}」改名同步失败（HTTP ${res.status}），下次同步会重试`)
+              err.status = res.status
+              err.code = (res.classification && res.classification.code) || 'HTTP'
+              throw err
+            }
+            await crashHook({ rel: pair.newRel, act: 'move-remote' })
+            // 目标新指纹（etag / mtime 可能因 MOVE 改变）：与上传的批量校验同目的 ——
+            // 基线指纹必须对应远端实际状态；核对失败不写基线（下一轮 newBoth 采纳自愈）
+            const props = await remotePropsEx(cfg, joinRemote(dir.remotePath, pair.newRel))
+            if (!props || props.gone || props.error || !props.props || props.props.size !== oldIt.r.size) {
+              throw new Error(`「${pair.newRel}」已在云端改名，但核对云端状态失败，下次同步会自动核对`)
+            }
+            const rp = props.props
+            await commitSet(entryFrom(newIt.l, { size: rp.size, mtimeMs: rp.mtime, etag: rp.etag }, pair.m.lhash ?? null, { origName: pair.newRel.split('/').pop() }))
+            await store.deleteEntry(pair.oldRel).catch(() => {})
+            store.clearFailure(pair.oldRel)
+            // 空目录清理对齐：旧语义（delete-remote + upload）会把旧路径计入远端删除
+            // 集合、轮末清理因此变空的父目录 —— MOVE 同样让旧父目录变空，登记保持行为一致
+            remoteDeletedRels.add(pair.oldRel)
+            summary.renamedRemote++
+            recordSyncOp({ op: 'rename-remote', rel: pair.newRel, from: pair.oldRel })
+          }),
+        'rename-remote'
+      )
+    }
+    /**
+     * 远端改名 → 本地跟随（零下载）。远端已是目标状态，本机只需把旧文件原地改名：
+     * 执行前复核旧文件仍是扫描时状态、新路径仍不存在（计划外内容绝不覆盖），
+     * rename 保留 mtime（与新基线的远端指纹天然对齐）。
+     */
+    const pushRenameLocalTransfer = (pair: RenamePair) => {
+      const oldIt = planByRel.get(pair.oldRel)
+      const newIt = planByRel.get(pair.newRel)
+      if (!oldIt || !newIt) return
+      pushTransfer(
+        pair.newRel,
+        () =>
+          runOp(newIt, 'move-local', async (commitSet: any) => {
+            if (process.platform === 'win32') {
+              const badName = checkWindowsRel(pair.newRel, dir && dir.localPath)
+              if (badName) throw badFilenameError(pair.newRel, badName)
+            }
+            const oldSegs = pair.oldRel.split('/')
+            if (oldIt.m && oldIt.m.origName) oldSegs[oldSegs.length - 1] = oldIt.m.origName
+            const oldAbs = path.join(dir.localPath, ...oldSegs)
+            const newAbs = path.join(dir.localPath, ...pair.newRel.split('/'))
+            // 双侧复核：旧文件仍是扫描时状态（否则改名会吃掉用户的修改）、
+            // 新路径仍不存在（计划外出现的内容绝不覆盖）
+            const st = await statOrNull(oldAbs)
+            if (!st || st.size !== oldIt.l.size || Math.abs(st.mtimeMs - oldIt.l.mtimeMs) > 1000) {
+              throw new Error(`「${pair.oldRel}」刚被改动，本次先不同步改名，下次同步会重新判断`)
+            }
+            if (await statOrNull(newAbs)) {
+              throw new Error(`「${pair.newRel}」已出现在电脑上，本次先不同步改名，下次同步会重新判断`)
+            }
+            await fsp.mkdir(path.dirname(newAbs), { recursive: true })
+            await fsp.rename(oldAbs, newAbs)
+            await crashHook({ rel: pair.newRel, act: 'move-local' })
+            // rename 落盘后 fsync 目标目录（POSIX）—— 与下载落地同规格
+            await storage.fsyncDirIfPossible(path.dirname(newAbs))
+            const ns = await fsp.stat(newAbs)
+            await commitSet(entryFrom(ns, newIt.r, pair.m.lhash ?? null, { origName: newIt.r.origName }))
+            await store.deleteEntry(pair.oldRel).catch(() => {})
+            store.clearFailure(pair.oldRel)
+            // 空目录清理对齐（本地侧，与远端方向同理）：旧语义的 delete-local 会让
+            // 旧父目录参与轮末清理，本地改名同样让它变空
+            localDeletedRels.add(pair.oldRel)
+            summary.renamedLocal++
+            recordSyncOp({ op: 'rename-local', rel: pair.newRel, from: pair.oldRel })
+          }),
+        'rename-local'
+      )
+    }
+    for (const p of renamePairs) {
+      if (p.dir === 'local') pushRenameRemoteTransfer(p)
+      else pushRenameLocalTransfer(p)
+    }
+
     // ---- 规划完成后、worker 执行前的两道闸（按需租约锁 → B 档新上传写前查重）----
 
     /**
@@ -5716,7 +6139,7 @@ async function runSyncRound(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, han
     // 不拿锁，语义不变）；C 档轮次因规划层已剔除全部远端写，天然不再进入。
     // 规划期已取消（aborted）的轮次不再拿锁 —— 取消应尽快收场，不为一把
     // 马上要释放的锁发出 GET/PUT/回读共 4 个请求与 1.5s 写回静置。
-    const hasRemoteWrite = transferMeta.some((t) => t.kind === 'upload' || t.kind === 'delete-remote' || t.kind === 'conflict')
+    const hasRemoteWrite = transferMeta.some((t) => t.kind === 'upload' || t.kind === 'delete-remote' || t.kind === 'conflict' || t.kind === 'rename-remote')
     if (hasRemoteWrite && !aborted && !shouldAbort() && prefs.leaseLock !== false) {
       // 锁阶段进度（含 GET → PUT → 1.5s 写回静置 → 回读确认的完整窗口）：
       // UI 显示「正在确认租约锁…」。force 外发 —— 与 verify 终态事件同相位，不吃节流
@@ -6403,6 +6826,20 @@ const services = {
         return null
       }
     },
+    /**
+     * 读取小体积文本文件（当前唯一用途：设置页导入 CA 证书 PEM）。带 256KB 上限 ——
+     * 该入口只服务用户在文件选择器里挑中的单个证书文件，超限按损坏内容拒绝
+     *（返回 null），绝不成为任意大文件的读取通道。读取失败同样返回 null。
+     */
+    async readTextFile(abs: string): Promise<string | null> {
+      try {
+        const st = await statOrNull(String(abs || ''))
+        if (!st || !st.isFile() || st.size > 256 * 1024) return null
+        return await fsp.readFile(String(abs), 'utf-8')
+      } catch (_) {
+        return null
+      }
+    },
   },
   sync: {
     syncDirectory,
@@ -6635,6 +7072,12 @@ const services = {
       checkWindowsRel,
       /** 大小写冲突检测（纯函数：本地/远端 rel 集合 → 冲突组 + 跳过集合） */
       detectCaseCollisions,
+      /** 改名配对（规划期启发式：旧路径消失 + 新路径出现 + 指纹一致 → 改名；直检回落条件用） */
+      computeRenamePairs,
+      /** TLS 握手错误映射（纯函数：Node 错误码 → 友好文案 + code='TLS'；非 TLS 返回 null） */
+      normalizeTlsError,
+      /** TLS Agent 选项解析（纯函数：cfg.tls → 分池键 + Agent 构造项） */
+      tlsAgentOptsFor,
       /** 同步目录重叠校验（纯函数，与公开入口同实现） */
       checkDirOverlap,
       /** 读取某目录的持续失败退避记录（测试断言用）：rel → { code, message, count, firstAt, lastAt, retryAtMs } 副本 */

@@ -187,24 +187,32 @@ function groupsOf(r: SyncRecordRow) {
                   </div>
                   <div class="rec-detail-scroll">
                     <template v-if="groupsOf(r)">
-                      <div v-if="groupsOf(r)!.cloudUp.length || groupsOf(r)!.cloudDel.length" class="grp">
+                      <div v-if="groupsOf(r)!.cloudUp.length || groupsOf(r)!.cloudDel.length || groupsOf(r)!.cloudRename.length" class="grp">
                         <div class="grp-title">云端（线上）</div>
                         <div v-for="(o, j) in groupsOf(r)!.cloudUp" :key="`u${j}`" class="op-line" :title="o.rel">
                           <span class="op-text">{{ opLineText(o) }}</span>
                           <span class="font-mono op-rel">{{ o.rel }}</span>
                           <span v-if="o.bytes" class="op-bytes">{{ fmtBytes(o.bytes) }}</span>
                         </div>
+                        <div v-for="(o, j) in groupsOf(r)!.cloudRename" :key="`cr${j}`" class="op-line" :title="`${o.from ?? ''} → ${o.rel}`">
+                          <span class="op-text">{{ opLineText(o) }}</span>
+                          <span class="font-mono op-rel">{{ o.from ? `${o.from} → ` : '' }}{{ o.rel }}</span>
+                        </div>
                         <div v-for="(o, j) in groupsOf(r)!.cloudDel" :key="`cd${j}`" class="op-line" :title="o.rel">
                           <span class="op-text">{{ opLineText(o) }}</span>
                           <span class="font-mono op-rel">{{ o.rel }}</span>
                         </div>
                       </div>
-                      <div v-if="groupsOf(r)!.localDown.length || groupsOf(r)!.localDel.length" class="grp">
+                      <div v-if="groupsOf(r)!.localDown.length || groupsOf(r)!.localDel.length || groupsOf(r)!.localRename.length" class="grp">
                         <div class="grp-title">电脑（线下）</div>
                         <div v-for="(o, j) in groupsOf(r)!.localDown" :key="`d${j}`" class="op-line" :title="o.rel">
                           <span class="op-text">{{ opLineText(o) }}</span>
                           <span class="font-mono op-rel">{{ o.rel }}</span>
                           <span v-if="o.bytes" class="op-bytes">{{ fmtBytes(o.bytes) }}</span>
+                        </div>
+                        <div v-for="(o, j) in groupsOf(r)!.localRename" :key="`lr${j}`" class="op-line" :title="`${o.from ?? ''} → ${o.rel}`">
+                          <span class="op-text">{{ opLineText(o) }}</span>
+                          <span class="font-mono op-rel">{{ o.from ? `${o.from} → ` : '' }}{{ o.rel }}</span>
                         </div>
                         <div v-for="(o, j) in groupsOf(r)!.localDel" :key="`cl${j}`" class="op-line" :title="o.rel">
                           <span class="op-text">{{ opLineText(o) }}</span>

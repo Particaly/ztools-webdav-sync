@@ -7,6 +7,8 @@ import { defineConfig } from 'vitest/config'
  *                                   vitest 按文件并行；文件内保持原节顺序）
  * - 档位标签：slowSection 登记的节带 `slow` tag —— 日常 `npm run test:fast`（--tag '!slow'）
  *   跳过；发版 `npm test` 全量；`npm run test:slow` 单独回归等待型用例。
+ *   注意：全 fast 的分片文件在 slow 过滤下整文件跳过、afterAll 不会执行 —— dav-server
+ *   的父进程死亡看门狗（WDSYNC_DAV_EXIT_WITH）保证这类路径不残留占端口的子进程。
  * 注意：本文件必须保持独立（不引入 vite.config.js 的 Vue/UnoCSS 插件链），
  * vitest 会优先读取 vitest.config.* 而非 vite.config.*。
  */
