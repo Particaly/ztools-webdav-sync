@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton } from './ui'
 import { useStore } from '../composables/store'
-import { fmtRelTime } from '../composables/format'
+import { fmtRelTime, fmtSpeed } from '../composables/format'
 
 const store = useStore()
 
@@ -14,6 +14,12 @@ const syncLabel = computed(() => {
   if (pendingTotal.value > 0) return `最近一次同步：${fmtRelTime(store.lastSyncAt.value)} · ${pendingTotal.value} 项待处理`
   return `${store.anySyncing.value ? '上次同步' : '最近一次同步'}：${fmtRelTime(store.lastSyncAt.value)}`
 })
+/**
+ * 实时传输速率（调度器 1s 采样、EMA 平滑）：仅同步中且近秒有流量时显示 ——
+ * 速率为 0（扫描规划期 / 文件间隙 / 轮次收尾）整段隐藏，避免「0 B/s」噪声
+ */
+const speed = computed(() => store.state.netSpeed)
+const speedVisible = computed(() => store.anySyncing.value && (speed.value.upBps > 0 || speed.value.downBps > 0))
 </script>
 
 <template>
@@ -38,6 +44,17 @@ const syncLabel = computed(() => {
       <span v-else class="text-[12px] text-ink-2 truncate">{{ syncLabel }}</span>
     </div>
     <span class="flex-spacer" />
+    <!-- 实时上传 / 下载速度：同步中且近秒有流量时显示（调度器 net-speed 事件驱动） -->
+    <div v-if="speedVisible" class="flex items-center gap-[8px] shrink-0" title="当前的实时传输速度">
+      <span v-if="speed.upBps > 0" class="speed-item text-ink-2">
+        <AppIcon name="upload" :size="12" class="text-ink-3" />
+        <span class="font-mono">{{ fmtSpeed(speed.upBps) }}</span>
+      </span>
+      <span v-if="speed.downBps > 0" class="speed-item text-ink-2">
+        <AppIcon name="download" :size="12" class="text-ink-3" />
+        <span class="font-mono">{{ fmtSpeed(speed.downBps) }}</span>
+      </span>
+    </div>
     <AppButton
       variant="primary"
       :size="32"
@@ -53,6 +70,16 @@ const syncLabel = computed(() => {
 </template>
 
 <style scoped lang="scss">
+/* 实时速率单项：图标 + 等宽速率文字（等宽避免每秒跳动时数字宽度抖动） */
+.speed-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
 /* 待处理入口：与两侧展示文案同号但可点（hover 浮起 + 下划线提示可交互） */
 .pending-entry {
   display: flex;

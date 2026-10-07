@@ -18,16 +18,12 @@
  * （与 render-store.test.mjs 一致）。
  */
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
-}
+// 软失败登记收敛到 harness 的 makeCheck（results 保留引用：E15 用例内自检 all-ok）
+const { check, results, assertAtEnd } = makeCheck()
 
 // ---- 导入被测模块前装好 window 桩（installEscRouter 要挂 keydown 监听）----
 // listeners 记录 (type, capture) 分桶；dispatch 按真实传播顺序先捕获后冒泡
@@ -148,6 +144,5 @@ test('渲染层 ESC 退层路由（E1–E16，强顺序链）', async () => {
     check('E16 用例链无异常', false, String(e))
   }
 
-  const failed = results.filter((r) => !r.ok)
-  if (failed.length) throw new Error(`${failed.length} 项失败：\n${failed.map((r) => `- ${r.name}`).join('\n')}`)
+  assertAtEnd({ fail: (failed) => `${failed.length} 项失败：\n${failed.map((r) => `- ${r.name}`).join('\n')}` })
 })

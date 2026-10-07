@@ -21,19 +21,22 @@ export type SyncRecordRow =
  * 没有磁盘侧日志，返回空数组由调用方兜底。
  */
 export async function loadSyncRecords(dirs: SyncDir[]): Promise<SyncRecordRow[]> {
-  if (!window.services) return []
+  // 窄化结果存局部常量：函数守卫的收窄进不了下方异步回调，直取 window.services
+  // 会重新摊开「可能缺席」
+  const services = window.services
+  if (!services) return []
   const rows: SyncRecordRow[] = []
   await Promise.all(
     dirs.map(async (d) => {
       const dirArg = { id: d.id, localPath: d.localPath, remotePath: d.remotePath, mode: d.mode }
       try {
-        const rounds = (await window.services.sync.listSyncLog(dirArg)) as SyncLogEntry[]
+        const rounds = (await services.sync.listSyncLog(dirArg)) as SyncLogEntry[]
         for (const r of rounds || []) rows.push({ ...r, type: 'round', dirName: d.name })
       } catch {
         /* 单目录同步记录读取失败跳过 */
       }
       try {
-        const entries = (await window.services.sync.listDecisionLog(dirArg)) as DecisionLogEntry[]
+        const entries = (await services.sync.listDecisionLog(dirArg)) as DecisionLogEntry[]
         for (const e of entries || []) rows.push({ ...e, type: 'decision', dirName: d.name })
       } catch {
         /* 单目录决策历史读取失败跳过 */

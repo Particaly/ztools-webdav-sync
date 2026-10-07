@@ -12,7 +12,6 @@
     "noEmit": true,
     "jsx": "preserve",
     "strict": true,
-    "noImplicitAny": false,
     "types": ["node", "@ztools-center/ztools-api-types"]
   },
   "include": ["src"]

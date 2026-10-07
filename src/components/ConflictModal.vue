@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton, AppModal } from './ui'
 import { useStore } from '../composables/store'
-import { fmtClock, fmtSize } from '../composables/format'
+import { fmtClock, fmtSize, relBaseName } from '../composables/format'
 
 const store = useStore()
 const info = computed(() => store.state.activeConflict)
@@ -13,12 +13,8 @@ watch(info, (v) => {
   if (v) applyAll.value = false
 })
 
-/** 冲突文件名展示（badge） */
-const fileName = computed(() => {
-  const rel = info.value?.rel ?? ''
-  const seg = rel.split('/')
-  return seg[seg.length - 1] || rel
-})
+/** 冲突文件名展示（badge）：远端 rel 取末段 */
+const fileName = computed(() => relBaseName(info.value?.rel ?? ''))
 
 /** 「同时保留」提示中的另存文件名：README.md -> README.conflict.md */
 const conflictCopyName = computed(() => {

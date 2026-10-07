@@ -12,6 +12,12 @@
  *   等端口释放 → 删临时目录）；退出码由 vitest 接管。
  * - 对拍通道：WDSYNC_E2E_JSONL=<路径> 时逐用例追加 JSONL（节名/用例名/结果），
  *   供新旧运行 diff 比对。
+ * - 工具库导出（模块顶层零副作用，unit 文件也可安全 import，不影响分片全局行为）：
+ *   makeTrashStub / mountFakeDbStorage / makeCheck / spawnDav / killDav / UNIT_HERE，
+ *   详见各导出处注释。
+ * - setupShard 刻意保持在分片文件顶层执行、不迁移进 beforeAll：dav-server 端口已
+ *   全部 0 化（内核随机分配，跨运行 / 并行 CI 不再 EADDRINUSE），顶层互斥已消解，
+ *   惰性初始化的剩余收益只是省资源，不值得动 8 个分片的既有结构。
  */
 import { spawn } from 'node:child_process'
 import http from 'node:http'
@@ -29,6 +35,8 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 export const isNoop = (s) => s.uploaded === 0 && s.downloaded === 0 && s.deleted === 0 && s.conflicts === 0
 /** 各节共用的同步偏好（原 SAFE 节内定义，提升到顶层） */
 export const SP = { ignoreHidden: true, concurrency: 4, conflictStrategy: 'ask' }
+/** unit 测试文件所在目录（test/unit —— 替代各 unit 文件自建的 HERE 常量） */
+export const UNIT_HERE = path.join(HERE, 'unit')
 
 let curSection = null
 export function check(name, cond, detail = '') {
@@ -71,20 +79,220 @@ export function slowSection(desc, reason, fn) {
 }
 
 /**
- * 每分片一套独立环境：dav-server / 端口 / .dav-root-<shard> / 临时目录 / preload 实例。
- * 返回旧主 try 作用域的全部共享标识符（分片文件顶部同名解构，节体零改动搬运）。
+ * unit 文件专用的 check 工厂（消除 9 份 results/check 自建副本；与上面分片侧
+ * check/section 软失败机制同族但独立 —— unit 无节概念，全文件一张登记表）。
+ * @param jsonlSection 对拍节名（如 'store-unit'）；给出时启用 WDSYNC_E2E_JSONL
+ *   逐用例追加（仅迁移对拍期使用，与既有 3 份带通道副本的行为一致）；缺省不写
+ * @returns {{ check, results, assertAtEnd }}
+ *   - check(name, cond, detail)：软失败登记（results 只存 {name, ok}，保持各文件
+ *     既有失败清单形态）+ 标准日志行
+ *   - results：登记数组本体（个别文件用例内自检 results.every(r => r.ok)）
+ *   - assertAtEnd({ passLine, fail })：末尾汇总 —— passLine 为可选的
+ *     `(passed, total) => string`（存在即先打印）；有失败时抛 fail(failed, total)
+ *     返回的消息（string 或 Error，各文件措辞自定、输出与旧脚本字节一致）
  */
-export async function setupShard({ shard, port }) {
-  const BUILT = process.env.WDSYNC_E2E_PRELOAD === 'built'
-  const ROOT = path.join(HERE, `.dav-root-${shard}`)
-  const PORT = port
-  await fsp.rm(ROOT, { recursive: true, force: true })
-  const server = spawn(process.execPath, [path.join(HERE, 'dav-server.mjs'), String(PORT), ROOT], {
+export function makeCheck(jsonlSection = null) {
+  const results = []
+  const check = (name, cond, detail = '') => {
+    results.push({ name, ok: !!cond })
+    if (jsonlSection && process.env.WDSYNC_E2E_JSONL) {
+      try {
+        fs.appendFileSync(process.env.WDSYNC_E2E_JSONL, JSON.stringify({ section: jsonlSection, name, ok: !!cond }) + '\n')
+      } catch (_) {
+        /* 对拍输出失败不影响测试本身 */
+      }
+    }
+    console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
+  }
+  const assertAtEnd = ({ passLine = null, fail } = {}) => {
+    const failed = results.filter((r) => !r.ok)
+    if (passLine) console.log(passLine(results.length - failed.length, results.length))
+    if (failed.length) {
+      const msg = fail(failed, results.length)
+      throw msg instanceof Error ? msg : new Error(msg)
+    }
+  }
+  return { check, results, assertAtEnd }
+}
+
+/** 本测试文件内 makeTrashStub 创建过的回收站目录（teardownShard 统一清理用；forks 池下每文件独立） */
+const trashDirs = []
+/**
+ * 本进程 setupShard 产生的全部 uniq 临时目录（LOCAL / STORAGE_* / freshStore /
+ * tmpLocal 登记制追加）：模块级登记的原因 —— 部分分片只把 { ROOT, LOCAL, server }
+ * 传给 teardownShard，靠 ctx 字段会漏清；登记制对任意句柄形态都成立。
+ * 前提（vitest.config 注释所载）：forks 池下每测试文件独占一个子进程，单进程
+ * 只有一次 setupShard。
+ */
+const shardTmpDirs = []
+
+/**
+ * 宿主回收站桩工厂（原 head/lock/misc/sched/tiers 五分片逐字复制、net/tree/rename
+ * 三处简化变体的统一替代）：shellTrashItem 把传入路径 rename 进独立 TRASH_DIR
+ *（不真删，供断言「进了回收站」），并支持失败注入与「宿主未提供端口」模拟。
+ * 返回 { TRASH_DIR, install, trashLog, failNext, missing }：
+ * - install()：按当前控制变量（重）装 global.window.ztools；missing=true 时卸载
+ *   ztools（模拟宿主无回收站端口）
+ * - trashLog：已回收路径数组（引用本体，可原地 length=0 清零复用）
+ * - failNext：数字存取器 —— 接下来 N 次调用抛 EACCES 注入失败（trash.failNext = 1）
+ * - missing：布尔存取器 —— 置 true 后下一次 install() 装出「无 ztools」形态
+ */
+export function makeTrashStub() {
+  const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-${Date.now()}-${process.pid}`)
+  fs.mkdirSync(TRASH_DIR, { recursive: true })
+  trashDirs.push(TRASH_DIR)
+  const trashLog = []
+  let trashFailNext = 0
+  let trashMissing = false
+  const install = () => {
+    if (trashMissing) {
+      delete global.window.ztools
+      return
+    }
+    global.window.ztools = {
+      shellTrashItem: async (p) => {
+        trashLog.push(p)
+        if (trashFailNext > 0) {
+          trashFailNext--
+          throw new Error('EACCES: permission denied (injected trash failure)')
+        }
+        const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
+        await fsp.rename(p, dest)
+      },
+    }
+  }
+  return {
+    TRASH_DIR,
+    install,
+    trashLog,
+    get failNext() {
+      return trashFailNext
+    },
+    set failNext(v) {
+      trashFailNext = v
+    },
+    get missing() {
+      return trashMissing
+    },
+    set missing(v) {
+      trashMissing = v
+    },
+  }
+}
+
+/**
+ * 挂假 dbStorage 到 global.window.ztools（原 shard-sched 的 mountScZtools /
+ * shard-net 的 mountScDb / shard-tree 内联挂载的统一替代）：getItem/setItem 后备
+ * 到传入的普通对象（生产为宿主 dbStorage 的同步 KV），并保留已装的
+ * shellTrashItem（回收站桩叠加 —— deleteLocalOne 依赖，三处原实现均如此）。
+ * @param db 承载数据的普通对象（各分片的 SC_DB）
+ */
+export function mountFakeDbStorage(db) {
+  const prevTrash = global.window.ztools && global.window.ztools.shellTrashItem
+  global.window.ztools = {
+    dbStorage: { getItem: (k) => (k in db ? db[k] : null), setItem: (k, v) => { db[k] = v } },
+    ...(prevTrash ? { shellTrashItem: prevTrash } : {}),
+  }
+}
+
+/**
+ * spawn 一个 dav-server 并等待就绪（stdout 出现含 'listening' 的行；15s 超时，
+ * 超时即杀子进程防孤儿）；stderr 逐行转发到控制台。
+ * @param opts.tag 根目录名后缀（root 缺省 = test/.dav-root-<tag>，spawn 前清空；stderr 前缀）
+ * @param opts.root 根目录覆盖（如 shard-sched SC8 的 ROOT-sc8b 副根）
+ * @param opts.port 监听端口，0 = 内核随机分配（默认 —— 跨运行 / 并行 CI 零冲突），
+ *   实际端口从就绪行解析
+ * @param opts.cert / opts.key TLS 证书与密钥路径（同时给出时以 https 提供服务）
+ * @returns {Promise<{child: ChildProcess, root: string, port: number}>} port 为实际监听端口
+ */
+export async function spawnDav({ tag, port = 0, cert, key, root } = {}) {
+  const davRoot = root || path.join(HERE, `.dav-root-${tag}`)
+  await fsp.rm(davRoot, { recursive: true, force: true })
+  const child = spawn(process.execPath, [path.join(HERE, 'dav-server.mjs'), String(port), davRoot, ...(cert && key ? [cert, key] : [])], {
     stdio: 'pipe',
     // 父进程死亡看门狗的注入 pid：worker 被强杀等未走 afterAll 的路径下，
     // dav-server 自行退出（防端口残留；见 dav-server.mjs 顶部说明）
     env: { ...process.env, WDSYNC_DAV_EXIT_WITH: String(process.pid) },
   })
+  const portActual = await new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      try {
+        child.kill('SIGKILL')
+      } catch (_) {
+        /* 已死：忽略 */
+      }
+      reject(new Error(`dav-server ${tag} start timeout`))
+    }, 15000)
+    child.stdout.on('data', (d) => {
+      const line = String(d)
+      if (line.includes('listening')) {
+        const m = /127\.0\.0\.1:(\d+)/.exec(line)
+        if (m) {
+          clearTimeout(t)
+          resolve(Number(m[1]))
+        }
+      }
+    })
+    child.stderr.on('data', (d) => console.error(`[dav-${tag}]`, String(d)))
+  })
+  return { child, root: davRoot, port: portActual }
+}
+
+/** 关停 spawnDav 返回的句柄：销毁 stdio 管道 → kill → 删其根目录 */
+export async function killDav(h) {
+  try {
+    h.child.stdout.destroy()
+    h.child.stderr.destroy()
+  } catch (_) {
+    /* 已死：忽略 */
+  }
+  h.child.kill()
+  await fsp.rm(h.root, { recursive: true, force: true }).catch(() => {})
+}
+
+/**
+ * 清扫历史运行残留的 uniq 临时目录（wdsync-e2e[-store|-trash]-<时间戳>-<pid>，
+ * 即 setupShard 的 LOCAL/STORAGE_* 与 makeTrashStub 的 TRASH_DIR 形态）：
+ * 只删「创建进程已死」的目录 —— 并行运行中的其他分片（pid 存活）、freshStore/
+ * tmpLocal 之类无 pid 后缀的目录（由 teardownShard 登记制清理）与用户的其他
+ * /tmp 内容绝不动。触发场景：整文件被 slow 过滤跳过时 afterAll 不执行，
+ * setupShard 在下一轮启动时兜底（对应 dav-root 的既有先例）。
+ */
+async function sweepDeadRunTmpDirs() {
+  const sweepRe = /^wdsync-e2e-(store-[a-z]+-|trash-)?\d+-\d+$/
+  let entries = []
+  try {
+    entries = await fsp.readdir(os.tmpdir())
+  } catch (_) {
+    return
+  }
+  for (const name of entries) {
+    if (!sweepRe.test(name)) continue
+    const pid = Number(name.slice(name.lastIndexOf('-') + 1))
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue
+    try {
+      process.kill(pid, 0) // 探活：还活着（并行分片 / pid 已被复用）→ 保守跳过
+      continue
+    } catch (e) {
+      if (!e || e.code !== 'ESRCH') continue // EPERM 等按存活处理（保守）
+    }
+    await fsp.rm(path.join(os.tmpdir(), name), { recursive: true, force: true }).catch(() => {})
+  }
+}
+/**
+ * 每分片一套独立环境：dav-server（端口 0 = 内核随机分配，就绪行解析回填 PORT）/
+ * .dav-root-<shard> / 临时目录 / preload 实例。
+ * 返回旧主 try 作用域的全部共享标识符（分片文件顶部同名解构，节体零改动搬运）；
+ * LOCAL / STORAGE_* 与 freshStore / tmpLocal 产生的目录一并登记到模块级
+ * shardTmpDirs（teardownShard 统一清理，不依赖分片传入的句柄形态）。
+ */
+export async function setupShard({ shard }) {
+  const BUILT = process.env.WDSYNC_E2E_PRELOAD === 'built'
+  const ROOT = path.join(HERE, `.dav-root-${shard}`)
+  // 上一轮「整文件被 slow 过滤跳过 → afterAll 未执行」残留 uniq 临时目录的兜底清扫
+  await sweepDeadRunTmpDirs()
+  await fsp.rm(ROOT, { recursive: true, force: true })
+  const { child: server, port: PORT } = await spawnDav({ tag: shard, port: 0 })
   process.on('exit', () => {
     try {
       server.kill()
@@ -92,19 +300,9 @@ export async function setupShard({ shard, port }) {
       /* 已死：忽略 */
     }
   })
-  // 防泄漏：spawn 之后任何失败（端口占用 / 启动超时 / 加载异常）立即杀掉子进程，
-  // 否则收集期失败不触发 afterAll，孤儿 dav-server 会级联污染后续运行（EADDRINUSE）
+  // 防泄漏：spawn 之后任何失败（加载异常等）立即杀掉子进程，否则收集期失败不触发
+  // afterAll，孤儿 dav-server 会级联污染后续运行（端口已 0 化，此处防 fd / 进程残留）
   try {
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('server start timeout')), 15000)
-    server.stdout.on('data', (d) => {
-      if (String(d).includes('listening')) {
-        clearTimeout(t)
-        resolve()
-      }
-    })
-    server.stderr.on('data', (d) => console.error('[dav]', String(d)))
-  })
   const preloadPath = BUILT
     ? path.join(HERE, '..', 'src-ztools', 'preload', 'dist', 'services.js')
     : path.join(HERE, '..', 'src-ztools', 'preload', 'services.mts')
@@ -121,6 +319,8 @@ export async function setupShard({ shard, port }) {
   const STORAGE_B = path.join(os.tmpdir(), `wdsync-e2e-store-b-${uniq}`)
   const STORAGE_C = path.join(os.tmpdir(), `wdsync-e2e-store-c-${uniq}`)
   const STORAGE_D = path.join(os.tmpdir(), `wdsync-e2e-store-d-${uniq}`)
+  // uniq 目录登记到模块级 shardTmpDirs（teardownShard 对任意句柄形态统一清理）
+  shardTmpDirs.push(LOCAL, STORAGE_MAIN, STORAGE_A, STORAGE_B, STORAGE_C, STORAGE_D)
   const switchDevice = async (root) => {
     await services.storage.setRootForTest(root)
     if (BUILT) await storeModule.setRootForTest(root)
@@ -142,16 +342,19 @@ export async function setupShard({ shard, port }) {
     if (mode) fs.writeFileSync(path.join(ROOT, '.wdsync-test-midair'), mode)
     else await fsp.rm(path.join(ROOT, '.wdsync-test-midair'), { force: true }).catch(() => {})
   }
-  /** 新建独立存储根并切换（档位 / 能力缓存 / 基线互不串扰的前提） */
+  /** 新建独立存储根并切换（档位 / 能力缓存 / 基线互不串扰的前提）；目录登记入 shardTmpDirs 待收尾清理 */
   const freshStore = async (tag) => {
     const root = path.join(os.tmpdir(), `wdsync-e2e-store-${tag}-${Date.now()}`)
     await fsp.mkdir(root, { recursive: true })
+    shardTmpDirs.push(root)
     await switchDevice(root)
     return root
   }
+  /** 新建独立本地目录（tag 区分用途）；目录登记入 shardTmpDirs 待收尾清理 */
   const tmpLocal = async (tag) => {
     const lp = path.join(os.tmpdir(), `wdsync-e2e-local-${tag}-${Date.now()}`)
     await fsp.mkdir(lp, { recursive: true })
+    shardTmpDirs.push(lp)
     return lp
   }
   const syncP = (lp, rp, prefs, handlers) =>
@@ -230,7 +433,7 @@ export async function setupShard({ shard, port }) {
    * 起一轮同步，并在「目标请求行出现在 reqlog 且再过 warmMs」后置位取消标记 ——
    * 此时该传输必然在途（节流保证剩余时长 ≥1s）。返回 { err, summary, sawBytes,
    * abortToSettleMs }：err 为 null 表示轮次正常返回（取消失败形态）；sawBytes 记录
-   * onProgress 是否观察到字节推进（引擎进度按文件粒度推进，小文件先完成即计）。
+   * onProgress 是否观察到字节推进（引擎进度随传输字节流推进，传输中有字节落地即计）。
    */
   const runCancelRound = async (lp, rp, targetLine, warmMs, prefs) => {
     let abort = false
@@ -529,6 +732,15 @@ export async function teardownShard(ctx) {
   })
   await fsp.rm(ctx.LOCAL, { recursive: true, force: true }).catch(() => {})
   await fsp.rm(path.join(ctx.ROOT, '.wdsync-test-noetag'), { force: true }).catch(() => {})
+  // 本轮 uniq 的各级临时目录统一清理（模块级登记制：setupShard 的 LOCAL / 五个
+  // 存储根 + freshStore/tmpLocal 产生的目录 + makeTrashStub 的回收站目录）——
+  // 与分片传给 teardownShard 的句柄形态无关（多数分片只传 { ROOT, LOCAL, server }）
+  for (const d of shardTmpDirs) {
+    await fsp.rm(d, { recursive: true, force: true }).catch(() => {})
+  }
+  for (const d of trashDirs) {
+    await fsp.rm(d, { recursive: true, force: true }).catch(() => {})
+  }
   http.globalAgent.destroy()
   https.globalAgent.destroy()
 }

@@ -4,8 +4,11 @@
 // 本文件是 window.services 公共 API 与内部模块（store / scheduler / services）
 // 共用类型的**单一事实源**：渲染层 env.d.ts 由此 re-export，preload 各模块经
 // `import type` 引用 —— 手写两份的类型从此不再漂移。
-// 约束（Node 类型剥离 + esbuild 双通道都要吃）：只允许可擦除语法
-//（interface / type / import type），不得出现 enum / namespace / import =。
+// 约束（Node 类型剥离 + esbuild 双通道都要吃）：interface / type / import type
+// 等可擦除语法之外，仅允许少量前后端共用的常量与纯函数（当前为
+// ZTOOLS_PLUGINS_DIR_ID / resolveDirPrefs：零 import、零副作用，对 tsc 类型
+// 擦除与 esbuild 打包双通道均安全 —— 渲染层经 vite 直接 import 值，preload
+// 经 esbuild 单文件产物内联）；不得出现 enum / namespace / import =。
 
 /** WebDAV 连接配置（渲染层持久化的 server 段；netOpts 见 NetOpts、tls 见 TlsOpts） */
 export interface DavConfig {
@@ -268,7 +271,7 @@ export interface Prefs {
   /**
    * 后台运行（默认 true）：用户开关的语义是「隐藏插件视图时是否继续自动同步」。
    * 关闭 = 隐藏时调度器挂起（suspend）、进入时恢复；宿主的 backgroundRunning 声明
-   * 仍是静态 true（换取隐藏态 Blink 不节流，交互不被钳制）。副作用见 README。
+   * 仍是静态 true（换取隐藏态 Blink 不节流，交互不被钳制）。
    */
   backgroundRunning?: boolean
   /**
@@ -340,12 +343,111 @@ export interface Prefs {
 }
 
 /**
+ * 「ZTools 插件同步」虚拟记录的固定目录 id —— 前后端共用的目录 id 单一事实源：
+ * 渲染层列表行（store.ts 直接 import）、调度器合成 slot（scheduler.mts 经
+ * ztools-plugins.mts 的 re-export）与 round-end / 冲突等事件按此对齐。
+ * 字面量只在此定义一次；ztools-plugins.mts re-export 本常量以保持其既有
+ * 消费方导入路径不变。
+ */
+export const ZTOOLS_PLUGINS_DIR_ID = 'ztools-plugins'
+
+/**
+ * 目录级覆盖形参的读取形态（resolveDirPrefs 的 overrides 形参）：只声明与
+ * 同步参数相关的字段，值一律 unknown —— 畸形值防御统一在 resolveDirPrefs
+ * 内做。渲染层 DirOverrides（env.d.ts，另有 autoSync 等无关字段）与调度器侧
+ * Record<string, unknown>（loadConfig 透传的原始 JSON）都可直接传入。
+ */
+export interface DirPrefsOverridesInput {
+  ignoreHidden?: unknown
+  concurrency?: unknown
+  conflictStrategy?: unknown
+  deepVerify?: unknown
+  leaseLock?: unknown
+  excludePatterns?: unknown
+  excludeRels?: unknown
+}
+
+/**
+ * resolveDirPrefs 的返回形态：目录生效的引擎同步参数 = Prefs 的同步参数
+ * 字段子集 + 目录级 excludeRels。与 services.mts 的 EnginePrefs
+ *（Pick<Prefs, …> & { excludeRels?: string[] }）结构同形 —— 本文件不可反向
+ * import services（会成环），形状在此独立定义、由结构化类型双向约束。
+ */
+export interface ResolvedDirPrefs {
+  ignoreHidden: boolean
+  concurrency: number
+  conflictStrategy: Prefs['conflictStrategy']
+  verifyMaxBytes?: number
+  deepVerify?: boolean
+  deepVerifyDays?: number
+  adoptVerifyBudgetBytes?: number
+  leaseLock: boolean
+  excludePatterns?: string[]
+  /** 勾选树「取消同步」的精确 rel（目录级字段，无全局形态）：与 excludePatterns 在引擎扫描层合并 */
+  excludeRels?: string[]
+}
+
+/**
+ * 目录生效同步参数的合并口径（前后端单一事实源）：目录级覆盖（overrides）
+ * 优先，未覆盖项回落全局偏好，并把畸形值防御一并收进来 —— 数值取整为正
+ *（concurrency）、布尔归一（ignoreHidden / deepVerify / leaseLock）、数组
+ * 校验（excludePatterns / excludeRels）、冲突策略合法值校验。渲染层
+ * dirSyncPrefs（store.ts）与调度器 prefsOf（scheduler.mts）都收敛到本函数：
+ * 「无调度器直调引擎」与「调度器自动轮」两条路径由此同规则，这也是本地与
+ * 远端按同规则解释目录设置的前提。globalPrefs 两端形态不同 —— 渲染层传
+ * 带默认值的完整 Prefs，preload 可能传 dbStorage 读到的残缺 JSON —— 防御
+ * 逻辑对两种都兜住：字段缺失 / 畸形时回落内置默认（concurrency 4、
+ * ignoreHidden / leaseLock true、conflictStrategy 'ask'）。
+ * @param overrides 目录级覆盖（null / undefined = 无覆盖，全部回落全局）
+ * @param globalPrefs 全局偏好（允许缺字段的残缺形态）
+ */
+export function resolveDirPrefs(
+  overrides: DirPrefsOverridesInput | null | undefined,
+  globalPrefs: Partial<Prefs> | null | undefined
+): ResolvedDirPrefs {
+  const o = overrides || {}
+  const p = globalPrefs || {}
+  /** 布尔归一：取值是布尔才生效，否则看回落值；两者都非布尔返回 undefined（交调用侧定默认） */
+  const boolOr = (v: unknown, fb: unknown): boolean | undefined => (typeof v === 'boolean' ? v : typeof fb === 'boolean' ? fb : undefined)
+  /** 数值归一：正数取整生效，其余（缺省 / 非数值 / 非正）返回 undefined */
+  const posIntOf = (v: unknown): number | undefined => {
+    const n = Number(v)
+    return n > 0 ? Math.floor(n) : undefined
+  }
+  /** 冲突策略合法值校验：四个合法字面量之外（缺省 / 畸形）返回 undefined */
+  const csOf = (v: unknown): Prefs['conflictStrategy'] | undefined =>
+    v === 'ask' || v === 'local' || v === 'remote' || v === 'both' ? v : undefined
+  return {
+    ignoreHidden: boolOr(o.ignoreHidden, p.ignoreHidden) ?? true,
+    concurrency: posIntOf(o.concurrency) ?? posIntOf(p.concurrency) ?? 4,
+    conflictStrategy: csOf(o.conflictStrategy) ?? csOf(p.conflictStrategy) ?? 'ask',
+    verifyMaxBytes: p.verifyMaxBytes,
+    deepVerify: boolOr(o.deepVerify, p.deepVerify),
+    deepVerifyDays: p.deepVerifyDays,
+    adoptVerifyBudgetBytes: p.adoptVerifyBudgetBytes,
+    leaseLock: boolOr(o.leaseLock, p.leaseLock) ?? true,
+    // 用户排除规则：目录级覆盖整体替换全局规则（数组语义「全集」，不做两表
+    // 合并）；非数组（畸形）视同未设置，回落全局，两处都畸形则交引擎按
+    //「未配置」处理
+    excludePatterns: Array.isArray(o.excludePatterns)
+      ? o.excludePatterns
+      : Array.isArray(p.excludePatterns)
+        ? p.excludePatterns
+        : undefined,
+    // 勾选树「取消同步」的精确 rel（目录级字段，无全局形态）：与 excludePatterns
+    // 在引擎扫描层合并生效（compileSyncExcludes —— 字面精确匹配，祖先目录
+    // 命中即整棵子树排除）；非数组（畸形）视同未设置
+    excludeRels: Array.isArray(o.excludeRels) ? o.excludeRels : undefined,
+  }
+}
+
+/**
  * 「ZTools 插件同步」（实验）的自动发现结果（services.ztoolsPlugins.describe 的
  * 返回形状；发现逻辑见 ztools-plugins.mts）。渲染层虚拟行与调度器合成配置共用。
  */
 export interface ZtoolsPluginsSyncDesc {
-  /** 虚拟记录固定 id（渲染层行与调度器 slot 以此对齐） */
-  id: 'ztools-plugins'
+  /** 虚拟记录固定 id（渲染层行与调度器 slot 以此对齐；字面量见 ZTOOLS_PLUGINS_DIR_ID） */
+  id: typeof ZTOOLS_PLUGINS_DIR_ID
   /** 本机插件实体目录绝对路径（ZTOOLS_DATA_ROOT 覆盖时跟随；自动发现、不可修改） */
   pluginsDir: string
   /** 平台目录名（mac / windows / linux；未知平台原样使用 platform 值，保持隔离语义） */
@@ -410,7 +512,10 @@ export interface ConflictInfo {
  *   plan（verify 池运行中）—— bytesDone / bytesTotal 承载规划期内容校验的字节估算；
  *   transfer              —— bytesDone / bytesTotal 承载「计划需要上传 + 下载」的
  *                            字节量（分母只含已入队的传输任务，不含未变化的文件；
- *                            删除任务计 0），bytesDone 随传输完成递增。
+ *                            删除任务计 0），bytesDone 随传输字节流实时递增：
+ *                            上传读流 / 下载落盘逐块累加（ReqOpts.onBytes 逐块回调），
+ *                            任务完结补齐尾差，终值 = 计划传输字节 —— 大文件传输期间
+ *                            进度按真实大小推进，速度可由相邻事件的字节差折算。
  * scanBytesTotal 恒为「本轮扫描到的全部文件字节（两侧并集）」，与传输量无关
  *（云端占用估算的数据来源）。
  */
@@ -511,6 +616,21 @@ export type SchedulerEvent =
   | { type: 'scheduler-error'; message: string; phase?: string; visible?: boolean }
   | { type: 'plugin-out'; isKill: boolean }
   | { type: 'plugin-enter'; code?: string }
+  /**
+   * 实时传输速率（调度器内置 1s 采样器外发；仅存在进行中轮次且有流量时发送，
+   * 轮次全部结束补发一次全零表示空闲）。速率为 EMA 平滑后的字节/秒 —— 抹平
+   * 逐文件完成粒度的抖动；上传 / 下载按文件内容通道计（PUT 请求体 / GET 响应体），
+   * 扫描规划期的清单流量不计入。
+   */
+  | {
+      type: 'net-speed'
+      /** 全局实时上传速率（字节/秒；空闲为 0） */
+      upBps: number
+      /** 全局实时下载速率（字节/秒；空闲为 0） */
+      downBps: number
+      /** 每目录实时速率（键为目录 id；仅运行中且近秒产生过流量的目录有值） */
+      dirs: Record<string, { upBps: number; downBps: number }>
+    }
 
 /** 单次手动同步的结果（syncNow 单目录形态） */
 export interface SyncNowResult {
@@ -811,9 +931,10 @@ export interface SyncLogEntry {
   errorsDropped?: number
 }
 
-/** 基线 / WAL 日志行负载（{t:'set'|'del'|'clear'|'intent'|'done'|'abort', ...}） */
+/** 基线 / WAL 日志行负载（t 为六种负载类型之一，见字段注释） */
 export interface LogOp {
-  t: string
+  /** 负载类型：set / del / clear 为基线日志（clear 仅重放识别，现不再写入），intent / done / abort 为 WAL */
+  t: 'set' | 'del' | 'clear' | 'intent' | 'done' | 'abort'
   k?: string
   e?: BaselineEntry
   id?: string
@@ -838,7 +959,7 @@ export interface InternalApiPermissionStatus {
  * resources/preload.js 对所有插件注入该命名空间，但每次调用在主进程按
  * canUseInternalApi 鉴权：完全授权（内置 / 手动全量名单）放行一切；按通道
  * 授权模式下放行「已授权通道」。授权数据每次 IPC 现读 —— 设置页批准后立即
- * 生效，无需重开插件。授权入口与申请流程见 design/host-api-requirements.md。
+ * 生效，无需重开插件。
  */
 export interface ZToolsInternalApi {
   /** 读取 ZTOOLS/ 命名空间文档（如 'plugins' 注册表）；未授权时 reject */

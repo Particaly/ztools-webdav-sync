@@ -12,16 +12,12 @@
  * 执行；check() 沿用软失败登记 + 末尾一次性抛出（与 store.test.mjs 一致）。
  */
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
-}
+// 软失败登记收敛到 harness 的 makeCheck
+const { check, assertAtEnd } = makeCheck()
 
 // ---- 导入 store 前装好 window.services 桩（refreshPendingConflicts 的数据源）----
 const pendingsByDir = new Map()
@@ -119,8 +115,8 @@ test('渲染层 store：根丢失决策弹窗自动触发（R1–R6，强顺序�
     check('unexpected error', false, e && e.stack ? e.stack.split('\n').slice(0, 4).join(' | ') : String(e))
   }
 
-  const failed = results.filter((r) => !r.ok)
-  if (failed.length) {
-    throw new Error(`渲染层 store 测试失败 ${failed.length}/${results.length} 条:\n${failed.map((f) => `  - ${f.name} ${f.detail}`).join('\n')}`)
-  }
+  // 旧失败清单模板逐字保留（含 f.detail 恒为 undefined 的历史形态 —— 输出字节不变）
+  assertAtEnd({
+    fail: (failed, total) => `渲染层 store 测试失败 ${failed.length}/${total} 条:\n${failed.map((f) => `  - ${f.name} ${f.detail}`).join('\n')}`,
+  })
 })

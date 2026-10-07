@@ -16,6 +16,7 @@
  * check() 沿用软失败登记 + 末尾一次性抛出（与 store.test.mjs 一致）。
  */
 import { test } from 'vitest'
+import { makeCheck } from '../harness.mjs'
 
 // services.mts 在模块顶层挂 window.services（模块不导出对象本体）—— Node 直载
 // 需先备好宿主对象，再从 window 取（与 e2e harness 的加载形态一致）
@@ -24,11 +25,8 @@ await import('../../src-ztools/preload/services.mts')
 const services = globalThis.window.services
 const { compileSyncExcludes, compileExcludePatterns, compileExactRels } = services.sync._internals
 
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
-}
+// 软失败登记收敛到 harness 的 makeCheck
+const { check, assertAtEnd } = makeCheck()
 
 test('排除匹配语义（精确 rel + 祖先传播 + glob 合并）', () => {
   // ---- X1 精确 rel ----
@@ -89,6 +87,5 @@ test('排除匹配语义（精确 rel + 祖先传播 + glob 合并）', () => {
     return compileSyncExcludes(null, [long]) === null
   })())
 
-  const failed = results.filter((r) => !r.ok)
-  if (failed.length) throw new Error(`排除语义单元测试 ${failed.length}/${results.length} 项失败：\n  ❌ ${failed.map((f) => f.name).join('\n  ❌ ')}`)
+  assertAtEnd({ fail: (failed, total) => `排除语义单元测试 ${failed.length}/${total} 项失败：\n  ❌ ${failed.map((f) => f.name).join('\n  ❌ ')}` })
 })

@@ -17,7 +17,7 @@
 // 本模块在每轮对账开头做权限闸：REQUIRED_INTERNAL_CHANNELS 齐备才动注册表，
 // 缺失时自动提交申请（状态 pending，见 reconcileCore 步骤 1）。
 //
-// 设计约束（配套：README「ZTools 插件同步的边界」、design/host-api-requirements.md）：
+// 设计约束：
 //   - manifest 是注册表的**投影**不是权威：本机注册表对本机已有记录保持权威
 //     （安装 / 升级 / 禁用状态由宿主自己写），manifest 只补「本机没有的名字」；
 //     manifest 改写仅发生在「本轮注册表确有变化」或「盘上 manifest 缺失 / 损坏」
@@ -179,6 +179,35 @@ function rebaseLogoIn(logo: unknown, pluginsDir: string): string {
 }
 
 /**
+ * manifest 记录的可同步字段白名单（单一事实源）：registryRecordToManifest（导出
+ * 投影）与 manifestRecordToRegistry（导入还原）共用同一份键序 —— 键序即序列化
+ * 键序，manifest 的跨设备字节稳定依赖它。name / entity / logo 不在白名单：三者
+ * 各有专门的相对化 / 重定基逻辑（entity 相对路径、logo file:// 重建），不走逐字段
+ * 拷贝。`satisfies` 把元素约束为接口合法键（写错键名 / 接口删字段 → 编译期即报）；
+ * 下方 _manifestFieldsComplete 断言则保证反向完整性 —— 接口加字段而本数组漏更时
+ * 编译期即报「缺键」，而不是该字段在两侧静默漏同步。
+ */
+const MANIFEST_FIELDS = [
+  'title',
+  'version',
+  'description',
+  'author',
+  'homepage',
+  'main',
+  'preload',
+  'features',
+  'storageKind',
+  'sourceType',
+  'installedFrom',
+  'installedAt',
+] as const satisfies ReadonlyArray<keyof RegistryManifestRecord>
+
+/** 编译期断言（无运行时语义）：MANIFEST_FIELDS 恰好覆盖接口除 name / entity / logo 外的全部键 */
+type _ManifestFieldsMissing = Exclude<keyof RegistryManifestRecord, (typeof MANIFEST_FIELDS)[number] | 'name' | 'entity' | 'logo'>
+const _manifestFieldsComplete: [_ManifestFieldsMissing] extends [never] ? true : never = true
+void _manifestFieldsComplete
+
+/**
  * 注册表记录 → manifest 记录（导出投影）：白名单字段按固定键序拷贝（undefined
  * 跳过，保证序列化字节稳定），绝对 path 换成 entity 相对路径，logo 重定基。
  * @param record 注册表原始记录（宿主 buildPluginInfo 形态）
@@ -190,21 +219,8 @@ export function registryRecordToManifest(record: any, pluginsDir: string): Regis
   const entity = isEntityRecord(record, pluginsDir) ? relInside(pluginsDir, record.path) : null
   if (entity === null) return null
   const m: RegistryManifestRecord = { name: record.name, entity }
-  const rest: Array<[keyof RegistryManifestRecord, unknown]> = [
-    ['title', record.title],
-    ['version', record.version],
-    ['description', record.description],
-    ['author', record.author],
-    ['homepage', record.homepage],
-    ['main', record.main],
-    ['preload', record.preload],
-    ['features', record.features],
-    ['storageKind', record.storageKind],
-    ['sourceType', record.sourceType],
-    ['installedFrom', record.installedFrom],
-    ['installedAt', record.installedAt],
-  ]
-  for (const [k, v] of rest) {
+  for (const k of MANIFEST_FIELDS) {
+    const v = (record as any)[k]
     if (v !== undefined) (m as any)[k] = v
   }
   const logo = rebaseLogoOut(record.logo, pluginsDir)
@@ -225,21 +241,7 @@ export function manifestRecordToRegistry(m: RegistryManifestRecord, pluginsDir: 
     name: m.name,
     path: path.join(pluginsDir, ...m.entity.split('/')),
   }
-  const keys: Array<keyof RegistryManifestRecord> = [
-    'title',
-    'version',
-    'description',
-    'author',
-    'homepage',
-    'main',
-    'preload',
-    'features',
-    'storageKind',
-    'sourceType',
-    'installedFrom',
-    'installedAt',
-  ]
-  for (const k of keys) {
+  for (const k of MANIFEST_FIELDS) {
     if ((m as any)[k] !== undefined) out[k] = (m as any)[k]
   }
   out.logo = rebaseLogoIn(m.logo, pluginsDir)
@@ -611,8 +613,8 @@ export async function reconcileCore(pluginsDir: string, deps: RegistryReconcileD
     }
     result.adopted = merged.added
 
-    // 6. 注册表有变化：备份 → 写回 → 通知宿主刷新。通知 API 是宿主需求清单新增
-    //    项（internal:notify-plugins-changed），缺失 / 失败静默跳过 —— 登记仍
+    // 6. 注册表有变化：备份 → 写回 → 通知宿主刷新。通知走 internal:notify-plugins-changed
+    //    （宿主未提供该通道时静默跳过）—— 登记仍
     //    生效，列表延迟到宿主下一次触发或重启才刷新
     const changed = merged.added.length > 0 || merged.removed.length > 0
     if (changed) {

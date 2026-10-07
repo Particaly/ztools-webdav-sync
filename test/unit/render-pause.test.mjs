@@ -2,22 +2,19 @@
  * 渲染层 store 单元测试：全局暂停自动同步（顶栏一键暂停）的渲染层语义。
  *
  * 覆盖：默认未暂停 / 定时暂停的到期归一 / 已过期视同未暂停 / -1 一直暂停 /
- * 手动恢复清标记。调度器侧的门控与补跑由 e2e SC13 假时钟节覆盖，本文件只测
+ * 手动恢复清标记。调度器侧的门控与补跑由 e2e 调度器分片的假时钟节覆盖，本文件只测
  * 渲染层状态归一与动作（persist 的调度器 reload 通知在无 preload 桩下自然跳过）。
  *
  * 运行：npx vitest run test/unit
  */
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' : ''}${detail}`)
-}
+// 软失败登记收敛到 harness 的 makeCheck（顺带修复旧本地副本的日志模板变异：
+// detail 分支曾被拆成「分隔符 + 再拼一次 detail」的形态，统一回标准模板）
+const { check, assertAtEnd } = makeCheck()
 
 // ---- 导入 store 前装好 window 桩（shellOpenPath 捕获打开调用；无 dbStorage → persist 走 localStorage 兜底） ----
 const openCalls = []
@@ -57,7 +54,7 @@ test('渲染层 store：全局暂停自动同步（P1–P6）', async () => {
       JSON.stringify({ until: store.globalPauseUntil.value, text: store.pauseStatusText.value })
     )
 
-    // P5 手动恢复：清标记（调度器经 reload 感知迁移并补跑，e2e SC13 覆盖）
+    // P5 手动恢复：清标记（调度器经 reload 感知迁移并补跑，e2e 假时钟节覆盖）
     store.resumeAutoSync()
     check(
       'P5 resumeAutoSync clears the flag (and is a no-op when not paused)',
@@ -76,6 +73,5 @@ test('渲染层 store：全局暂停自动同步（P1–P6）', async () => {
     store.resumeAutoSync()
   }
 
-  const failed = results.filter((r) => !r.ok)
-  if (failed.length) throw new Error(`${failed.length} check(s) failed:\n${failed.map((f) => `- ${f.name}`).join('\n')}`)
+  assertAtEnd({ fail: (failed) => `${failed.length} check(s) failed:\n${failed.map((f) => `- ${f.name}`).join('\n')}` })
 })

@@ -1,6 +1,6 @@
 /**
  * e2e 分片「sched」：调度器组（SC1-SC10 / SC9B / W10）。SC1 挂假 dbStorage 供全系列使用，afterAll 统一收尾（删 ztools / 清 SC_DB）
- * 由 test/sync-e2e.mjs 机械拆分（节体逐字保留）；每文件独立 dav-server / 端口 / 根目录，
+ * 每文件独立 dav-server / 端口 / 根目录，
  * vitest 按文件并行、文件内保持原节顺序。共享基建见 test/harness.mjs。
  * 日常回归：npm run test:fast（跳过 slow tag）；等待组单独回归：npm run test:slow。
  */
@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP, makeTrashStub, mountFakeDbStorage, spawnDav } from './harness.mjs'
 
 const {
     HERE, ROOT, PORT, LOCAL, server, services, cfg, storeModule, BUILT, preloadPath,
@@ -22,30 +22,11 @@ const {
     setThrottle, waitForReqLine, waitAbortLine, runCancelRound, readWalOps, findTempResidue,
     PUP, setNetcut, setPartialPut, puBuf,
     SC_DB, SC_KEY, setSCConfig, createTestSched, makeFakeClock, waitReal, pumpUntil, readLeaderLock, writeLeaderLock,
-  } = await setupShard({ shard: 'sched', port: 5377 })
+  } = await setupShard({ shard: 'sched' })
 
-  const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-${Date.now()}-${process.pid}`)
-  fs.mkdirSync(TRASH_DIR, { recursive: true })
-  const trashLog = []
-  let trashFailNext = 0
-  let trashMissing = false
-  const installTrash = () => {
-    if (trashMissing) {
-      delete global.window.ztools
-      return
-    }
-    global.window.ztools = {
-      shellTrashItem: async (p) => {
-        trashLog.push(p)
-        if (trashFailNext > 0) {
-          trashFailNext--
-          throw new Error('EACCES: permission denied (injected trash failure)')
-        }
-        const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-        await fsp.rename(p, dest)
-      },
-    }
-  }
+  // 宿主回收站桩（原分片内逐字复制的 installTrash 块，统一收敛到 harness 工厂）
+  const trash = makeTrashStub()
+  const { install: installTrash } = trash
   installTrash()
 
 /**
@@ -53,14 +34,9 @@ const {
  * deleteLocalOne 依赖 shellTrashItem）。提取成模块级助手的原因：--tagsFilter slow
  * 只跑慢组时 SC1（快组）被跳过，而 SC3+ 的 createTestSched/init 仍需读该挂载 ——
  * 各 SC 节首自行调用（重复调用幂等无害），全量 / fast / slow 三种模式都成立。
+ * 形态与 net/tree 分片一致，收敛到 harness 的 mountFakeDbStorage。
  */
-const mountScZtools = () => {
-  const prevTrash = global.window.ztools && global.window.ztools.shellTrashItem
-  global.window.ztools = {
-    dbStorage: { getItem: (k) => (k in SC_DB ? SC_DB[k] : null), setItem: (k, v) => { SC_DB[k] = v } },
-    ...(prevTrash ? { shellTrashItem: prevTrash } : {}),
-  }
-}
+const mountScZtools = () => mountFakeDbStorage(SC_DB)
 
   // ============================================================
   // SC 系列：preload 侧调度器 —— 自举 / DirSlot 状态机（假时钟）/
@@ -243,7 +219,7 @@ const mountScZtools = () => {
 
       // 取消：慢轮中取消 → cancelled 收场、interval 预订保持原计划（不重排、不提前）
       const bookedAt = sched.getSnapshot().slots[0].nextDueAt
-      // B2-fix 4.1：取消点必须锚定在「PUT 真正在途」。路径须含 'throttle' 才被
+      // 取消点必须锚定在「PUT 真正在途」。路径须含 'throttle' 才被
       // dav-server 节流（throttle=20 → 4MB/64KB×20ms ≈ 1.3s 传输窗口）；reqlog 出现
       // 目标 PUT 行才发取消，轮末断言 !ABORT（服务器观察到该 PUT 未写完即被销毁）——
       // 此前仅断言 slot running（含扫描 / 规划期，PUT 未必开始），取消落在传输中这一
@@ -473,7 +449,7 @@ const mountScZtools = () => {
         // 发现失位 → 在途轮经 shouldAbort 在文件边界以取消语义中止；基线不新增。
         // 外来锁循环改写直到失位确认：与心跳的 temp+rename 写入存在竞态（外来锁可能
         // 恰好落在心跳「先读后写」之间而被覆盖），重写保证任一心跳拍的先读必命中。
-        // B2-fix 4.1：外来锁写入等 reqlog 出现目标 PUT 行才开始 —— 把「中止发生在
+        // 外来锁写入等 reqlog 出现目标 PUT 行才开始 —— 把「中止发生在
         // 传输中」变成前提而非巧合（此前仅断言 slot running，含扫描 / 规划期）；
         // 轮末断言 !ABORT（服务器观察到该 PUT 未写完即被销毁）
         const baseBefore = await services.sync._internals.baselineSize(sc4dir)
@@ -741,20 +717,9 @@ const mountScZtools = () => {
     mountScZtools() // 幂等：fast/slow 过滤下 SC1 可能未运行
     // 第二个 dav-server 实例（不同 origin）：「每 origin 并发 1」需要两个 origin 才
     // 可验证。目录级 serverUrl 覆盖指向它（UI 不写该字段 —— 单服务器用户行为不变）。
-    const PORT2 = PORT + 1
+    // 端口 0 随机分配（原 PORT+1 推算在固定端口时代安全，随机端口下会撞端口）。
     const ROOT2 = ROOT + '-sc8b'
-    await fsp.rm(ROOT2, { recursive: true, force: true }).catch(() => {})
-    const server2 = spawn(process.execPath, [path.join(HERE, 'dav-server.mjs'), String(PORT2), ROOT2], { stdio: 'pipe' })
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('sc8 second server start timeout')), 5000)
-      server2.stdout.on('data', (d) => {
-        if (String(d).includes('listening')) {
-          clearTimeout(t)
-          resolve()
-        }
-      })
-      server2.stderr.on('data', (d) => console.error('[dav2]', String(d)))
-    })
+    const { child: server2, port: PORT2 } = await spawnDav({ tag: 'sched-sc8b', root: ROOT2 })
     const log1 = async () => (await fsp.readFile(REQLOG, 'utf-8').catch(() => '')).split('\n').filter(Boolean)
     const log2 = async () => (await fsp.readFile(path.join(ROOT2, '.wdsync-test-reqlog.log'), 'utf-8').catch(() => '')).split('\n').filter(Boolean)
     const waitForLineIn = async (read, target, timeoutMs = 15000) => {
@@ -1381,11 +1346,11 @@ const mountScZtools = () => {
     }
   })
 
-  // ---- W10（快，B2-fix 4.2）：watcher 同名窄洞（注入事件形态）与 interval 兜底 ----
-  // 窄洞（README 已知边界）：用户文件恰与被监听目录同名、且平台以 change 事件上报其
+  // ---- W10（快）：watcher 同名窄洞（注入事件形态）与 interval 兜底 ----
+  // 窄洞（已知边界）：用户文件恰与被监听目录同名、且平台以 change 事件上报其
   // 修改时，会被 watchDir 的「目录自事件过滤器」一并吞掉（evt=change 且 filename 全等
-  // 目录名）。Windows 的内容修改正是 change 形态（README 口径，未在本机验证）；
-  // macOS 实测（darwin 24.6 / Node 22，B2-fix 探针两次运行一致）：用户文件的创建 /
+  // 目录名）。Windows 的内容修改正是 change 形态（未在本机验证）；
+  // macOS 实测（darwin 24.6 / Node 22，探针两次运行一致）：用户文件的创建 /
   // 覆盖 / 原地改写一律 rename 具名事件，change 只出现在目录自事件 —— 窄洞在 macOS
   // 上无法用真实用户写入构成。故窄洞本身用**注入事件形态**模拟：直接调用过滤器纯
   // 函数 _internals.ignoredWatchEvent 传入 {evt:'change', filename:目录名}（= Windows
@@ -1522,8 +1487,8 @@ const mountScZtools = () => {
 
       // ④ 端到端一轮：插件目录（自动发现）→ 平台隔离远端；目录插件与 asar 文件都上传
       await waitReal(() => sc11Sched.getSnapshot().leader.isLeader === true, 5000)
-      // leader 上位后也无 startup 轮：真实等待窗内 slot 保持 scheduled（旧实现会在
-      // tick ≤1s 内把 startup 轮入队 → queued/running）
+      // leader 上位后也无 startup 轮：真实等待窗内 slot 保持 scheduled（startup 轮
+      // 不得在 tick ≤1s 内入队 → queued/running）
       await new Promise((r) => setTimeout(r, 2200))
       const plugQuiet11 = sc11Sched.getSnapshot().slots.find((s) => s.id === 'ztools-plugins')
       check(

@@ -4,28 +4,17 @@
  * e2e 行为链路（401 挑战应答 / 限速耗时 / 代理转发）见 test/shard-net.test.mjs。
  * 运行：npx vitest run test/unit（或 npm run test:unit）
  */
-import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { beforeAll, afterAll, test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PRELOAD = path.join(HERE, '..', '..', 'src-ztools', 'preload')
 
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  if (process.env.WDSYNC_E2E_JSONL) {
-    try {
-      fs.appendFileSync(process.env.WDSYNC_E2E_JSONL, JSON.stringify({ section: 'digest-net-unit', name, ok: !!cond }) + '\n')
-    } catch {
-      /* 对拍输出失败不影响测试 */
-    }
-  }
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ` — ${detail}` : ''}`)
-}
+// 软失败登记 + JSONL 对拍通道（section 固定 'digest-net-unit'）收敛到 harness 的 makeCheck
+const { check, assertAtEnd } = makeCheck('digest-net-unit')
 
 let services
 let internals
@@ -44,8 +33,7 @@ afterAll(() => {
   } catch {
     /* 清理失败不影响断言输出 */
   }
-  const failed = results.filter((r) => !r.ok)
-  if (failed.length) throw new Error(`${failed.length}/${results.length} 个用例失败：\n  ❌ ${failed.map((f) => f.name).join('\n  ❌ ')}`)
+  assertAtEnd({ fail: (failed, total) => `${failed.length}/${total} 个用例失败：\n  ❌ ${failed.map((f) => f.name).join('\n  ❌ ')}` })
 })
 
 test('U-D1：Digest 挑战解析（引号 / 无引号 / 多方案头）', () => {

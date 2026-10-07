@@ -3,8 +3,8 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton, AppModal } from './ui'
 import { useStore, dirRootLostOpen } from '../composables/store'
-import { fmtRelTime, fmtBytes } from '../composables/format'
-import type { DeleteBatchNode, DeleteScope, SyncDir } from '../env.d'
+import { fmtRelTime, fmtBytes, relBaseName } from '../composables/format'
+import type { DeleteScope, SyncDir } from '../env.d'
 
 /**
  * 待处理挂起面板（三类记录统一处理）：
@@ -32,7 +32,9 @@ const store = useStore()
 /** 打开时刷新一次（事件外兜底：处理动作可能来自其他入口），并重置分批展开 */
 watch(open, (v) => {
   if (v) {
-    shownCount.value = PAGE_SIZE
+    treeShown.value = PAGE_SIZE
+    flatShown.value = PAGE_SIZE
+    conflictShown.value = PAGE_SIZE
     void store.refreshPendingConflicts(props.dir)
   }
 })
@@ -66,6 +68,9 @@ interface TreeRow {
   scope: DeleteScope | null
   /** 命中的 scope 是否精确作用于本节点（决定徽标文案：已选 vs 已随上级处理） */
   exact: boolean
+  /** 快照里是否挂有子节点：引擎保证父目录必先于子节点产出，故「有子节点挂接」
+   *  即「存在 rel 前缀命中的后代」—— 构建期随挂接一次性置位，行渲染 O(1) 取用 */
+  hasKids: boolean
 }
 
 /** 命中某 rel 的最具体（最长前缀）范围决策；无命中返回 null（引擎同款匹配规则） */
@@ -107,18 +112,22 @@ const treeRows = computed<TreeRow[]>(() => {
     const hit = scopeFor(b.scopes, n.rel)
     const row: TreeRowNode = {
       rel: n.rel,
-      name: n.rel.slice(slash + 1),
+      // 快照节点 rel 由引擎拼装（无尾斜杠），末段名与 relBaseName 完全同义
+      name: relBaseName(n.rel),
       isDir: n.isDir,
       files: n.files,
       bytes: n.bytes,
       depth: slash < 0 ? 0 : parentRel.split('/').length,
       scope: hit,
       exact: !!hit && hit.prefix === n.rel,
+      hasKids: false,
       children: [],
     }
     byRel.set(n.rel, row)
-    if (parent) parent.children.push(row)
-    else roots.push(row)
+    if (parent) {
+      parent.children.push(row)
+      parent.hasKids = true
+    } else roots.push(row)
   }
   const rows: TreeRow[] = []
   const walk = (list: TreeRowNode[]) => {
@@ -133,14 +142,6 @@ const treeRows = computed<TreeRow[]>(() => {
   return rows
 })
 
-/** 子层是否已在快照里（目录节点可能有 children；折叠目录 / 叶子没有） */
-const hasChildren = (row: TreeRow): boolean => {
-  const b = batch.value
-  if (!b || !row.isDir || row.scope) return false
-  const prefix = row.rel + '/'
-  return b.nodes.some((n: DeleteBatchNode) => n.rel.startsWith(prefix))
-}
-
 /** 快照缺列时的兜底：未决策的逐文件删除记录（扁平展示，单文件范围决策） */
 const flatDeleteItems = computed(() =>
   batch.value ? [] : (props.dir.pendingConflicts ?? []).filter((p) => p.kind === 'delete' && !p.choice)
@@ -149,9 +150,12 @@ const flatDeleteItems = computed(() =>
 /** 未决策删除总数（快照 undecided 为引擎真值；无快照退回记录口径） */
 const deleteUndecided = computed(() => batch.value?.undecided ?? flatDeleteItems.value.length)
 
-/** 渲染分批（长列表限长）：每批 50 条，展开按钮出现在列表底部 */
+/** 渲染分批（长列表限长）：每批 50 条，展开按钮出现在列表底部。树 / 扁平 /
+ *  冲突三份列表各自独立游标 —— 一份点「显示更多」不影响其他两份的已展示条数 */
 const PAGE_SIZE = 50
-const shownCount = ref(PAGE_SIZE)
+const treeShown = ref(PAGE_SIZE)
+const flatShown = ref(PAGE_SIZE)
+const conflictShown = ref(PAGE_SIZE)
 
 const choiceLabel: Record<string, string> = {
   local: '保留电脑版本',
@@ -207,9 +211,9 @@ const subtitle = computed(() => {
 
       <!-- 删除确认：目录树（快照承载，按目录决策；「全部」按钮见底部） -->
       <template v-if="treeRows.length">
-        <div v-for="row in treeRows.slice(0, shownCount)" :key="row.rel" class="item tree-row" :style="{ paddingLeft: `${10 + row.depth * 14}px` }">
+        <div v-for="row in treeRows.slice(0, treeShown)" :key="row.rel" class="item tree-row" :style="{ paddingLeft: `${10 + row.depth * 14}px` }">
           <button
-            v-if="row.isDir && !row.scope && hasChildren(row)"
+            v-if="row.isDir && !row.scope && row.hasKids"
             type="button"
             class="tw"
             :title="isExpanded(row.rel) ? '收起' : '展开'"
@@ -236,14 +240,14 @@ const subtitle = computed(() => {
             <button type="button" class="act danger" @click="applyScope(row.rel, 'delete')">删除</button>
           </div>
         </div>
-        <button v-if="treeRows.length > shownCount" type="button" class="more-btn" @click="shownCount += PAGE_SIZE">
-          显示更多（{{ Math.min(shownCount, treeRows.length) }} / {{ treeRows.length }} 行）
+        <button v-if="treeRows.length > treeShown" type="button" class="more-btn" @click="treeShown += PAGE_SIZE">
+          显示更多（{{ Math.min(treeShown, treeRows.length) }} / {{ treeRows.length }} 行）
         </button>
       </template>
 
       <!-- 删除确认兜底：无快照但有逐文件记录（扁平列表，单文件范围决策） -->
       <template v-else-if="flatDeleteItems.length">
-        <div v-for="it in flatDeleteItems.slice(0, shownCount)" :key="it.rel" class="item">
+        <div v-for="it in flatDeleteItems.slice(0, flatShown)" :key="it.rel" class="item">
           <div class="min-w-0 flex-1 flex flex-col gap-[2px]">
             <span class="font-mono text-[12px] text-ink-1 truncate" :title="it.rel">{{ it.rel }}</span>
             <span class="text-[11px] text-ink-4">等你确认删除 · 发现于 {{ fmtRelTime(it.createdAt) }}</span>
@@ -253,13 +257,13 @@ const subtitle = computed(() => {
             <button type="button" class="act danger" @click="applyScope(it.rel, 'delete')">删除</button>
           </div>
         </div>
-        <button v-if="flatDeleteItems.length > shownCount" type="button" class="more-btn" @click="shownCount += PAGE_SIZE">
-          显示更多（{{ Math.min(shownCount, flatDeleteItems.length) }} / {{ flatDeleteItems.length }}）
+        <button v-if="flatDeleteItems.length > flatShown" type="button" class="more-btn" @click="flatShown += PAGE_SIZE">
+          显示更多（{{ Math.min(flatShown, flatDeleteItems.length) }} / {{ flatDeleteItems.length }}）
         </button>
       </template>
 
       <!-- 冲突：逐条三选一（数据侧限长 200，渲染侧分批） -->
-      <div v-for="it in items.slice(0, shownCount)" :key="it.rel" class="item">
+      <div v-for="it in items.slice(0, conflictShown)" :key="it.rel" class="item">
         <div class="min-w-0 flex-1 flex flex-col gap-[2px]">
           <span class="font-mono text-[12px] text-ink-1 truncate" :title="it.rel">{{ it.rel }}</span>
           <span class="text-[11px] text-ink-4">{{
@@ -283,8 +287,8 @@ const subtitle = computed(() => {
           <AppIcon name="check-circle" :size="12" bg="var(--green-bg)" />
         </span>
       </div>
-      <button v-if="items.length > shownCount" type="button" class="more-btn" @click="shownCount += PAGE_SIZE">
-        显示更多（{{ Math.min(shownCount, items.length) }} / {{ items.length }}）
+      <button v-if="items.length > conflictShown" type="button" class="more-btn" @click="conflictShown += PAGE_SIZE">
+        显示更多（{{ Math.min(conflictShown, items.length) }} / {{ items.length }}）
       </button>
     </div>
     <template #footer>

@@ -5,9 +5,10 @@ import DirFormModal from './DirFormModal.vue'
 import PendingConflictsModal from './PendingConflictsModal.vue'
 import SyncTreeModal from './SyncTreeModal.vue'
 import DryRunModal from './DryRunModal.vue'
-import { AppDropdown, AppIconButton } from './ui'
+import { AppButton, AppDropdown, AppIconButton, AppModal } from './ui'
 import { useStore, dirRootLostOpen, dirPendingSignal, isPluginSyncDir } from '../composables/store'
-import { fmtBytes, fmtRelTime } from '../composables/format'
+import { fmtBytes, fmtRelTime, fmtSpeed } from '../composables/format'
+import { syncRoundPercent, syncTaskText } from '../composables/syncProgress'
 import type { SyncDir } from '../env.d'
 
 const props = defineProps<{ dir: SyncDir }>()
@@ -22,76 +23,6 @@ const isPlugin = computed(() => isPluginSyncDir(props.dir))
 /** 插件目录是否可用（自动发现结果；缺失时行内提示条说明，等待 ZTools 创建） */
 const pluginAvailable = computed(() => props.dir.pluginSyncInfo?.available !== false)
 
-/** 目录进度载荷（SyncDir.progress 的非空形态，本组件的折算与文案输入） */
-type DirProgress = NonNullable<SyncDir['progress']>
-
-/**
- * 把一轮同步的进度折算为整条进度条的百分比（前置 10% + 传输 80% + 后置 10%）：
- *   前置 10% —— 扫描起步 3%，规划 6%，verify 校验在 4–8% 间按完成数推进，锁 9%；
- *   传输 80% —— 10%–90%，按「已完成字节 / 计划上传+下载字节」推进（与文件数无关；
- *               字节分母为 0 的空轮直接落 90%）；
- *   后置 10% —— 收尾阶段定格 95%（批量校验提交 / 基线落盘 / 清理，轮末即达 100%）。
- * 旧事件无 stage 时按 phase 回落；传输段在字节分母缺失时退回按文件数折算。
- */
-function syncRoundPercent(p: DirProgress | null): number {
-  if (!p) return 0
-  const stage = p.stage
-  if (stage === 'lockwait' || stage === 'lock') return 9
-  if (stage === 'finalize') return 95
-  if (stage === 'transfer' || (!stage && p.phase === 'transfer')) {
-    if (p.bytesTotal > 0) return Math.min(90, Math.round(10 + (p.bytesDone / p.bytesTotal) * 80))
-    if (!stage && p.filesTotal > 0) return Math.min(90, Math.round(10 + (p.filesDone / p.filesTotal) * 80))
-    return 90
-  }
-  if (stage === 'verify' || (!stage && p.phase === 'plan')) {
-    if (p.verifyTotal && p.verifyTotal > 0) return Math.round(4 + 4 * Math.min(1, (p.verifyDone ?? 0) / p.verifyTotal))
-    return 6
-  }
-  // scan（本地扫描无既定总量）：低位起步值，随规划 / 锁 / 传输逐段推进
-  return 3
-}
-
-/** 相对路径取末段文件名（当前任务展示用） */
-function baseNameOf(rel: string): string {
-  const i = rel.lastIndexOf('/')
-  return i >= 0 ? rel.slice(i + 1) : rel
-}
-
-/** 当前正在进行的任务文案（细分阶段 → 「正在…」；旧事件无 stage 时按 phase 回落） */
-function syncTaskText(p: DirProgress): string {
-  // 旧事件形态兼容：无 stage 时按粗粒度 phase 映射（phase 与 stage 口径一致，
-  // 绝不能把传输中的事件误标成「正在扫描」）
-  if (!p.stage) {
-    if (p.phase === 'plan') return '正在比对文件差异…'
-    if (p.phase === 'transfer') return '正在同步文件…'
-    return p.filesDone > 0 ? `正在扫描文件（已发现 ${p.filesDone} 个）…` : '正在扫描文件…'
-  }
-  switch (p.stage) {
-    case 'lockwait':
-      return '正在等待其他设备完成同步…'
-    case 'lock':
-      return '正在确认租约锁…'
-    case 'verify':
-      return p.verifyTotal && p.verifyTotal > 0 ? `正在校验文件内容（${p.verifyDone ?? 0}/${p.verifyTotal}）…` : '正在校验文件内容…'
-    case 'finalize':
-      return '正在完成收尾…'
-    case 'plan':
-      return '正在比对文件差异…'
-    case 'transfer': {
-      const name = p.currentFile ? baseNameOf(p.currentFile) : ''
-      if (p.currentOp === 'upload') return name ? `正在上传 ${name}` : '正在上传文件…'
-      if (p.currentOp === 'download') return name ? `正在下载 ${name}` : '正在下载文件…'
-      if (p.currentOp === 'delete-local' || p.currentOp === 'delete-remote') return name ? `正在删除 ${name}` : '正在删除文件…'
-      if (p.currentOp === 'rename-remote' || p.currentOp === 'rename-local') return name ? `正在同步改名 ${name}` : '正在同步改名…'
-      if (p.currentOp === 'conflict') return name ? `正在处理冲突 ${name}` : '正在处理冲突…'
-      return '正在同步文件…'
-    }
-    default:
-      // scan：附已发现文件数（无既定总量，不给百分比预期）
-      return p.filesDone > 0 ? `正在扫描文件（已发现 ${p.filesDone} 个）…` : '正在扫描文件…'
-  }
-}
-
 const pct = computed(() => syncRoundPercent(props.dir.progress))
 /** 当前任务文案（同步中才有意义；「正在同步…」兜底给无 progress 的排队态） */
 const taskText = computed(() => (props.dir.progress ? syncTaskText(props.dir.progress) : '正在同步…'))
@@ -101,6 +32,13 @@ const bytesText = computed(() => {
   if (!p || !p.bytesTotal) return ''
   return `${fmtBytes(p.bytesDone)} / ${fmtBytes(p.bytesTotal)}`
 })
+/**
+ * 本目录实时传输速率（调度器 1s 采样、EMA 平滑）：仅传输段展示 —— 扫描 / 规划 /
+ * 锁等待期没有文件内容流量，显示会误导；两个方向各自非零才出现对应一项。
+ */
+const dirSpeed = computed(() => (props.dir.progress?.stage === 'transfer' ? store.state.dirSpeeds[props.dir.id] || null : null))
+const speedUpText = computed(() => (dirSpeed.value && dirSpeed.value.upBps > 0 ? fmtSpeed(dirSpeed.value.upBps) : ''))
+const speedDownText = computed(() => (dirSpeed.value && dirSpeed.value.downBps > 0 ? fmtSpeed(dirSpeed.value.downBps) : ''))
 
 const enabled = computed(() => store.dirEnabled(props.dir))
 const syncing = computed(() => props.dir.status === 'syncing')
@@ -253,12 +191,29 @@ function onOpenSettings(close: () => void) {
   settingsOpen.value = true
 }
 
+/** 「移除同步」确认弹窗开关（「更多操作」菜单入口，替代原生 confirm） */
+const removeOpen = ref(false)
+/**
+ * 移除确认的第二段（armed 范式，与 RootLostModal 的删除确认同款交互语言）：
+ * 首次点确认只亮出后果说明，再点才执行移除；弹窗每次打开时重置。
+ */
+const removeArmed = ref(false)
+
+/** 打开「移除同步」确认弹窗（菜单先收起；后果说明见弹窗正文与 armed 提示条） */
 function onRemove(close: () => void) {
-  const d = props.dir
-  if (confirm(`不再同步「${d.name}」？电脑和云端的文件都不会被删除`)) {
-    store.removeDir(d.id)
-  }
   close()
+  removeOpen.value = true
+  removeArmed.value = false
+}
+
+/** 确认移除：第一点亮出后果文案（armed），第二点才真正移除 —— 移除只停同步，不动任何文件 */
+function confirmRemove() {
+  if (!removeArmed.value) {
+    removeArmed.value = true
+    return
+  }
+  removeOpen.value = false
+  store.removeDir(props.dir.id)
 }
 
 /**
@@ -275,6 +230,110 @@ function handleConflict() {
   // 本入口仅在 ?demo= 场景可见（详见 store.openConflictFor 注释）
   store.openConflictFor(props.dir)
 }
+
+/**
+ * 黄 / 红提示条的统一描述：六类条（demo 冲突 / 插件目录未发现 /
+ * 注册表对账降级 / 失败 / 云端文件夹丢失 / 待处理挂起）共用同一渲染块 —— 新增条只
+ * 加一个描述项，不再复制模板结构。完成摘要条（done strip）结构特殊（多段计数），
+ * 不并入本表。渲染顺序即数组顺序：失败条在根丢失条之前（后者置位时前者不显示），
+ * 待处理条最后 —— 与既有模板顺序一致。
+ */
+interface AlertStrip {
+  key: string
+  tone: 'warn' | 'error'
+  /** 悬浮完整内容（truncate 的兜底）；仅原本就有 title 的条携带 */
+  title?: string
+  /** 主文案（truncate） */
+  text: string
+  /** 第二行（失败条的首条具体原因，色阶弱一级） */
+  subText?: string
+  /** 动作链接（如「处理」「重试同步」） */
+  actionLabel?: string
+  onAction?: () => void
+  /** 「不再显示」关闭（情境指纹 / 会话内关闭由各 onDismiss 自理） */
+  dismissible?: boolean
+  onDismiss?: () => void
+}
+const alertStrips = computed<AlertStrip[]>(() => {
+  const d = props.dir
+  const out: AlertStrip[] = []
+  if (d.status === 'conflict' && d.conflictFile && !conflictStripClosed.value) {
+    out.push({
+      key: 'conflict',
+      tone: 'warn',
+      text: `${d.conflictFile} 这个文件在电脑和云端都被改过，请选择保留哪一个`,
+      actionLabel: '处理',
+      onAction: handleConflict,
+      dismissible: true,
+      onDismiss: () => {
+        conflictStripClosed.value = true
+      },
+    })
+  }
+  if (pluginUnavailableVisible.value) {
+    out.push({
+      key: 'plugin-unavailable',
+      tone: 'warn',
+      title: d.pluginSyncInfo?.reason || '',
+      text: d.pluginSyncInfo?.reason || '本机还没有找到 ZTools 插件目录，等 ZTools 创建后会自动开始同步',
+      dismissible: true,
+      onDismiss: () => {
+        store.state.prefs.pluginUnavailableDismissed = true
+      },
+    })
+  }
+  if (registrySyncStripVisible.value) {
+    out.push({
+      key: 'registry-sync',
+      tone: 'warn',
+      text:
+        d.pluginSyncInfo.registrySync === 'pending'
+          ? '已向 ZTools 提交「高级 API」授权申请，批准后插件将自动安装（无需重启，下一轮同步生效）'
+          : d.pluginSyncInfo.registrySync === 'denied'
+            ? '插件文件会同步，但自动安装需要 ZTools 支持权限申请（请升级 ZTools 或在设置中手动授权）'
+            : '当前 ZTools 版本不支持自动安装同步的插件（缺少内部 API），升级 ZTools 后恢复',
+      dismissible: true,
+      onDismiss: dismissRegistrySyncStrip,
+    })
+  }
+  if (d.status === 'error' && d.errorMessage && !rootLostOpen.value) {
+    out.push({
+      key: 'error',
+      tone: 'error',
+      title: d.errorDetail || d.errorMessage,
+      text: d.errorMessage,
+      subText: errDetailLine.value || undefined,
+      actionLabel: '重试同步',
+      onAction: () => store.syncDir(d),
+    })
+  }
+  if (rootLostOpen.value) {
+    out.push({
+      key: 'root-lost',
+      tone: 'error',
+      text: '云端的同步文件夹不见了，同步已暂停，等你确认是重新上传还是删除本地文件',
+      actionLabel: '处理',
+      onAction: openRootLost,
+    })
+  }
+  if (pendingStripVisible.value) {
+    out.push({
+      key: 'pending',
+      tone: 'warn',
+      text:
+        pendingDeleteOpen.value > 0
+          ? `${pendingOpen.value} 项等你处理（其中 ${pendingDeleteOpen.value} 项是删除，你确认前不会删除任何文件）`
+          : `${pendingOpen.value} 个文件两边都被改过，等你选择保留哪个`,
+      actionLabel: '处理',
+      onAction: () => {
+        pendingOpenModal.value = true
+      },
+      dismissible: true,
+      onDismiss: () => store.mutePendingStrip(d),
+    })
+  }
+  return out
+})
 
 /** 请求取消进行中的同步：置位取消标记，引擎在下一个检查点以「同步已中止」收场，状态回 idle */
 function onCancelSync() {
@@ -456,9 +515,11 @@ function onCancelSync() {
       <div class="flex items-center gap-2 min-w-0">
         <span class="text-[11px] font-medium text-btn-text truncate" :title="taskText">{{ taskText }}</span>
         <span class="flex-spacer" />
+        <span v-if="speedUpText" class="inline-flex items-center gap-[3px] font-mono text-[11px] text-ink-3 shrink-0"><AppIcon name="upload" :size="11" class="text-ink-4" />{{ speedUpText }}</span>
+        <span v-if="speedDownText" class="inline-flex items-center gap-[3px] font-mono text-[11px] text-ink-3 shrink-0"><AppIcon name="download" :size="11" class="text-ink-4" />{{ speedDownText }}</span>
         <span v-if="bytesText" class="font-mono text-[11px] text-ink-3 shrink-0">{{ bytesText }}</span>
         <span class="font-mono text-[11px] text-ink-3 shrink-0">{{ pct }}%</span>
-        <button type="button" class="cancel-btn" @click="onCancelSync">取消</button>
+        <button type="button" class="cancel-btn shrink-0" @click="onCancelSync">取消</button>
       </div>
       <div class="track">
         <div class="fill" :style="{ width: pct + '%' }" />
@@ -479,102 +540,30 @@ function onCancelSync() {
       </span>
     </div>
 
-    <!-- 冲突提示条（demo/兼容：真实同步的冲突经 onConflict 即时弹窗，status 不会停在 'conflict'） -->
-    <div v-if="dir.status === 'conflict' && dir.conflictFile && !conflictStripClosed" class="strip warn-strip rise-in-sm">
-      <AppIcon name="warn" :size="14" class="text-warning-icon" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{ dir.conflictFile }} 这个文件在电脑和云端都被改过，请选择保留哪一个</span>
-      <button type="button" class="inline-flex items-center gap-[3px] border-0 bg-transparent text-primary text-[11px] font-semibold shrink-0 py-[2px] px-0 [text-underline-offset:2px] hover:underline" @click="handleConflict">
-        处理
-        <AppIcon name="chevron-right" :size="10" />
-      </button>
-      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="conflictStripClosed = true">
-        <AppIcon name="close" :size="10" />
-      </AppIconButton>
-    </div>
-
-    <!-- 插件目录尚未发现（ZTools 未创建 / 环境异常）：说明性提示条，等待目录出现后自动恢复 -->
-    <div v-if="pluginUnavailableVisible" class="strip warn-strip rise-in-sm">
-      <AppIcon name="warn" :size="14" class="text-warning-icon" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep" :title="dir.pluginSyncInfo?.reason || ''">
-        {{ dir.pluginSyncInfo?.reason || '本机还没有找到 ZTools 插件目录，等 ZTools 创建后会自动开始同步' }}
-      </span>
-      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="store.state.prefs.pluginUnavailableDismissed = true">
-        <AppIcon name="close" :size="10" />
-      </AppIconButton>
-    </div>
-
-    <!-- 插件注册表对账降级提示条：实体同步照常，但自动登记（无感安装）未就绪。
-         pending = 已向宿主提交「高级 API」授权申请，等用户在设置页批准（批准后
-         实时生效，下一轮同步自动登记）；denied = 宿主无申请通道（旧版宿主，需
-         手动授权或升级）；unavailable = 旧版宿主没有内部 API 命名空间 -->
+    <!-- 黄 / 红提示条（数据驱动）：六类条共用同一结构（图标 + 文案 + 可选
+         动作 / 关闭），描述与显隐逻辑在 alertStrips（顺序、文案、悬浮 title 与
+         模板逐项对应） -->
     <div
-      v-if="registrySyncStripVisible"
-      class="strip warn-strip rise-in-sm"
+      v-for="s in alertStrips"
+      :key="s.key"
+      class="strip rise-in-sm"
+      :class="s.tone === 'error' ? 'error-strip' : 'warn-strip'"
     >
-      <AppIcon name="warn" :size="14" class="text-warning-icon" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">
-        {{
-          dir.pluginSyncInfo.registrySync === 'pending'
-            ? '已向 ZTools 提交「高级 API」授权申请，批准后插件将自动安装（无需重启，下一轮同步生效）'
-            : dir.pluginSyncInfo.registrySync === 'denied'
-              ? '插件文件会同步，但自动安装需要 ZTools 支持权限申请（请升级 ZTools 或在设置中手动授权）'
-              : '当前 ZTools 版本不支持自动安装同步的插件（缺少内部 API），升级 ZTools 后恢复'
-        }}
-      </span>
-      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="dismissRegistrySyncStrip">
-        <AppIcon name="close" :size="10" />
-      </AppIconButton>
-    </div>
-
-    <!-- 失败提示条：摘要 + 首条具体原因（完整细节折叠在悬浮 title），并提供「重试同步」；
-         云端文件夹丢失待决策时由下方专门提示条承载，不重复展示 -->
-    <div v-if="dir.status === 'error' && dir.errorMessage && !rootLostOpen" class="strip error-strip rise-in-sm">
-      <AppIcon name="warn" :size="14" class="text-danger shrink-0" />
-      <span class="flex-1 min-w-0 flex flex-col gap-[1px]" :title="dir.errorDetail || dir.errorMessage">
-        <span class="truncate text-[11px] text-[#b3261e]">{{ dir.errorMessage }}</span>
-        <span v-if="errDetailLine" class="truncate text-[10px] text-[#b3261e] opacity-80">{{ errDetailLine }}</span>
+      <AppIcon name="warn" :size="14" :class="s.tone === 'error' ? 'text-danger shrink-0' : 'text-warning-icon'" />
+      <span class="flex-1 min-w-0 flex flex-col gap-[1px]" :title="s.title">
+        <span class="truncate" :class="s.tone === 'error' ? 'text-[11px] text-[#b3261e]' : 'text-[11px] text-warning-deep'">{{ s.text }}</span>
+        <span v-if="s.subText" class="truncate text-[10px] text-[#b3261e] opacity-80">{{ s.subText }}</span>
       </span>
       <button
+        v-if="s.actionLabel"
         type="button"
         class="inline-flex items-center gap-[3px] border-0 bg-transparent text-primary text-[11px] font-semibold shrink-0 py-[2px] px-0 [text-underline-offset:2px] hover:underline"
-        @click="store.syncDir(props.dir)"
+        @click="s.onAction"
       >
-        重试同步
-      </button>
-    </div>
-
-    <!-- 云端文件夹丢失待决策条：引擎已停止该目录同步（零删除零传输），点开决策弹窗二选一 -->
-    <div v-if="rootLostOpen" class="strip error-strip rise-in-sm">
-      <AppIcon name="warn" :size="14" class="text-danger" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-[#b3261e]">云端的同步文件夹不见了，同步已暂停，等你确认是重新上传还是删除本地文件</span>
-      <button
-        type="button"
-        class="inline-flex items-center gap-[3px] border-0 bg-transparent text-primary text-[11px] font-semibold shrink-0 py-[2px] px-0 [text-underline-offset:2px] hover:underline"
-        @click="openRootLost"
-      >
-        处理
+        {{ s.actionLabel }}
         <AppIcon name="chevron-right" :size="10" />
       </button>
-    </div>
-
-    <!-- 待处理挂起条：后台轮 defer 的冲突 + 批量删除超阈值的确认挂起，回窗口统一处理；
-         关闭（不再显示）后出现更新的挂起会重新显示 -->
-    <div v-if="pendingStripVisible" class="strip warn-strip rise-in-sm">
-      <AppIcon name="warn" :size="14" class="text-warning-icon" />
-      <span class="flex-1 min-w-0 truncate text-[11px] text-warning-deep">{{
-        pendingDeleteOpen > 0
-          ? `${pendingOpen} 项等你处理（其中 ${pendingDeleteOpen} 项是删除，你确认前不会删除任何文件）`
-          : `${pendingOpen} 个文件两边都被改过，等你选择保留哪个`
-      }}</span>
-      <button
-        type="button"
-        class="inline-flex items-center gap-[3px] border-0 bg-transparent text-primary text-[11px] font-semibold shrink-0 py-[2px] px-0 [text-underline-offset:2px] hover:underline"
-        @click="pendingOpenModal = true"
-      >
-        处理
-        <AppIcon name="chevron-right" :size="10" />
-      </button>
-      <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="store.mutePendingStrip(props.dir)">
+      <AppIconButton v-if="s.dismissible" :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click="s.onDismiss">
         <AppIcon name="close" :size="10" />
       </AppIconButton>
     </div>
@@ -588,6 +577,35 @@ function onCancelSync() {
     <!-- 选择性同步树（勾选面板）与预演结果（只读摘要）：「更多操作」菜单入口 -->
     <SyncTreeModal v-if="treeOpen" :dir="dir" @close="treeOpen = false" />
     <DryRunModal v-if="dryRunOpen" :dir="dir" @close="dryRunOpen = false" />
+
+    <!-- 移除同步确认弹窗（两段式 armed 确认，替代原生 confirm）：Teleport 到 body，
+         遮罩覆盖整个插件窗口（与 DirFormModal 同因：行内 relative 容器会裁住 AppModal 的 absolute 遮罩）；
+         AppModal 挂载期间自动接入全局 ESC 退层栈 -->
+    <Teleport to="body">
+      <Transition name="modal-pop">
+        <AppModal
+          v-if="removeOpen"
+          title="移除同步"
+          :subtitle="`不再同步「${dir.name}」`"
+          :width="400"
+          @close="removeOpen = false"
+        >
+          <div class="flex flex-col gap-[10px]">
+            <p class="m-0 text-[12px] text-ink-2 leading-[1.55]">
+              移除后这个文件夹不再自动同步，也不会出现在同步列表里；电脑和云端的文件都不会被删除，之后想继续同步可以重新添加。
+            </p>
+            <div v-if="removeArmed" class="armed-note">
+              <AppIcon name="warn" :size="12" class="shrink-0 text-danger" />
+              <span>再点一次「确认移除」。电脑和云端的文件都不会被删除</span>
+            </div>
+          </div>
+          <template #footer>
+            <AppButton size="sm" @click="removeOpen = false">取消</AppButton>
+            <AppButton size="sm" :variant="removeArmed ? 'danger' : 'primary'" @click="confirmRemove">{{ removeArmed ? '确认移除' : '移除同步' }}</AppButton>
+          </template>
+        </AppModal>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -694,7 +712,8 @@ function onCancelSync() {
   background: var(--text-muted);
 }
 
-/* 取消同步：次要文字按钮（同步进行中可见），悬停转危险色提示后果 */
+/* 取消同步：次要文字按钮（同步进行中可见），悬停转危险色提示后果；shrink-0
+ * 防止窄窗口下被速率 / 字节段挤得竖排换行 */
 .cancel-btn {
   border: none;
   background: transparent;
@@ -702,6 +721,7 @@ function onCancelSync() {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-muted);
+  white-space: nowrap;
   transition: color 0.12s ease;
 
   &:hover {
@@ -781,6 +801,20 @@ function onCancelSync() {
   height: 3px;
   border-radius: 2px;
   background: var(--green-dot-br);
+}
+
+/* 移除确认弹窗的二段式提示条（与 RootLostModal 的 armed-note 同款视觉） */
+.armed-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--red-strip-bg, #fdf0ef);
+  border: 1px solid var(--red-strip-br, #f3cfcb);
+  font-size: 11px;
+  color: #b3261e;
+  line-height: 1.45;
 }
 
 /* ---------- 更多操作菜单（AppDropdown 面板内） ---------- */

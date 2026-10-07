@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton, AppModal } from './ui'
 import { useStore } from '../composables/store'
-import { fmtBytes } from '../composables/format'
+import { fmtBytes, relBaseName } from '../composables/format'
 import type { SyncDir } from '../env.d'
 
 /**
@@ -45,7 +45,6 @@ const errors = ref<Array<{ rel: string; message: string }>>([])
 const showError = ref('')
 /** 「取消同步」集合（祖先命中即整棵子树排除；与 dir.overrides.excludeRels 同形） */
 const off = ref<Set<string>>(new Set())
-const saving = ref(false)
 /** 已有的 glob 排除规则条数（树上不展示，但仍然生效 —— 提示避免「勾了还不同步」的困惑） */
 const globRuleCount = computed(() => {
   const o = props.dir.overrides
@@ -64,7 +63,7 @@ function buildTree(
   const ensureDir = (rel: string): TreeNode => {
     let node = byRel.get(rel)
     if (node) return node
-    node = { rel, name: rel.split('/').pop() || rel, isDir: true, size: 0, children: [], open: false }
+    node = { rel, name: relBaseName(rel), isDir: true, size: 0, children: [], open: false }
     byRel.set(rel, node)
     const i = rel.lastIndexOf('/')
     if (i < 0) root.push(node)
@@ -73,7 +72,7 @@ function buildTree(
   }
   for (const e of entries) {
     if (hidden(e.rel)) continue
-    const node: TreeNode = { rel: e.rel, name: e.rel.split('/').pop() || e.rel, isDir: e.isDir, size: e.size, children: [], open: false }
+    const node: TreeNode = { rel: e.rel, name: relBaseName(e.rel), isDir: e.isDir, size: e.size, children: [], open: false }
     byRel.set(e.rel, node)
     const i = e.rel.lastIndexOf('/')
     if (i < 0) root.push(node)
@@ -91,8 +90,16 @@ async function load() {
   loading.value = true
   showError.value = ''
   tree.value = null
+  // 窄化到局部常量再进 try：无 preload（浏览器预览）时按加载失败收场，与原先
+  // 直取抛错进 catch 的路径同去处
+  const services = window.services
+  if (!services) {
+    showError.value = '浏览器预览模式没有连接服务器的能力'
+    loading.value = false
+    return
+  }
   try {
-    const r = await window.services.dav.listTree(store.dirEngineCfg(props.dir), props.dir.remotePath, store.dirSyncPrefs(props.dir).ignoreHidden)
+    const r = await services.dav.listTree(store.dirEngineCfg(props.dir), props.dir.remotePath, store.dirSyncPrefs(props.dir).ignoreHidden)
     complete.value = r.complete === true
     errors.value = r.errors || []
     tree.value = buildTree(r.entries || [], store.dirSyncPrefs(props.dir).ignoreHidden)
@@ -228,8 +235,10 @@ const flatRows = computed<FlatRow[]>(() => {
               <AppIcon :name="row.node.open ? 'chevron-down' : 'chevron-right'" :size="11" />
             </button>
             <span v-else class="twist" />
+            <!-- toggle 只绑 label：input 点击/空格的合成 click 会冒泡到 label，双绑会一加一减互相抵消；
+                 label 的 .prevent 阻止把点击转发给内部 input 的默认行为，勾选状态以 :checked 为唯一来源 -->
             <label class="flex min-w-0 flex-1 cursor-pointer items-center gap-[6px]" @click.prevent="toggle(row.node)">
-              <input type="checkbox" class="tree-check" :checked="!isOff(row.node.rel)" :disabled="!complete" @click.prevent="toggle(row.node)" />
+              <input type="checkbox" class="tree-check" :checked="!isOff(row.node.rel)" :disabled="!complete" />
               <AppIcon :name="row.node.isDir ? 'folder' : 'file'" :size="12" class="shrink-0 text-ink-4" />
               <span class="truncate text-[12px] text-ink-1">{{ row.node.name }}</span>
               <span v-if="!row.node.isDir && row.node.size" class="ml-auto shrink-0 text-[10px] text-ink-4">{{ fmtBytes(row.node.size) }}</span>
@@ -245,7 +254,7 @@ const flatRows = computed<FlatRow[]>(() => {
 
     <template #footer>
       <AppButton variant="ghost" @click="emit('close')">取消</AppButton>
-      <AppButton :disabled="loading || !!showError || !complete || saving" @click="save">保存</AppButton>
+      <AppButton :disabled="loading || !!showError || !complete" @click="save">保存</AppButton>
     </template>
   </AppModal>
 </template>

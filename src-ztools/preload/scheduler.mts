@@ -37,8 +37,13 @@ import nodeTimers from 'node:timers'
 import * as store from './store.mts'
 import { getHostPorts } from './host.mts'
 import { ZTOOLS_PLUGINS_DIR_ID, describeZtoolsPluginsSync } from './ztools-plugins.mts'
+import { resolveDirPrefs } from './types.mts'
 import { reconcilePluginRegistry } from './ztools-registry.mts'
+import { netTraffic } from './svc/net.mts'
 import type { ConflictChoice, ConflictInfo, Prefs, RoundDisplay, SchedulerApi, SchedulerEvent, SchedulerSnapshot, SchedulerSlotView, SyncProgress, SyncSummary } from './types.mts'
+// 仅类型导入（编译期擦除，不构成对 services 的运行时依赖 / 循环 require）：
+// SchedulerEngine.syncDirectory 的签名与引擎侧 syncDirectory 完全同形
+import type { DirCfg, EngineCfg, EnginePrefs, SyncHandlers } from './services.mts'
 
 const fsp = fs.promises
 
@@ -92,8 +97,8 @@ export interface SchedulerConfig {
 
 /** 引擎注入（services 挂载时提供；本模块不反向依赖 services） */
 export interface SchedulerEngine {
-  /** 执行一轮同步（cfg / dir / prefs / handlers 与 syncDirectory 同形） */
-  syncDirectory(cfg: any, dir: any, prefs: any, handlers: any): Promise<SyncSummary>
+  /** 执行一轮同步（cfg / dir / prefs / handlers 与 syncDirectory 同形，类型即引擎侧导出） */
+  syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, handlers: SyncHandlers): Promise<SyncSummary>
   /** 注册目录监听（watcherId 由调度器命名） */
   watchDir(watcherId: string, localPath: string, onChange: () => void): boolean
   /** 停止监听 */
@@ -140,7 +145,7 @@ export interface SchedulerOpts {
 export type TimerHandle = { unref?(): void } | NodeJS.Timeout | number | undefined
 /**
  * 注入式计时器（node:timers 的最小子集；测试假 timer 队列同形）。
- * 成员用「属性 : 函数类型」而非方法简写 —— 计时器静态检查（U16 / B2A-S）按
+ * 成员用「属性 : 函数类型」而非方法简写 —— 单测与 e2e 的计时器静态检查按
  * 「行首裸计时器名 + 左括号」识别调用点，方法简写会被误判为裸调用。
  */
 export interface InjectedTimers {
@@ -155,13 +160,22 @@ export interface TimerEntry {
   dispose(): void
 }
 
+/**
+ * 自动调度来源的封闭集合（单一事实源）：interval 定时轮、startup 新目录首轮、
+ * watch 监听触发轮、follow-up 开放意图补跟轮、yield-retry 让出重排轮、backoff
+ * 退避轮。startRound 的 leader 轮首复核与 executeRound 的自动 / 手动分流（锁等待
+ * 上限）共用，DirSlot.nextDueKind 的类型联合亦由本数组派生 —— 新增自动来源时
+ * 三处手抄收敛为改这一处。
+ */
+const AUTO_KINDS = ['interval', 'startup', 'watch', 'follow-up', 'yield-retry', 'backoff'] as const
+
 /** DirSlot 状态机（调度侧每目录的全部运行时状态） */
 export interface DirSlot {
   id: string
   dir: SchedulerDirCfg
   state: 'idle' | 'scheduled' | 'queued' | 'running'
   nextDueAt: number | null
-  nextDueKind: 'interval' | 'startup' | 'watch' | 'backoff' | 'follow-up' | 'yield-retry' | null
+  nextDueKind: typeof AUTO_KINDS[number] | null
   rerunPending: boolean
   cancelRequested: boolean
   lastRound: { endedAt: number; summary: SyncSummary | null; error: string | null } | null
@@ -178,6 +192,11 @@ export interface DirSlot {
   lastNotifyFp: string | null
   /** 新目录首轮待发射（reload 新增目录 → leader 态 tick 发射 'startup' 轮） */
   startupPending: boolean
+  /**
+   * 本轮流量袋（executeRound / fallbackRun 挂到 cfg.__wdsyncTraffic 的同一对象引用，
+   * 网络层随字节流累加）：1s 采样器据此折算「每目录实时速率」；轮末 settleRound 清空。
+   */
+  traffic: { upBytes: number; downBytes: number } | null
 }
 
 /** 队列元素（全局 FIFO；manual/watch 直插队首受公平上限约束） */
@@ -252,7 +271,7 @@ interface ManualTriple {
   receipt?: ManualOp
 }
 
-// ---------- 常量（导出供测试与文档引用） ----------
+// ---------- 常量（导出供测试断言引用） ----------
 
 /** 调度 tick 周期：按时间戳扫描到期目录（unref；睡眠唤醒后第一拍自然补跑） */
 const TICK_MS = 1000
@@ -314,6 +333,14 @@ const PROGRESS_MIN_INTERVAL_MS = 250
 /** 自动轮等待目录锁的上限（超时改为 +2s 重排，不阻塞全局队列）；手动 / 委托轮更长 */
 const DIR_LOCK_AUTO_MAX_WAIT_MS = 5000
 const DIR_LOCK_MANUAL_MAX_WAIT_MS = 92000
+/**
+ * 手动轮冲突转发等待渲染层应答的 TTL（分钟级）：轮开始时渲染层在线、转发后渲染层
+ * 消失（渲染进程崩溃 / 关闭 —— 多实例模型下发不出卸载事件，cleanup 设计上不被
+ * 调用，见文件头）时无人应答，引擎 onConflict 的 await 将永久挂起，手动轮与目录
+ * 锁悬挂到进程退出。分钟级给足「用户看着弹窗犹豫」的常态时长，超时按「渲染层未
+ * 回应」以 'defer' 结算（见 forwardConflict）。
+ */
+const CONFLICT_FORWARD_TTL_MS = 5 * 60 * 1000
 
 /**
  * 模块级活动定时器登记表：元素为 { dispose() }（由各实例的 timer kit 注册）。
@@ -577,9 +604,13 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    */
   function realSleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const handle = nodeTimers.setTimeout(resolve, ms)
+      const box: { entry: TimerEntry | null } = { entry: null }
+      const handle = nodeTimers.setTimeout(() => {
+        if (box.entry) box.entry.dispose()
+        resolve()
+      }, ms)
       if (handle && typeof handle === 'object' && typeof handle.unref === 'function') handle.unref()
-      makeTimer(() => nodeTimers.clearTimeout(handle as NodeJS.Timeout))
+      box.entry = makeTimer(() => nodeTimers.clearTimeout(handle as NodeJS.Timeout))
     })
   }
 
@@ -750,26 +781,14 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     return base
   }
 
-  /** 目录生效的同步参数（与渲染层 dirSyncPrefs 同一优先级口径；overrides 优先，未覆盖项回落全局偏好） */
+  /**
+   * 目录生效的同步参数（与渲染层 dirSyncPrefs 同一优先级口径；overrides 优先，
+   * 未覆盖项回落全局偏好）。优先级合并与畸形值防御（dbStorage 读到的原始
+   * JSON：数值取整 / 布尔归一 / 数组校验）统一在 types.mts 的 resolveDirPrefs
+   * —— 前后端单一口径，本函数只负责喂入 slot 的覆盖与全局偏好。
+   */
   function prefsOf(slot: DirSlot) {
-    const p = (config && config.prefs) || {}
-    const o = slot.dir.overrides || {}
-    return {
-      ignoreHidden: o.ignoreHidden != null ? o.ignoreHidden : p.ignoreHidden != null ? p.ignoreHidden : true,
-      concurrency: Number(o.concurrency) > 0 ? Math.floor(Number(o.concurrency)) : Number(p.concurrency) > 0 ? Number(p.concurrency) : 4,
-      conflictStrategy: o.conflictStrategy || p.conflictStrategy || 'ask',
-      verifyMaxBytes: p.verifyMaxBytes,
-      deepVerify: o.deepVerify != null ? o.deepVerify : p.deepVerify,
-      deepVerifyDays: p.deepVerifyDays,
-      adoptVerifyBudgetBytes: p.adoptVerifyBudgetBytes,
-      leaseLock: o.leaseLock != null ? o.leaseLock !== false : p.leaseLock !== false,
-      // 用户排除规则：数组形态透传给引擎扫描层（compileExcludePatterns）；
-      // 目录级覆盖整体替换全局规则（数组语义「全集」，不做两表合并）
-      excludePatterns: Array.isArray(o.excludePatterns) ? o.excludePatterns : Array.isArray(p.excludePatterns) ? p.excludePatterns : undefined,
-      // 勾选树「取消同步」的精确 rel（目录级字段，无全局形态）：与 excludePatterns
-      // 在引擎扫描层合并生效（compileSyncExcludes —— 字面精确匹配，祖先目录命中即整棵子树）
-      excludeRels: Array.isArray(o.excludeRels) ? o.excludeRels : undefined,
-    }
+    return resolveDirPrefs(slot.dir.overrides, config && config.prefs)
   }
 
   // ---------- dbStorage 读取与配置应用 ----------
@@ -897,6 +916,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       watchHeld: false,
       lastNotifyFp: null,
       startupPending: false,
+      traffic: null,
     }
   }
 
@@ -912,6 +932,13 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     const prevSlots = slots
     configV = v
     config = cfg
+    // 目录锁键缓存全量失效：configV 自检已保证只在配置**真变**时走到这里，全量清
+    // 一次的代价可忽略（每目录下次取锁多一次 getDeviceId + hash16）。一次 clear
+    // 覆盖三类情形：① 目录路径变化（normalizeLocalKey/RemoteKey 输入变 → 键必变，
+    // 旧缓存会让新旧路径各持一把锁失去互斥）；② 服务器 URL / serverId 变化
+    //（originOf 输入变，同上）；③ 已删除目录的 Map 条目回收（不清则按 dirId 永久
+    // 泄漏 —— cache 键是 slot.id，slot 删除时无人摘除）。
+    dirLockHashCache.clear()
     ready = true
     everLoaded = true
     notReadyReason = null
@@ -926,7 +953,16 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         prevSlots.set(d.id, newSlotState(d.id, d))
       }
     }
-    for (const dirId of Array.from(prevSlots.keys())) if (!cfg.dirs.some((d) => d.id === dirId)) prevSlots.delete(dirId)
+    // 删除目录：除了摘 slot 与 watcher，还必须冲刷该目录的轮末等待者 —— slot 一旦
+    // 出表，其 rerun 预订（watch 重排）永不被 tick 扫到（tick 只遍历 slots），等待
+    // 「该目录下一次轮末」的 syncNow / rerun 等待者将永久悬挂（见 failWaitersFor）。
+    // 文案与 pumpQueue 丢弃已移除目录 job（1787 附近）、委托回执「目录已被移除」
+    // 的既有用例保持一致。
+    for (const dirId of Array.from(prevSlots.keys())) {
+      if (cfg.dirs.some((d) => d.id === dirId)) continue
+      prevSlots.delete(dirId)
+      failWaitersFor(dirId, new Error('这个同步文件夹已被移除'))
+    }
     for (const dirId of Array.from(watcherRegs.keys())) if (!prevSlots.has(dirId)) stopWatcherFor(dirId)
     for (const slot of prevSlots.values()) {
       if (!dirEligible(slot)) {
@@ -1810,6 +1846,27 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     roundWaiters.push({ dirId: slot.id, afterSeq: slot.roundSeq, resolve })
   }
 
+  /**
+   * 以错误收场某目录的全部轮末等待者（倒序 splice + try/catch 包 resolve ——
+   * 与 becomeLost / suspend / cleanup 的既有冲刷范本同构，resolve 抛错不外传）。
+   * 删除目录必须调用本助手：slot 移出 slots 表后，其 rerun 预订永不被 tick 扫到，
+   * 等待者若不冲刷将永久悬挂（syncNow 的 Promise 永不 settle）。对在飞轮随后
+   * 正常 settle 的场景，提前冲刷不破坏语义 —— 等待者已 splice 出表（settleRound
+   * 的唤醒循环找不到它，不重复 resolve），且 Promise 本身只结算一次。
+   */
+  function failWaitersFor(dirId: string, err: Error): void {
+    for (let i = roundWaiters.length - 1; i >= 0; i--) {
+      const w = roundWaiters[i]
+      if (w.dirId !== dirId) continue
+      roundWaiters.splice(i, 1)
+      try {
+        w.resolve({ error: err })
+      } catch (_) {
+        /* 忽略 */
+      }
+    }
+  }
+
   /** 系统通知（挂起冲突提醒）：经宿主端口尽力而为（默认端口内部已吞异常、缺接口 no-op），异常不打断调度 */
   function notifyBestEffort(body: string): void {
     try {
@@ -1934,6 +1991,8 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     slot.state = 'idle'
     slot.progress = null
     slot.cancelRequested = false
+    // 本轮流量袋随轮释放（采样器对非 running slot 不再采样，基线表同步收敛）
+    slot.traffic = null
     // 真实轮对目录做了全量对比同步，退避期合并的 watch 变化已被吸收；skipped /
     // concurrent / 预演轮没有真正同步，保留 watchHeld 待下一轮吸收
     if (!skipped && !concurrent && !dryRun) slot.watchHeld = false
@@ -2041,7 +2100,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     const jobRec = { slot, kind, origin: originOf(slot) }
     runningJobs.push(jobRec) // 同步注册：泵在首个 await 前即可见到本 job 占用的 origin
     try {
-      if (kind === 'interval' || kind === 'startup' || kind === 'watch' || kind === 'follow-up' || kind === 'yield-retry' || kind === 'backoff') {
+      if ((AUTO_KINDS as readonly string[]).includes(kind)) {
         if (leaderState !== 'leader' || !ownerRef.valid || !(await leaderLockIsMine())) {
           if (leaderState === 'leader') becomeLost('轮首复核：锁不归属本实例')
           settleRound(slot, kind, { skipped: true })
@@ -2084,8 +2143,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
    *        同步记录落预演触发；脏路径快照不携带 —— 预演恒全量扫描）
    */
   async function executeRound(slot: DirSlot, kind: string, op?: 'pull' | 'push' | 'pull-full' | 'push-full' | null, dryRun?: boolean): Promise<RoundOutcome> {
-    const isAuto =
-      kind === 'interval' || kind === 'startup' || kind === 'watch' || kind === 'follow-up' || kind === 'yield-retry' || kind === 'backoff'
+    const isAuto = (AUTO_KINDS as readonly string[]).includes(kind)
     const h = await dirLockHashFor(slot)
     // 进度发射器提前到锁等待之前：等待目录锁（他机 / 他实例正在同步该目录）期间
     // 发 lockwait 细分阶段 —— UI 显示「正在等待其他设备完成同步…」而不是无进度的空转
@@ -2128,7 +2186,15 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
           dirty = null // 引擎侧异常按「无提示」处理（回落全量扫描，语义安全）
         }
       }
-      const summary = await engine.syncDirectory(cfgOf(slot), slot.dir, prefsOf(slot), {
+      // cfgOf / prefsOf 展开服务器条目与 overrides（Record<string, unknown> 键取值静态
+      // 类型为 unknown），结构是 EngineCfg / EnginePrefs 的运行时形态但静态类型无法
+      // 证明 —— 调用侧断言收窄，不改这两个函数。slot.dir（SchedulerDirCfg）只缺
+      // DirCfg 的索引签名（接口不带隐式索引，连 as 的重叠判定也过不了），与 cfgOf
+      // 同因经 unknown 双重断言
+      // 本轮流量袋装配 + 采样器就位（见 attachRoundTraffic 注释）；settleRound 轮末清空
+      const roundCfg = cfgOf(slot) as unknown as EngineCfg
+      attachRoundTraffic(slot, roundCfg)
+      const summary = await engine.syncDirectory(roundCfg, slot.dir as unknown as DirCfg, prefsOf(slot) as EnginePrefs, {
         onProgress: progressAt,
         shouldAbort: () => slot.cancelRequested || !ownerRef.valid,
         // 预演轮不转发冲突（引擎侧不询问），回调仅为防御性兜底
@@ -2169,14 +2235,172 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     }
   }
 
+  // ---------- 实时速率采样（net-speed 事件） ----------
+  //
+  // 进度事件按「文件完成」节流外发，单个大文件传输期间数秒无事件 —— 速率不能
+  // 从进度事件折算。网络层在字节流上累计全局流量（netTraffic）与每轮流量袋
+  // （cfg.__wdsyncTraffic），本采样器按 1s 周期做差分 → EMA 平滑 → net-speed
+  // 事件外发，与进度事件通道完全解耦（大文件传输中速率照常跳动）。
+
+  /** 速率采样周期（ms）：1s 粒度对「实时」足够，事件量可忽略 */
+  const NET_SPEED_SAMPLE_MS = 1000
+  /** 速率 EMA 平滑系数：瞬时值权重（1s 采样下 0.5 ≈ 2s 时间常数，抖动与响应性平衡） */
+  const NET_SPEED_EMA = 0.5
+  /** 速率归零下限（字节/秒）：低于视为 0 —— 传输收尾的 EMA 衰减尾不再显示假速度 */
+  const NET_SPEED_FLOOR_BPS = 512
+  /** 连续无流量的采样拍数：达到即硬归零（EMA 减半衰减太慢，收尾后假速度会拖 10 秒以上） */
+  const NET_SPEED_ZERO_TICKS = 2
+
+  /** 单方向差分基线 + 平滑值 */
+  interface SpeedChan {
+    /** 上次采样的累计字节数（差分基线） */
+    last: number
+    /** EMA 平滑后的速率（字节/秒） */
+    bps: number
+    /** 连续「本拍零流量」计数（达到 NET_SPEED_ZERO_TICKS 硬归零） */
+    zeros: number
+  }
+
+  /** 一路采样（全局 / 每目录同形）：两方向 + 采样时刻 */
+  interface SpeedSample {
+    up: SpeedChan
+    down: SpeedChan
+    at: number
+  }
+
+  /** 采样器运行态：全局一路 + 每运行中目录一路；timer 为 null = 采样器停止 */
+  const speedState = {
+    global: { up: { last: 0, bps: 0, zeros: 0 }, down: { last: 0, bps: 0, zeros: 0 }, at: 0 } as SpeedSample,
+    perDir: new Map<string, SpeedSample>(),
+    timer: null as TimerEntry | null,
+    /** 上一次采样是否外发过非零速率（归零沿只补发一次全零事件） */
+    active: false,
+  }
+
+  /** 单方向推进：差分 → 瞬时速率 → EMA 平滑；低于下限或连续零流量拍硬归零 */
+  function speedStep(c: SpeedChan, totalBytes: number, dtSec: number): void {
+    const inst = Math.max(0, totalBytes - c.last) / dtSec
+    c.last = totalBytes
+    if (inst > 0) {
+      c.zeros = 0
+      c.bps = c.bps * (1 - NET_SPEED_EMA) + inst * NET_SPEED_EMA
+      // 锁文件等小体积请求的瞬时速率没有展示意义：低于下限直接按 0
+      if (c.bps < NET_SPEED_FLOOR_BPS) c.bps = 0
+    } else if (++c.zeros >= NET_SPEED_ZERO_TICKS || c.bps < NET_SPEED_FLOOR_BPS) {
+      c.bps = 0
+    } else {
+      c.bps *= 1 - NET_SPEED_EMA
+    }
+  }
+
+  /** 新建一路采样：差分基线取当前累计值（历史流量不计入首拍突发） */
+  function speedSampleOf(totalUp: number, totalDown: number, t: number): SpeedSample {
+    return { up: { last: totalUp, bps: 0, zeros: 0 }, down: { last: totalDown, bps: 0, zeros: 0 }, at: t }
+  }
+
+  /**
+   * 轮体装配（executeRound / fallbackRun 共用）：把本轮流量袋挂到 cfg 与 slot
+   *（同一对象引用，网络层随字节流累加）、启动采样器，并以零基线种下该目录的
+   * 采样路 —— 基线为 0 使首拍差分即覆盖「自轮首起的全部流量」，慢轮快轮都不漏。
+   */
+  function attachRoundTraffic(slot: DirSlot, cfg: EngineCfg): void {
+    cfg.__wdsyncTraffic = { upBytes: 0, downBytes: 0 }
+    slot.traffic = cfg.__wdsyncTraffic
+    ensureSpeedSampler()
+    speedState.perDir.set(slot.id, speedSampleOf(0, 0, now()))
+  }
+
+  /** 启动 1s 采样器（幂等）：差分基线取当前累计值，历史流量不造成首拍假突发 */
+  function ensureSpeedSampler(): void {
+    if (speedState.timer) return
+    speedState.global = speedSampleOf(netTraffic.upBytes, netTraffic.downBytes, now())
+    speedState.perDir.clear()
+    speedState.timer = kit.every(() => speedTick(), NET_SPEED_SAMPLE_MS)
+  }
+
+  /** 停止采样器并清空每目录基线（归零沿 / 全部轮次结束后调用） */
+  function stopSpeedSampler(): void {
+    if (speedState.timer) {
+      speedState.timer.dispose()
+      speedState.timer = null
+    }
+    speedState.perDir.clear()
+    speedState.active = false
+  }
+
+  /** 采样一拍：全局与运行中目录各做差分，非零则外发 net-speed；空闲且无在飞轮则停表 */
+  function speedTick(): void {
+    const st = speedState
+    const t = now()
+    const dt = Math.max(0.2, (t - st.global.at) / 1000)
+    speedStep(st.global.up, netTraffic.upBytes, dt)
+    speedStep(st.global.down, netTraffic.downBytes, dt)
+    st.global.at = t
+    // 每目录只对「运行中且挂了流量袋」的 slot 采样；基线表收敛到当前运行集合
+    const running = new Set<string>()
+    for (const slot of slots.values()) {
+      if (slot.state !== 'running' || !slot.traffic) continue
+      running.add(slot.id)
+      let s = st.perDir.get(slot.id)
+      if (!s) {
+        s = speedSampleOf(slot.traffic.upBytes, slot.traffic.downBytes, t)
+        st.perDir.set(slot.id, s)
+      }
+      speedStep(s.up, slot.traffic.upBytes, dt)
+      speedStep(s.down, slot.traffic.downBytes, dt)
+      s.at = t
+    }
+    for (const id of Array.from(st.perDir.keys())) {
+      if (!running.has(id)) st.perDir.delete(id)
+    }
+    const dirs: Record<string, { upBps: number; downBps: number }> = {}
+    for (const [id, s] of st.perDir) {
+      if (s.up.bps > 0 || s.down.bps > 0) dirs[id] = { upBps: Math.round(s.up.bps), downBps: Math.round(s.down.bps) }
+    }
+    const gActive = st.global.up.bps > 0 || st.global.down.bps > 0
+    if (gActive) {
+      st.active = true
+      emit({ type: 'net-speed', upBps: Math.round(st.global.up.bps), downBps: Math.round(st.global.down.bps), dirs })
+    } else if (st.active) {
+      // 归零沿：补发一次全零（渲染层随即隐藏速率显示）
+      st.active = false
+      emit({ type: 'net-speed', upBps: 0, downBps: 0, dirs: {} })
+    }
+    // 停表条件：无在飞轮且速率已归零（EMA 衰减尾走完）—— 在飞轮存在时保持运转，
+    // 文件间隙（传输下一文件前的规划 / 校验）不算空闲
+    if (!running.size && !gActive) stopSpeedSampler()
+  }
+
   /**
    * 手动轮的冲突转发：本机渲染层订阅在线时把冲突交给渲染层弹窗，等待用户经
    * resolveConflict 应答（引擎询问串行化，同一时刻至多一个在等）。
+   *
+   * TTL 兜底（真实时钟）：转发后渲染层消失（崩溃 / 关闭且 cleanup 不被调用 ——
+   * 设计假设，见文件头多实例模型）时永无应答，引擎询问与目录锁将悬挂到进程退出；
+   * 超时按「渲染层未回应」以 'defer' 结算 —— 与无处理器路径（onConflict 恒返回
+   * 'defer'）同一返回值，语义 = 挂到待处理中心、两侧保持原样，用户稍后决定，
+   * 安全侧不丢数据。定时器走 node:timers 真实通道（轮体 IO 语义，与 realSleep
+   * 同款 —— 假时钟冻结的测试里也要能到期，防挂死），句柄经 makeTimer 登记；
+   * 渲染层应答 / TTL 到期 / cleanup 冲刷任一先结算即清定时器与等待表条目，
+   * 不留泄漏（Promise 只结算一次，晚到的重复 settle 无害）。
    */
   function forwardConflict(slot: DirSlot, info: ConflictInfo): Promise<ConflictChoice> {
     return new Promise((resolve) => {
       const conflictId = randomId()
-      conflictResolvers.set(conflictId, resolve)
+      const box: { entry: TimerEntry | null } = { entry: null }
+      let settled = false
+      const settle = (choice: ConflictChoice) => {
+        if (settled) return
+        settled = true
+        if (box.entry) box.entry.dispose()
+        if (conflictResolvers.get(conflictId) === settle) conflictResolvers.delete(conflictId)
+        resolve(choice)
+      }
+      conflictResolvers.set(conflictId, settle)
+      // 先武装 TTL 再发事件：同步订阅者若在 emit 内即刻应答，settle 才来得及清掉刚武装的句柄
+      const handle = nodeTimers.setTimeout(() => settle('defer'), CONFLICT_FORWARD_TTL_MS)
+      if (handle && typeof handle === 'object' && typeof handle.unref === 'function') handle.unref()
+      box.entry = makeTimer(() => nodeTimers.clearTimeout(handle as NodeJS.Timeout))
       emit({ type: 'conflict', conflictId, dirId: slot.id, info })
     })
   }
@@ -2210,7 +2434,12 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     slot.state = 'running'
     emitSlot(slot, true)
     try {
-      const summary = await engine.syncDirectory(cfgOf(slot), slot.dir, prefsOf(slot), {
+      // 同 executeRound：cfgOf / prefsOf / slot.dir 的静态形态与引擎形参不吻合
+      //（运行时同形），调用侧断言收窄（注释见 executeRound 调用点）
+      // 本轮流量袋装配：与 executeRound 同款（attachRoundTraffic，轮末清空）
+      const roundCfg = cfgOf(slot) as unknown as EngineCfg
+      attachRoundTraffic(slot, roundCfg)
+      const summary = await engine.syncDirectory(roundCfg, slot.dir as unknown as DirCfg, prefsOf(slot) as EnginePrefs, {
         onProgress: progressAt,
         shouldAbort: () => slot.cancelRequested,
         onConflict: () => 'defer',
@@ -2388,10 +2617,25 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       for (const slot of targets) {
         const mineNow = leaderState === 'leader' && ownerRef.valid && (await leaderLockIsMine())
         if (mineNow) {
-          // op / 预演轮的忙检查已在本函数入口完成：此处到 enqueue 之间无 await（单线程
-          // 事件循环内原子），不会出现「检查空闲 → 入队时已忙」的竞态窗口
+          // op / 预演轮的忙检查不能只靠入口那一次：上方 await leaderLockIsMine() 是
+          // 异步文件 IO，让出事件循环期间 tick / watcher / 委托请求都可能把该 slot
+          // 变忙；enqueue 的忙分支只置 rerunPending 并 waitRoundEnd、丢弃 op 与
+          // dryRun（预演轮静默变真实传输轮、单向覆盖轮退化为常规轮并传播删除）。
+          // 因此这里必须**同步**复检：本行到 enqueue 内置 slot.state='queued' 全程
+          // 无 await，才是真正的原子窗口（范本：pollManualRequestsInner 在 enqueue
+          // 前的同步忙检查 + 拒绝）。单目录调用（dirId 形参存在，targets 恰一个）
+          // 抛入口同款错误；批量调用逐目录记错误结果并 continue —— 不因 mid-loop
+          // 抛错丢掉已完成目录的结果（perDir 与 results 按下标对齐，语义保持）。
+          if ((op || dryRun) && (slot.state === 'queued' || slot.state === 'running')) {
+            if (dirId) throw new Error('这个文件夹正在同步中，请等这一轮结束再试')
+            results.push({ ok: false, error: new Error('这个文件夹正在同步中，请等这一轮结束再试') })
+            continue
+          }
           results.push(await new Promise<RoundResolveValue>((resolve) => enqueue(slot, 'manual', true, resolve, op, dryRun)))
         } else {
+          // 非 leader 路径无需本复检：委托轮的忙拒绝由 leader 侧 pollManualRequests
+          //（enqueue 前同步忙检查）以回执送达；预演本地直跑（runDryRoundLocal）经
+          // fallbackRun 取目录锁，与在飞轮天然互斥，等待语义安全。
           results.push(dryRun ? await runDryRoundLocal(slot) : await delegateManual(slot, op))
         }
       }
@@ -2584,13 +2828,14 @@ export {
   createScheduler,
   sweepSchedulerTimers,
   summarizeRound, // 轮末展示摘要（纯函数，渲染层与测试共用）
-  // 常量导出（测试断言与文档引用）
+  // 常量导出（测试断言引用）
   TICK_MS,
   HEARTBEAT_MS,
   LEADER_TTL_MS,
   SLOW_HEARTBEAT_WARN_MS,
   DIR_LOCK_TTL_MS,
   DIR_LOCK_RENEW_MS,
+  CONFLICT_FORWARD_TTL_MS,
   MANUAL_CLAIM_TIMEOUT_MS,
   MANUAL_COMPACT_AGE_MS,
   RERUN_DELAY_MS,

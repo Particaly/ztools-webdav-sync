@@ -1,6 +1,6 @@
 /**
  * e2e 分片「tiers」：档位组（P1-P9 / XS / W1-W9 / PR）。P 系列档位标记跨节残留、P9 统一收尾清理，整文件保序
- * 由 test/sync-e2e.mjs 机械拆分（节体逐字保留）；每文件独立 dav-server / 端口 / 根目录，
+ * 每文件独立 dav-server / 端口 / 根目录，
  * vitest 按文件并行、文件内保持原节顺序。共享基建见 test/harness.mjs。
  * 日常回归：npm run test:fast（跳过 slow tag）；等待组单独回归：npm run test:slow。
  */
@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP, makeTrashStub } from './harness.mjs'
 
 const {
     HERE, ROOT, PORT, LOCAL, server, services, cfg, storeModule, BUILT, preloadPath,
@@ -22,30 +22,11 @@ const {
     setThrottle, waitForReqLine, waitAbortLine, runCancelRound, readWalOps, findTempResidue,
     PUP, setNetcut, setPartialPut, puBuf,
     SC_DB, SC_KEY, setSCConfig, createTestSched, makeFakeClock, waitReal, pumpUntil, readLeaderLock, writeLeaderLock,
-  } = await setupShard({ shard: 'tiers', port: 5373 })
+  } = await setupShard({ shard: 'tiers' })
 
-  const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-${Date.now()}-${process.pid}`)
-  fs.mkdirSync(TRASH_DIR, { recursive: true })
-  const trashLog = []
-  let trashFailNext = 0
-  let trashMissing = false
-  const installTrash = () => {
-    if (trashMissing) {
-      delete global.window.ztools
-      return
-    }
-    global.window.ztools = {
-      shellTrashItem: async (p) => {
-        trashLog.push(p)
-        if (trashFailNext > 0) {
-          trashFailNext--
-          throw new Error('EACCES: permission denied (injected trash failure)')
-        }
-        const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-        await fsp.rename(p, dest)
-      },
-    }
-  }
+  // 宿主回收站桩（原分片内逐字复制的 installTrash 块，统一收敛到 harness 工厂）
+  const trash = makeTrashStub()
+  const { install: installTrash } = trash
   installTrash()
 
   // ============================================================
@@ -180,7 +161,7 @@ const {
 
   // ---------- P2 nginx 风格（无 etag + 静默忽略条件头 + mtime 秒级）----------
 
-  // [慢组登记原因] B 档深水区；p2 档真同步仍由 BV2 覆盖、B 档分类由 W5 覆盖
+  // [慢组登记原因] B 档深水区；p2 档真同步仍由批量校验用例覆盖、B 档分类由 W5 覆盖
   await slowSection('P2：nginx 风格档', 'B 档深水区；p2 档真同步仍由 BV2 覆盖、B 档分类由 W5 覆盖', async () => {
   await setProfile('p2')
   await fsp.rm(path.join(ROOT, 'px2'), { recursive: true, force: true }).catch(() => {})

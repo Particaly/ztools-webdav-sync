@@ -1,6 +1,6 @@
 /**
  * e2e 分片「head」：头部组（B2A-S / 基础与 watch / SAFE / P11-R / P13 / N1-N4 / D1 / M1 / M2-M3）。基础→watch 复用 /proj 基线；「基础」必须在空 ROOT 上首个运行（listDirs 断言根内容）
- * 由 test/sync-e2e.mjs 机械拆分（节体逐字保留）；每文件独立 dav-server / 端口 / 根目录，
+ * 每文件独立 dav-server / 端口 / 根目录，
  * vitest 按文件并行、文件内保持原节顺序。共享基建见 test/harness.mjs。
  * 日常回归：npm run test:fast（跳过 slow tag）；等待组单独回归：npm run test:slow。
  */
@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP, makeTrashStub } from './harness.mjs'
 
 const {
     HERE, ROOT, PORT, LOCAL, server, services, cfg, storeModule, BUILT, preloadPath,
@@ -22,30 +22,11 @@ const {
     setThrottle, waitForReqLine, waitAbortLine, runCancelRound, readWalOps, findTempResidue,
     PUP, setNetcut, setPartialPut, puBuf,
     SC_DB, SC_KEY, setSCConfig, createTestSched, makeFakeClock, waitReal, pumpUntil, readLeaderLock, writeLeaderLock,
-  } = await setupShard({ shard: 'head', port: 5371 })
+  } = await setupShard({ shard: 'head' })
 
-  const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-${Date.now()}-${process.pid}`)
-  fs.mkdirSync(TRASH_DIR, { recursive: true })
-  const trashLog = []
-  let trashFailNext = 0
-  let trashMissing = false
-  const installTrash = () => {
-    if (trashMissing) {
-      delete global.window.ztools
-      return
-    }
-    global.window.ztools = {
-      shellTrashItem: async (p) => {
-        trashLog.push(p)
-        if (trashFailNext > 0) {
-          trashFailNext--
-          throw new Error('EACCES: permission denied (injected trash failure)')
-        }
-        const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-        await fsp.rename(p, dest)
-      },
-    }
-  }
+  // 宿主回收站桩（原分片内逐字复制的 installTrash 块，统一收敛到 harness 工厂）
+  const trash = makeTrashStub()
+  const { install: installTrash } = trash
   installTrash()
 
 // SAFE 节写入、afterAll 清理（原 try 外声明）
@@ -352,7 +333,7 @@ let SAFE_LOCAL = null
     watched = true
   })
   await fsp.writeFile(path.join(BW_LOCAL, 'watch-trigger.txt'), 'x')
-  // macOS FSEvents 在并行负载下可能迟送 / 合并丢事件（同目录连续写，W10 已知边界）：
+  // macOS FSEvents 在并行负载下可能迟送 / 合并丢事件（同目录连续写，已知边界）：
   // 轮询等待去抖回调，过半窗口未触发则补写一次重触发 —— 断言语义是「watcher+去抖
   // 链路可用」，与单次事件必达无关
   let reTrig = 0
@@ -624,7 +605,7 @@ let SAFE_LOCAL = null
   })
 
   // ============================================================
-  // P11-R：WAL 意图恢复（改写自旧 P11 暂存日志套件；3.5 崩溃安全）
+  // P11-R：WAL 意图恢复与崩溃安全
   // afterTransferOp 在「操作成功、基线未写」处抛错 = 模拟进程崩溃
   // ============================================================
 
@@ -948,7 +929,7 @@ let SAFE_LOCAL = null
 
   // M2 A/B 交替同步多轮：编辑与删除正确传播，收敛后无互删互传乒乓（4.7）
 
-  // [慢组登记原因] 多轮收敛马拉松（每轮 1.5s 锁静置）；基础交替 / 下载语义仍由 M1 与 P8 覆盖
+  // [慢组登记原因] 多轮收敛马拉松（每轮 1.5s 锁静置）；基础交替 / 下载语义仍由 M1 与档位分片的对应用例覆盖
   await slowSection('M2/M3：多设备交替 / 基线丢失 adopt', '多轮收敛马拉松（每轮 1.5s 锁静置）；基础交替 / 下载语义仍由 M1 与 P8 覆盖', async () => {
   const M2_A = path.join(os.tmpdir(), `wdsync-e2e-m2-a-${Date.now()}`)
   const M2_B = path.join(os.tmpdir(), `wdsync-e2e-m2-b-${Date.now()}`)

@@ -1,11 +1,10 @@
 /* eslint-disable */
 // WebDAV 同步插件 —— 宿主依赖端口层
 //
-// 定位：同步引擎长期目标是移出渲染进程 preload（独立进程 / CLI 形态），前置条件是
-// 引擎对宿主（ZTools）的全部运行期依赖收敛为显式端口、core 无头可跑。本文件把
-// preload 里散落的 window.ztools 直连点（storageRoot / trashItem / notify /
-// config / lifecycle）收敛为单一 HostPorts 接口；进程拆分本身仍被宿主平台
-// sanctioned 后台进程能力的确认阻塞，本层只做端口化、不动进程模型。
+// 定位：引擎对宿主（ZTools）的全部运行期依赖收敛为显式端口、core 无头可跑
+// （不直接触达 window.ztools）。本文件把 preload 里散落的 window.ztools 直连点
+// （storageRoot / trashItem / notify / config / lifecycle）收敛为单一 HostPorts
+// 接口，本层只做端口化、不动进程模型。
 //
 // 默认端口绑定 window.ztools 且**现取不缓存**（getHostPorts 未被覆盖时每次新建
 // defaultHostPorts）—— 宿主注入晚于 preload 加载时依赖仍可用，这也是调度器自举
@@ -37,7 +36,7 @@ export interface InternalRegistryPort {
   /** 覆盖写 ZTOOLS/ 命名空间文档（未授权时 reject） */
   dbPut(key: string, value: unknown): Promise<unknown>
   /**
-   * 通知宿主刷新插件列表与指令索引（宿主需求清单新增项）：宿主未提供该方法
+   * 通知宿主刷新插件列表与指令索引（可选能力）：宿主未提供该方法
    * 或通知失败时 no-op —— 登记仍生效，列表延迟到宿主下一次触发或重启才刷新
    */
   notifyChanged(): Promise<void>

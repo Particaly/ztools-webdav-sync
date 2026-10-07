@@ -13,17 +13,14 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PRELOAD = path.join(HERE, '..', '..', 'src-ztools', 'preload')
 
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
-}
+// 软失败登记收敛到 harness 的 makeCheck
+const { check, assertAtEnd } = makeCheck()
 
 const zp = await import(pathToFileURL(path.join(PRELOAD, 'ztools-plugins.mts')).href)
 
@@ -110,9 +107,8 @@ test('ZTools 插件同步发现单元（ZP1–ZP8，强顺序链）', async () =
     await fsp.rm(TMP, { recursive: true, force: true }).catch(() => {})
   }
 
-  const failed = results.filter((r) => !r.ok)
-  console.log(`zp-unit: ${results.length - failed.length}/${results.length} passed`)
-  if (failed.length) {
-    throw new Error('发现层单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'))
-  }
+  assertAtEnd({
+    passLine: (passed, total) => `zp-unit: ${passed}/${total} passed`,
+    fail: (failed) => '发现层单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'),
+  })
 })

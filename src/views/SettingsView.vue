@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import RemoteDirModal from '../components/RemoteDirModal.vue'
 import { AppButton, AppIconButton, AppInput, AppSelect, AppSwitch, InfoTip } from '../components/ui'
 import { useStore, defaultPrefs, tierLabel, tierHint, serverLabel } from '../composables/store'
-import type { DavServerEntry } from '../env.d'
+import type { DavServerEntry, ZtoolsPluginsSyncDesc } from '../env.d'
 import { toast } from '../composables/toast'
 import { intervalOptions, strategyOptions, concurrencyOptions } from '../composables/options'
 import { fmtBytes, fmtRelTime } from '../composables/format'
@@ -158,8 +158,8 @@ const capabilityHintTitle = computed(() => {
   return `${c.writeReason}${c.writeRetrySoon ? '，稍后会自动重新检测' : ''}`
 })
 
+/** 云端占用展示：由各目录最近扫描字节（Σ lastBytesTotal）派生，无数据时占位「—」 */
 const cloudUsageText = computed(() => {
-  if (s.cloudUsage) return s.cloudUsage
   const bytes = store.cloudBytes.value
   return bytes > 0 ? fmtBytes(bytes) : '—'
 })
@@ -303,17 +303,30 @@ const pluginSyncModel = computed<boolean>({
 
 /**
  * 插件同步的自动发现结果（preload describe：本机目录 / 平台隔离的远端目录）。
- * 云端父目录（ztoolsPluginSyncRemoteDir）是响应式依赖：更换位置后远端根即时
- * 跟随刷新；无 preload（浏览器预览）时为 null，开关下方信息行不显示。
+ * describe 内部有磁盘 IO（fs.statSync），不能放进 computed 里随渲染同步重跑 ——
+ * 改为 ref 存结果：挂载时先拉一次，云端父目录（ztoolsPluginSyncRemoteDir，
+ * base 来源）变化时再拉；无 preload（浏览器预览）或 describe 不存在时为 null，
+ * 开关下方信息行不显示（与原回退一致）。
  */
-const pluginSyncDesc = computed(() => {
+const pluginSyncDesc = ref<ZtoolsPluginsSyncDesc | null>(null)
+
+/** 拉取自动发现结果：base 取当前父目录；任何异常按无结果处理，不打断设置页 */
+function refreshPluginSyncDesc() {
   const base = s.prefs.ztoolsPluginSyncRemoteDir || ''
   try {
-    return window.services?.ztoolsPlugins?.describe?.(base) ?? null
+    pluginSyncDesc.value = window.services?.ztoolsPlugins?.describe?.(base) ?? null
   } catch {
-    return null
+    pluginSyncDesc.value = null
   }
-})
+}
+
+onMounted(refreshPluginSyncDesc)
+watch(
+  () => s.prefs.ztoolsPluginSyncRemoteDir,
+  () => {
+    refreshPluginSyncDesc()
+  }
+)
 
 /** 开关下方的说明文案（两行展示）：本机插件目录、平台隔离的云端目录（含所选父目录） */
 const pluginSyncDescLines = computed(() => {

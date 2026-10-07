@@ -24,8 +24,8 @@
  *                              pct   —— d: 前缀 + href 全量百分号编码（%23/%20/UTF-8 字节）
  *   .wdsync-test-midair     —— 「规划后、执行前远端被改」竞态注入（内容选触发点）：
  *                              put     —— 收到目标文件 PUT 时先把远端内容改写为「对端新版本」
- *                                         再评估条件头（A 档 If-Match 必 412；P7 类忽略条件头的服务器
- *                                         会照常覆盖 —— 用于记录静默忽略的后果）
+ *                                         再评估条件头（A 档 If-Match 必 412；静默忽略条件头的
+ *                                         服务器会照常覆盖 —— 用于记录静默忽略的后果）
  *                              propfind—— 收到目标文件 Depth:0 PROPFIND 时先改写内容再应答
  *                                         （B 档引擎的「执行前复查」恰好用 Depth:0，必然被拦下）
  *                              目标文件 = 路径 basename 含 'midair'；每文件只触发一次（一次性钩子）。
@@ -174,8 +174,8 @@
  *   p1（缺省默认档）—— 全功能：内容哈希强 etag（同内容重传 etag 稳定）、条件请求生效
  *                      （If-Match / If-None-Match 严格评估，PUT 与 DELETE 一致）、
  *                      Depth: infinity 返回 403（多数服务器的保守默认）。
- *                      注：默认档 etag 由 mtime 型（"size-mtimeMs"）改为内容哈希型 —— mtime 型在同
- *                      内容重传时必然变化，会让 P1「强 etag 服务器」的探测误报 etag 不稳定。
+ *                      注：默认档 etag 取内容哈希型 —— mtime 型在同内容重传时必然
+ *                      变化，会让 p1「强 etag 服务器」的探测误报 etag 不稳定。
  *   p2（nginx 风格） —— 无 etag、静默忽略条件头（照常 2xx）、getlastmodified 捨到整秒。
  *   p3（弱 etag）   —— etag 带 W/ 前缀 + 条件请求生效。弱 etag 时 If-Match 的服务器行为按
  *                      RFC 7232 强比较语义：含弱 etag 的 If-Match 一律不匹配 → 412（比「忽略
@@ -196,7 +196,10 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const port = Number(process.argv[2]) || 5360
+// 端口解析：argv[2] 显式传 '0' 时按「内核随机分配」处理（Number('0') 为 falsy，
+// 不能走 || 回落）；未传参时保持历史缺省 5360（手动命令行用法）
+const portArg = process.argv[2]
+const port = portArg === undefined ? 5360 : Number(portArg)
 const ROOT = process.argv[3] || path.join(path.dirname(fileURLToPath(import.meta.url)), '.dav-root')
 fs.mkdirSync(ROOT, { recursive: true })
 
@@ -222,7 +225,7 @@ const HREF_ROOT = '/dav/'
 const RL_MAX = 3
 let rlHits = 0
 /**
- * 限流启用状态（跨请求记忆）：同一服务器进程会先后服务多个限流用例（RL 系列 / P5 档），
+ * 限流启用状态（跨请求记忆）：同一服务器进程会先后服务多个限流用例（限流系列 / p5 档），
  * 标记重新启用（禁用 → 启用的跳变）时重置预算 —— 与「新起一个进程」的语义对齐，
  * 否则第二个限流用例永远等不到 429。
  */
@@ -1190,5 +1193,6 @@ const server = useTls
 server.keepAliveTimeout = 30000
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`mini-dav listening at ${useTls ? 'https' : 'http'}://127.0.0.1:${port}${HREF_ROOT} root=${ROOT}`)
+  // port=0 时打印实际分配端口（harness 从本行解析回填；行内 'listening' 关键字是就绪判定锚点）
+  console.log(`mini-dav listening at ${useTls ? 'https' : 'http'}://127.0.0.1:${server.address().port}${HREF_ROOT} root=${ROOT}`)
 })

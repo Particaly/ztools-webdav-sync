@@ -1,0 +1,23 @@
+{
+  // 根级 Node 侧配置文件专用：uno.config.ts / vitest.config.ts / vitest.built.config.ts。
+  // 这三个文件不在 tsconfig.json 的 include ["src"] 内，也不属于 tsconfig.preload.json 链，
+  // 此前从未被任何 tsc 检查；纳入本配置后补齐第三条链路。
+  // `npm run typecheck` 三链路聚合：tsconfig.preload.json（preload）→ vue-tsc/tsconfig.json
+  // （renderer src）→ 本文件（根级 Node 配置）。build / test:unit 不再内联类型检查。
+  // vite.config.js 为纯 JS，纳入需 allowJs+checkJs 且类型收益低，故不纳入。
+  // compilerOptions 与根 tsconfig.json 对齐，仅将 types 收窄为 node
+  // （去掉 renderer 侧的 @ztools-center/ztools-api-types 全局注入；
+  //   vitest.config.ts 的 import 'vitest/config' 走显式模块解析，不依赖 types 注入）。
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["uno.config.ts", "vitest.config.ts", "vitest.built.config.ts"]
+}

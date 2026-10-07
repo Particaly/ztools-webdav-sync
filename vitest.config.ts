@@ -18,8 +18,8 @@ export default defineConfig({
     // vitest 5：使用 tag 前必须在此声明。fast = 快组（日常回归全跑）；
     // slow = 慢组（真实墙钟等待型，发版或 test:slow 单独回归）
     tags: [
-      { name: 'fast', displayName: '⚡' },
-      { name: 'slow', displayName: '🐌' },
+      { name: 'fast', description: '快组（日常回归全跑）' },
+      { name: 'slow', description: '慢组（真实墙钟等待型）' },
     ],
     // forks 池：每个测试文件独占一个子进程 —— global.window / preload 单例天然隔离，
     // 文件内 spawn dav-server、长定时器与 afterAll 清理都与旧单进程行为一致

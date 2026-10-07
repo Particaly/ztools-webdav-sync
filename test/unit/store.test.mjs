@@ -2,7 +2,7 @@
  * 存储层（src-ztools/preload/store.mts）独立单元测试（vitest 迁移版）。
  * 覆盖：半行日志、CRC 错误、压缩中途崩溃、快照损坏、日志重放幂等、
  * WAL 生命周期、deviceId 稳定性、5 万条目加载耗时与内存、
- * 凭据混淆 AES-256-GCM（U17）。
+ * 凭据混淆 AES-256-GCM（U17）、同步记录 JSONL 化与旧格式迁移（U19）。
  * 运行：npx vitest run test/unit（或 npm run test:unit）
  *
  * 结构说明：用例链强顺序依赖（U3 直接改 U2 的日志文件、U4 改 U3 的……），
@@ -13,25 +13,14 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PRELOAD = path.join(HERE, '..', '..', 'src-ztools', 'preload')
 
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  // 迁移对拍通道：设置 WDSYNC_E2E_JSONL=<路径> 时逐用例追加 JSONL
-  if (process.env.WDSYNC_E2E_JSONL) {
-    try {
-      fs.appendFileSync(process.env.WDSYNC_E2E_JSONL, JSON.stringify({ section: 'store-unit', name, ok: !!cond }) + '\n')
-    } catch (_) {
-      /* 对拍输出失败不影响测试本身 */
-    }
-  }
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
-}
+// 软失败登记 + JSONL 对拍通道（section 固定 'store-unit'）收敛到 harness 的 makeCheck
+const { check, assertAtEnd } = makeCheck('store-unit')
 
 // CJS 模块经 ESM 动态 import 取 module.exports
 const store = await import(pathToFileURL(path.join(PRELOAD, 'store.mts')).href)
@@ -618,6 +607,188 @@ test('存储层单元（U1–U18，强顺序链）', async () => {
     check('U17 back to root A: original ciphertext opens, other root does not', store.openSecret(sealedA) === 'root-a-secret' && store.openSecret(sealedC) === '', '')
   }
 
+  // U19 同步记录 JSONL 化：逐轮一行 append + 环形上限/重写松弛摊薄 + 旧
+  // sync-log.json 整文件读时兼容迁移 + 尾部撕裂容忍与自愈。写放大的关键断言是
+  // 「两次重写之间磁盘行数按轮递增（纯 append）、越过上限+松弛才整表重写一次」。
+  {
+    const logOpts = { localPath: 'D:\\Sync\\LogSync', remotePath: '/logsync' }
+    const openLogStore = () => store.openDirStore(logOpts)
+    const logDir = store.baselineDirPath(await store.getDeviceId(), logOpts.localPath, logOpts.remotePath)
+    const jsonl = path.join(logDir, 'sync-log.jsonl')
+    const legacy = path.join(logDir, 'sync-log.json')
+    const lineCount = async (p) => {
+      try {
+        return (await fsp.readFile(p, 'utf-8')).split('\n').filter((l) => l.trim()).length
+      } catch (_) {
+        return -1 // 文件不存在
+      }
+    }
+    const exists = async (p) => {
+      try {
+        await fsp.access(p)
+        return true
+      } catch (_) {
+        return false
+      }
+    }
+    // 单轮记录工厂：含全部可选字段（op / renamed / 错误明细 / rename from / choice），
+    // 同时验证 round-trip 对可选字段的保真
+    const slogEntry = (n, extra = {}) => ({
+      at: n,
+      endAt: n + 5,
+      trigger: 'interval',
+      status: 'ok',
+      uploaded: 1,
+      downloaded: 2,
+      deleted: 0,
+      conflicts: 1,
+      adopted: 0,
+      renamed: 1,
+      deferredConflicts: 0,
+      deleteHeld: 0,
+      bytesUp: 10,
+      bytesDown: 20,
+      totalFiles: 3,
+      ops: [
+        { op: 'upload', rel: `a/f${n}.txt`, bytes: 10, added: true },
+        { op: 'rename-remote', rel: `b/f${n}.txt`, from: `c/old${n}.txt` },
+        { op: 'conflict', rel: `d/f${n}.txt`, choice: 'both' },
+      ],
+      errors: [`err-${n}`],
+      ...extra,
+    })
+
+    // —— 首次建档：append 3 轮 + save → 整体重写建档为 JSONL（每行 CRC 有效），
+    //    不再产生旧整文件 sync-log.json
+    let ls = await openLogStore()
+    for (let i = 1; i <= 3; i++) ls.appendSyncLog(slogEntry(i))
+    await ls.saveSyncLog()
+    check('U19 首次落盘建档为 sync-log.jsonl（3 行）', (await lineCount(jsonl)) === 3, `lines=${await lineCount(jsonl)}`)
+    check('U19 不产生旧整文件 sync-log.json', !(await exists(legacy)), '')
+    {
+      const lines = (await fsp.readFile(jsonl, 'utf-8')).split('\n').filter(Boolean)
+      const crcOk = lines.every((l) => {
+        const o = JSON.parse(l)
+        return o.v === 1 && typeof o.c === 'number' && (store._internals.crc32(Buffer.from(JSON.stringify(o.o), 'utf-8')) >>> 0) === (o.c >>> 0)
+      })
+      check('U19 每行 { v, c, o } 信封且 CRC 校验通过', crcOk, '')
+      check('U19 listSyncLog 最新在前（at=3 首位）', ls.listSyncLog()[0].at === 3 && ls.listSyncLog().length === 3, '')
+    }
+
+    // —— append 路径 + 每轮落盘 fsync：增量续写 2 行（磁盘 5 行）且注入钩子能观测
+    //    到 'synclog' 类 fsync（维持「轮末 = 已持久化」的旧语义档位）
+    let fsyncKinds = []
+    store._internals.fsyncSpy.onEvent = (ev) => fsyncKinds.push(ev.kind)
+    try {
+      ls.appendSyncLog(slogEntry(4))
+      await ls.saveSyncLog()
+      ls.appendSyncLog(slogEntry(5))
+      await ls.saveSyncLog()
+    } finally {
+      store._internals.fsyncSpy.onEvent = null
+    }
+    check('U19 常规轮纯 append（磁盘行数 5，无整表重写）', (await lineCount(jsonl)) === 5, `lines=${await lineCount(jsonl)}`)
+    check('U19 每轮落盘伴随一次 synclog 句柄 fsync', fsyncKinds.filter((k) => k === 'synclog').length === 2, JSON.stringify(fsyncKinds))
+
+    // —— 重开持久化 + 可选字段 round-trip 保真（rename from / choice / renamed / op）
+    await store.closeAllStores()
+    ls = await openLogStore()
+    {
+      const list = ls.listSyncLog()
+      const rich = list.find((r) => r.at === 3)
+      check(
+        'U19 重开 5 轮完好且可选字段保真（from / choice / renamed / errors）',
+        list.length === 5 &&
+          rich.ops[1].from === 'c/old3.txt' &&
+          rich.ops[2].choice === 'both' &&
+          rich.renamed === 1 &&
+          rich.errors[0] === 'err-3' &&
+          rich.ops[0].added === true &&
+          rich.ops[0].bytes === 10,
+        JSON.stringify(rich)
+      )
+    }
+
+    // —— 环形 + 摊薄重写：补到 200 轮（一次批量 save，append 路径）→ 再逐轮 +25
+    //    （磁盘 225 行仍纯 append）→ 重开加载裁回 200 → 第 226 轮触发整表重写回 200 行
+    for (let i = 6; i <= 200; i++) ls.appendSyncLog(slogEntry(i))
+    await ls.saveSyncLog()
+    check('U19 批量补至 200 轮一次 save 仍走 append（磁盘 200 行）', (await lineCount(jsonl)) === 200, `lines=${await lineCount(jsonl)}`)
+    for (let i = 201; i <= 225; i++) {
+      ls.appendSyncLog(slogEntry(i))
+      await ls.saveSyncLog()
+    }
+    check('U19 上限+松弛内不重写（磁盘 225 行 = 200+25）', (await lineCount(jsonl)) === 225, `lines=${await lineCount(jsonl)}`)
+    await store.closeAllStores()
+    ls = await openLogStore()
+    check('U19 加载把磁盘 225 行裁回环形 200 轮（最新在前 at=225）', ls.listSyncLog().length === 200 && ls.listSyncLog()[0].at === 225, `len=${ls.listSyncLog().length}`)
+    ls.appendSyncLog(slogEntry(226))
+    await ls.saveSyncLog()
+    check('U19 越过上限+松弛触发一次整表重写（磁盘回 200 行）', (await lineCount(jsonl)) === 200 && ls.listSyncLog()[0].at === 226 && ls.listSyncLog().length === 200, `lines=${await lineCount(jsonl)}`)
+    await store.closeAllStores()
+
+    // —— 旧整文件格式迁移：手写 v1 sync-log.json（含 1 条畸形轮）→ 读时导入 →
+    //    首次落盘迁移为 JSONL 并删除旧文件
+    const logOpts2 = { localPath: 'D:\\Sync\\LogSync2', remotePath: '/logsync2' }
+    const logDir2 = store.baselineDirPath(await store.getDeviceId(), logOpts2.localPath, logOpts2.remotePath)
+    await fsp.mkdir(logDir2, { recursive: true })
+    await fsp.writeFile(
+      path.join(logDir2, 'sync-log.json'),
+      JSON.stringify({
+        v: 1,
+        rounds: [
+          { at: 1, endAt: 2, trigger: 'manual', status: 'ok', uploaded: 1, downloaded: 0, deleted: 0, conflicts: 0, adopted: 0, deferredConflicts: 0, deleteHeld: 0, bytesUp: 5, bytesDown: 0, totalFiles: 1, ops: [{ op: 'upload', rel: 'old/a.txt', added: true }], errors: [] },
+          { broken: true }, // 畸形轮：导入时直接丢弃，不连累整表
+          { at: 2, endAt: 3, trigger: 'watch', status: 'partial', uploaded: 0, downloaded: 1, deleted: 0, conflicts: 2, adopted: 0, renamed: 2, deferredConflicts: 2, deleteHeld: 0, bytesUp: 0, bytesDown: 7, totalFiles: 2, ops: [{ op: 'rename-local', rel: 'new/b.txt', from: 'old/b.txt' }], errors: ['legacy-err'] },
+        ],
+      }),
+      'utf-8'
+    )
+    let ls2 = await store.openDirStore(logOpts2)
+    {
+      const list = ls2.listSyncLog()
+      check(
+        'U19 旧整文件读时兼容导入（畸形轮丢弃、可选字段保留）',
+        list.length === 2 && list[0].at === 2 && list[0].renamed === 2 && list[0].ops[0].from === 'old/b.txt' && list[1].ops[0].added === true,
+        JSON.stringify(list)
+      )
+    }
+    ls2.appendSyncLog(slogEntry(99, { trigger: 'manual' }))
+    await ls2.saveSyncLog()
+    check('U19 首次落盘迁移为 JSONL（3 行）并删除旧整文件', (await lineCount(path.join(logDir2, 'sync-log.jsonl'))) === 3 && !(await exists(path.join(logDir2, 'sync-log.json'))), `lines=${await lineCount(path.join(logDir2, 'sync-log.jsonl'))}`)
+    await store.closeAllStores()
+    ls2 = await store.openDirStore(logOpts2)
+    check('U19 迁移后重开自 JSONL 读取（3 轮）', ls2.listSyncLog().length === 3 && ls2.listSyncLog()[0].at === 99, '')
+    await store.closeAllStores()
+
+    // —— 尾部撕裂容忍 + 自愈：追加半行 → 重开丢弃尾部并告警 → 下一轮落盘全量重写
+    //    自愈（不再有撕裂行）
+    {
+      const raw = await fsp.readFile(jsonl, 'utf-8')
+      await fsp.writeFile(jsonl, raw + raw.split('\n')[0].slice(0, 20), 'utf-8')
+    }
+    ls = await openLogStore()
+    check('U19 撕裂尾行丢弃且此前 200 轮完好（含 warning）', ls.listSyncLog().length === 200 && ls.listSyncLog()[0].at === 226 && ls.warnings.some((w) => /sync-log\.jsonl/.test(w)), JSON.stringify(ls.warnings))
+    ls.appendSyncLog(slogEntry(227))
+    await ls.saveSyncLog()
+    {
+      const lines = (await fsp.readFile(jsonl, 'utf-8')).split('\n').filter(Boolean)
+      const allDecode = lines.every((l) => {
+        try {
+          const o = JSON.parse(l)
+          return (store._internals.crc32(Buffer.from(JSON.stringify(o.o), 'utf-8')) >>> 0) === (o.c >>> 0)
+        } catch (_) {
+          return false
+        }
+      })
+      check('U19 损坏后下一轮落盘全量重写自愈（环形 200 行全 CRC 通过）', lines.length === 200 && allDecode, `lines=${lines.length}`)
+    }
+    await store.closeAllStores()
+    ls = await openLogStore()
+    check('U19 自愈后重开无新告警且 200 轮完好（最新 at=227）', ls.listSyncLog().length === 200 && ls.listSyncLog()[0].at === 227 && !ls.warnings.some((w) => /sync-log\.jsonl.*损坏/.test(w)), JSON.stringify(ls.warnings))
+    await store.closeAllStores()
+  }
+
   // U16 引擎/调度器计时器静态检查：
   // preload 侧引擎与调度器源码不得出现裸全局 setTimeout/setInterval/clearTimeout/
   // clearInterval 调用 —— 宿主 contextIsolation:false 下 preload 的全局计时器就是
@@ -652,9 +823,8 @@ test('存储层单元（U1–U18，强顺序链）', async () => {
     await fsp.rm(ROOT, { recursive: true, force: true }).catch(() => {})
   }
 
-  const failed = results.filter((r) => !r.ok)
-  console.log(`\n===== ${results.length - failed.length}/${results.length} passed =====`)
-  if (failed.length) {
-    throw new Error(`存储层单元测试 ${failed.length} 项失败：\n${failed.map((f) => `  ❌ ${f.name}`).join('\n')}`)
-  }
+  assertAtEnd({
+    passLine: (passed, total) => `\n===== ${passed}/${total} passed =====`,
+    fail: (failed) => `存储层单元测试 ${failed.length} 项失败：\n${failed.map((f) => `  ❌ ${f.name}`).join('\n')}`,
+  })
 })

@@ -26,8 +26,6 @@ const store = useStore()
 const phase = ref<'running' | 'done' | 'failed'>('running')
 const runError = ref('')
 const record = ref<SyncLogEntry | null>(null)
-/** 防抖标记：同一条预演结果只取一次 */
-const loadingRecord = ref(false)
 
 const summary = computed(() => record.value)
 
@@ -56,7 +54,6 @@ async function run() {
   phase.value = 'running'
   runError.value = ''
   record.value = null
-  loadingRecord.value = true
   try {
     const r = await store.dryRunDir(props.dir)
     if (!r.ok) {
@@ -71,8 +68,6 @@ async function run() {
   } catch (e) {
     runError.value = e instanceof Error ? e.message : String(e)
     phase.value = 'failed'
-  } finally {
-    loadingRecord.value = false
   }
 }
 

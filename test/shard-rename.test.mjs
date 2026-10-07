@@ -12,12 +12,10 @@
  * 日常回归：npm run test:fast；本分片全部为 fast 节。
  */
 import { test, afterAll } from 'vitest'
-import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, check, sleep, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, check, sleep, isNoop, SP, makeTrashStub, spawnDav, killDav } from './harness.mjs'
 
 const {
   HERE, ROOT, PORT, LOCAL, server, services, cfg, storeModule, BUILT, preloadPath,
@@ -28,17 +26,11 @@ const {
   setThrottle, waitForReqLine, waitAbortLine, runCancelRound, readWalOps, findTempResidue,
   PUP, setNetcut, setPartialPut, puBuf,
   SC_DB, SC_KEY, setSCConfig, createTestSched, makeFakeClock, waitReal, pumpUntil, readLeaderLock, writeLeaderLock,
-} = await setupShard({ shard: 'rename', port: 5381 })
+} = await setupShard({ shard: 'rename' })
 
-// 本地删除（delete-local）经宿主回收站端口：安装与其它分片同款的临时端口
-const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-rn-${Date.now()}-${process.pid}`)
-fs.mkdirSync(TRASH_DIR, { recursive: true })
-global.window.ztools = {
-  shellTrashItem: async (p) => {
-    const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-    await fsp.rename(p, dest)
-  },
-}
+// 本地删除（delete-local）经宿主回收站端口：收敛到 harness 工厂（与其它分片同款）
+const trash = makeTrashStub()
+trash.install()
 
 const FIXTURES = path.join(HERE, 'fixtures')
 const setNomove = async (on) => {
@@ -233,68 +225,41 @@ section('RN5：批量改名（60 个）不触发批量删除闸', async () => {
 // T1/T2/T3：自签名 / 自建 CA 证书的 https 连接链路（独立 TLS dav-server）
 // ============================================================
 
-/** spawn 一个 TLS dav-server；resolve 端口就绪后的句柄（含父进程死亡看门狗注入） */
-const spawnTlsServer = async (tag, portTls, cert, key) => {
-  const root = path.join(HERE, `.dav-root-${tag}`)
-  await fsp.rm(root, { recursive: true, force: true })
-  const child = spawn(process.execPath, [path.join(HERE, 'dav-server.mjs'), String(portTls), root, cert, key], {
-    stdio: 'pipe',
-    env: { ...process.env, WDSYNC_DAV_EXIT_WITH: String(process.pid) },
-  })
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('tls server start timeout')), 15000)
-    child.stdout.on('data', (d) => {
-      if (String(d).includes('listening')) {
-        clearTimeout(t)
-        resolve()
-      }
-    })
-    child.stderr.on('data', (d) => console.error(`[dav-${tag}]`, String(d)))
-  })
-  return { child, root }
-}
-
 section('T1/T2/T3：自签名与自建 CA 证书的连接链路', async () => {
-  const selfSigned = await spawnTlsServer('tls1', 5383, path.join(FIXTURES, 'self-signed.crt'), path.join(FIXTURES, 'self-signed.key'))
-  const caSigned = await spawnTlsServer('tls2', 5385, path.join(FIXTURES, 'ca-signed.crt'), path.join(FIXTURES, 'ca-signed.key'))
+  // TLS dav-server 改用 harness 的 spawnDav（端口 0 随机分配；含父进程死亡看门狗注入）
+  const selfSigned = await spawnDav({ tag: 'tls1', cert: path.join(FIXTURES, 'self-signed.crt'), key: path.join(FIXTURES, 'self-signed.key') })
+  const caSigned = await spawnDav({ tag: 'tls2', cert: path.join(FIXTURES, 'ca-signed.crt'), key: path.join(FIXTURES, 'ca-signed.key') })
   const caPem = fs.readFileSync(path.join(FIXTURES, 'test-ca.crt'), 'utf-8')
+  const urlTls1 = `https://127.0.0.1:${selfSigned.port}/dav/`
+  const urlTls2 = `https://127.0.0.1:${caSigned.port}/dav/`
   try {
     // T1 自签名：默认校验失败 → 友好文案指引信任开关；开启信任 → 连接成功
-    const bad = await services.dav.testConnection({ serverUrl: `https://127.0.0.1:5383/dav/`, username: 'u', password: 'p' })
+    const bad = await services.dav.testConnection({ serverUrl: urlTls1, username: 'u', password: 'p' })
     check('T1 自签名默认拒绝（连接失败）', bad.ok === false)
     check('T1 错误文案指向证书问题与信任开关', /证书/.test(String(bad.error || '')) && /信任此服务器证书/.test(String(bad.error || '')), String(bad.error || '').slice(0, 80))
 
-    const trusted = await services.dav.testConnection({ serverUrl: `https://127.0.0.1:5383/dav/`, username: 'u', password: 'p', tls: { trustServerCertificate: true } })
+    const trusted = await services.dav.testConnection({ serverUrl: urlTls1, username: 'u', password: 'p', tls: { trustServerCertificate: true } })
     check('T1 开启信任后连接成功', trusted.ok === true, String(trusted.error || ''))
 
     // T2 自建 CA 签发：默认失败；导入 CA → 校验通过
-    const bad2 = await services.dav.testConnection({ serverUrl: `https://127.0.0.1:5385/dav/`, username: 'u', password: 'p' })
+    const bad2 = await services.dav.testConnection({ serverUrl: urlTls2, username: 'u', password: 'p' })
     check('T2 CA 签发证书默认拒绝', bad2.ok === false && /证书/.test(String(bad2.error || '')))
-    const withCa = await services.dav.testConnection({ serverUrl: `https://127.0.0.1:5385/dav/`, username: 'u', password: 'p', tls: { caPem } })
+    const withCa = await services.dav.testConnection({ serverUrl: urlTls2, username: 'u', password: 'p', tls: { caPem } })
     check('T2 导入 CA 后连接成功（完整校验）', withCa.ok === true, String(withCa.error || ''))
 
     // T3 信任开启下的完整同步轮（引擎路径 + TLS Agent 池）
     await switchDevice(STORAGE_MAIN)
     const lp = await tmpLocal('tls3')
     await fsp.writeFile(path.join(lp, 'tls.txt'), 'tls-engine-round')
-    const tlsCfg = { serverUrl: `https://127.0.0.1:5383/dav/`, username: 'u', password: 'p', tls: { trustServerCertificate: true } }
+    const tlsCfg = { serverUrl: urlTls1, username: 'u', password: 'p', tls: { trustServerCertificate: true } }
     const s1 = await services.sync.syncDirectory(tlsCfg, { id: 'p', localPath: lp, remotePath: '/proj', mode: 'two-way' }, SP, {})
     check('T3 信任开启下引擎轮上传成功', s1.uploaded === 1)
     check('T3 远端落盘新文件', fs.existsSync(path.join(selfSigned.root, 'proj', 'tls.txt')))
     // 同一服务器换回严格校验（Agent 分池生效性）：连接测试重新失败
-    const strict = await services.dav.testConnection({ serverUrl: `https://127.0.0.1:5383/dav/`, username: 'u', password: 'p' })
+    const strict = await services.dav.testConnection({ serverUrl: urlTls1, username: 'u', password: 'p' })
     check('T3 严格校验与信任连接互不影响（分池生效）', strict.ok === false)
   } finally {
-    for (const h of [selfSigned, caSigned]) {
-      try {
-        h.child.stdout.destroy()
-        h.child.stderr.destroy()
-      } catch {
-        /* 忽略 */
-      }
-      h.child.kill()
-      await fsp.rm(h.root, { recursive: true, force: true }).catch(() => {})
-    }
+    for (const h of [selfSigned, caSigned]) await killDav(h)
   }
 })
 

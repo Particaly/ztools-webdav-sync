@@ -23,14 +23,15 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import type { ZtoolsPluginsSyncDesc } from './types.mts'
+import { ZTOOLS_PLUGINS_DIR_ID, type ZtoolsPluginsSyncDesc } from './types.mts'
 
 /**
  * 插件同步虚拟记录的固定 id：渲染层列表行、调度器 slot、round-end / 冲突等
- * 事件据此对齐。渲染层无法运行时导入本模块（无 Node 能力），store.ts 以字面量
- * 镜像本常量 —— 修改时两处同步（types.mts 的 ZtoolsPluginsSyncDesc.id 同款契约）。
+ * 事件据此对齐。字面量的单一事实源在 types.mts（前后端共用：渲染层 store.ts
+ * 也直接 import 同一常量，不再有字面量镜像）；此处 re-export 保持既有消费方
+ *（scheduler.mts 与单元测试）的导入路径不变。
  */
-export const ZTOOLS_PLUGINS_DIR_ID = 'ztools-plugins'
+export { ZTOOLS_PLUGINS_DIR_ID }
 
 /**
  * 远端固定后缀（不提供用户配置）：`/ztools-plugins/<platformKey>` 两段恒定地

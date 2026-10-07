@@ -16,33 +16,21 @@
 import { test, afterAll } from 'vitest'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, check, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, check, isNoop, SP, makeTrashStub, mountFakeDbStorage } from './harness.mjs'
 
 const {
   ROOT, LOCAL, server, services, cfg,
   freshStore, tmpLocal, syncP,
   readReqlog, waitReal,
   SC_DB, SC_KEY, setSCConfig, createTestSched,
-} = await setupShard({ shard: 'tree', port: 5387 })
+} = await setupShard({ shard: 'tree' })
 
 // 本地删除（delete-local）经宿主回收站端口 + ST4 调度器读配置的假 dbStorage：
-// 安装与其它分片同款的宿主桩（shellTrashItem 移入临时目录；dbStorage 读写 SC_DB）
-const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-st-${Date.now()}-${process.pid}`)
-fs.mkdirSync(TRASH_DIR, { recursive: true })
-global.window.ztools = {
-  shellTrashItem: async (p) => {
-    const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-    await fsp.rename(p, dest)
-  },
-  dbStorage: {
-    getItem: (k) => (k in SC_DB ? SC_DB[k] : null),
-    setItem: (k, v) => {
-      SC_DB[k] = v
-    },
-  },
-}
+// 回收站桩 + dbStorage 挂载（读写 SC_DB）均收敛到 harness 工厂（与其它分片同款）
+const trash = makeTrashStub()
+trash.install()
+mountFakeDbStorage(SC_DB)
 
 const setQuota = async (v) => {
   if (v == null) await fsp.rm(path.join(ROOT, '.wdsync-test-quota'), { force: true }).catch(() => {})

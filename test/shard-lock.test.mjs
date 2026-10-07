@@ -1,6 +1,6 @@
 /**
  * e2e 分片「lock」：锁与批量组（PF0-2 / BV1-4 / L1-L14 / B2B-P404 / CA / PU / PC1-4 / B2A / B2B / TR1）。两处 setProfile p1 前置在模块级生效（收集期写入，跳过任一节不失效）
- * 由 test/sync-e2e.mjs 机械拆分（节体逐字保留）；每文件独立 dav-server / 端口 / 根目录，
+ * 每文件独立 dav-server / 端口 / 根目录，
  * vitest 按文件并行、文件内保持原节顺序。共享基建见 test/harness.mjs。
  * 日常回归：npm run test:fast（跳过 slow tag）；等待组单独回归：npm run test:slow。
  */
@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP, makeTrashStub } from './harness.mjs'
 
 const {
     HERE, ROOT, PORT, LOCAL, server, services, cfg, storeModule, BUILT, preloadPath,
@@ -22,30 +22,11 @@ const {
     setThrottle, waitForReqLine, waitAbortLine, runCancelRound, readWalOps, findTempResidue,
     PUP, setNetcut, setPartialPut, puBuf,
     SC_DB, SC_KEY, setSCConfig, createTestSched, makeFakeClock, waitReal, pumpUntil, readLeaderLock, writeLeaderLock,
-  } = await setupShard({ shard: 'lock', port: 5375 })
+  } = await setupShard({ shard: 'lock' })
 
-  const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-${Date.now()}-${process.pid}`)
-  fs.mkdirSync(TRASH_DIR, { recursive: true })
-  const trashLog = []
-  let trashFailNext = 0
-  let trashMissing = false
-  const installTrash = () => {
-    if (trashMissing) {
-      delete global.window.ztools
-      return
-    }
-    global.window.ztools = {
-      shellTrashItem: async (p) => {
-        trashLog.push(p)
-        if (trashFailNext > 0) {
-          trashFailNext--
-          throw new Error('EACCES: permission denied (injected trash failure)')
-        }
-        const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-        await fsp.rename(p, dest)
-      },
-    }
-  }
+  // 宿主回收站桩（原分片内逐字复制的 installTrash 块，统一收敛到 harness 工厂）
+  const trash = makeTrashStub()
+  const { install: installTrash } = trash
   installTrash()
 
   // ============================================================
@@ -193,7 +174,7 @@ const {
   // ============================================================
   // BV1（P1 档）：一个目录的上传全部完成后按父目录批量校验 —— 不再逐文件 PROPFIND。
   // 场景：根 3 文件 + sub/ 2 文件 + sub2/ 1 文件。reqlog 断言：
-  //   核心 —— 对 6 个文件路径的 PROPFIND 为 0（旧实现每文件一次 Depth:0 校验）；
+  //   核心 —— 对 6 个文件路径的 PROPFIND 为 0（批量校验，不逐文件 Depth:0 校验）；
   //   辅助 —— 首个 PUT 之后的父目录 PROPFIND 恰为 3 个目录各 1 次（扫描与能力探测的
   //   列举都发生在上传开始之前，上传开始后只剩批量校验的 3 次）。
 
@@ -249,7 +230,7 @@ const {
   // BV2（P2 档，B 档覆盖）：新上传与覆盖上传均无「上传后」的文件 PROPFIND。B 档复查是
   // 上传**前**的 Depth:0 档位保护（允许存在）：以每个文件最后一次 PUT 为界，其后不得
   // 再有针对该文件的 PROPFIND；且整个两轮里每文件恰 1 次文件 PROPFIND（首轮新上传 0 +
-  // 次轮覆盖复查 1；旧实现覆盖轮是复查 + 校验共 2 次）。
+  // 次轮覆盖复查 1；覆盖轮仅复查、无逐文件校验）。
 
   await section('BV2：批量校验 B 档覆盖（P2 档）', async () => {
     await setProfile('p2')
@@ -1332,7 +1313,7 @@ const {
   // 覆盖：NETWORK 中断（非取消）自动重传 / 覆盖上传半截 / 对端改小前缀不符仍冲突 /
   // 超 verifyMaxBytes 冲突+提示 / 多开放 intent 去重 / 本地改/删后意图放弃无假重传 /
   // 原子服务器未落地正常覆盖 / 采纳内容确认（同 size 替换不采纳、GET 失败回退）/
-  // WAL 截断保护与 30 天超龄 / 多设备他机收敛（P1 为主，PU11 覆盖 P7）。
+  // WAL 截断保护与 30 天超龄 / 多设备他机收敛。
   // ============================================================
 
   await section('PU：半截上传识别与重传（恢复链路）', async () => {
@@ -2415,8 +2396,8 @@ const {
   //   FC5b（p2 / B 档，探测在 seed 轮前完成，能力缓存定档 B）：故障轮 dedupfail/
   //         子目录下 250 个**新**文件走写前查重（扫描后该路径第 2 次列举 → 503，
   //         worker 池之前逐文件登记 250 条网络类）+ 根目录 60 个 .toolarge 的 413
-  //         永久类（worker 池阶段、排在第 201 条之后全部落入截断区）→ 旧实现按
-  //         保留的前 200 条归纳为 network（other 整段丢失），增量累计后归 mixed；
+  //         永久类（worker 池阶段、排在第 201 条之后全部落入截断区）→ 若只按
+  //         保留的前 200 条归纳会得 network（other 整段丢失），按增量累计后归 mixed；
   //         恢复轮 250 个正常上传，60 个 413 已入永久失败退避表 → 汇总跳过不报错。
   // 慢组：两条 503×4 网络层重试退避链（~3.5s×2）+ 250 文件三轮真实 IO。
   // ============================================================

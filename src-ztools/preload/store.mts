@@ -15,7 +15,8 @@
 //   baselines/<hash16>/failures.json         持续失败退避表（整体原子写）
 //   baselines/<hash16>/pending-conflicts.json 冲突挂起表 + 批量删除快照 + 删除范围决策（整体原子写）
 //   baselines/<hash16>/decision-log.json      决策历史记录（整体原子写，环形上限）
-//   baselines/<hash16>/sync-log.json          同步记录（每轮一条，整体原子写，环形上限）
+//   baselines/<hash16>/sync-log.jsonl         同步记录（每轮一行 append，环形上限+
+//                                              重写松弛；旧 sync-log.json 整文件读时兼容导入）
 //   baselines/<hash16>/scan-cache.json        etag 跳过扫描缓存（整体原子写）
 //   servers/<hash16>/capabilities.json       服务器能力探测缓存（origin+username 粒度）
 //   servers/<hash16>/noise.json              指纹噪声标记（origin+username 粒度、跨目录共享）
@@ -103,10 +104,19 @@ const DECISION_LOG_V = 1
 /** 决策历史环形上限：超出后丢弃最旧条目（纯展示性信息，防膨胀优先于完整性） */
 const MAX_DECISION_LOG_ENTRIES = 200
 // ---- 同步记录 ----
-/** 同步记录（sync-log.json）结构版本号 */
+/** 同步记录（sync-log.jsonl）结构版本号 */
 const SYNC_LOG_V = 1
 /** 同步记录环形上限（轮数）：超出后丢弃最旧轮次（纯展示性信息，防膨胀优先于完整性） */
 const MAX_SYNC_LOG_ROUNDS = 200
+/** 同步记录 JSONL 文件名（追加句柄经 this.fds 按 basename 统一管理，随 flush/close 收尾） */
+const SYNC_LOG_JSONL = 'sync-log.jsonl'
+/**
+ * 同步记录环形重写松弛量：磁盘暂存轮数超过「环形上限 + 松弛量」时才做一次原子全量
+ * 重写，两次重写之间纯 append（每轮一行）—— 单轮落盘写放大从「整表规模」（旧整文件
+ * 实现每轮重写全部 200 轮）摊薄为「单轮增量规模」，重写频率 ≈ 1/松弛量；代价是磁盘
+ * 最多比内存环形多暂存松弛量轮旧记录，加载时统一裁回最新上限轮（环形展示语义不变）。
+ */
+const SYNC_LOG_REWRITE_SLACK = 25
 // ---- etag 跳过扫描缓存----
 /** 扫描缓存（scan-cache.json）结构版本号 */
 const SCAN_CACHE_V = 1
@@ -196,6 +206,8 @@ async function setRootForTest(dir: string | null): Promise<void> {
  *   'json-dir'    atomicWriteJson rename 后的目录 fsync（安全点 5，仅 POSIX）
  *   'compact-dir' compact rename 后的目录 fsync（安全点 5，仅 POSIX）
  *   'truncate'    _truncateFileNow 截断写空后的 fsync（安全点 6）
+ *   'synclog'     同步记录 JSONL 每轮 append 后的句柄 fsync（纯展示数据，维持旧
+ *                 整文件实现「轮末 = 已持久化」的掉电级语义）
  * Windows 上目录类事件（json-dir / compact-dir）不会出现（目录 fsync 被跳过），
  * 这本身就是注入断言的组成部分；onEvent 抛错亦静默，绝不影响写入路径。
  */
@@ -280,7 +292,7 @@ async function getDeviceId(): Promise<string> {
 // 目的：WebDAV 密码经 dbStorage（宿主 LMDB）落盘时不以明文出现 —— 防的是
 // 「随手窥视」（翻数据库文件 / 共享诊断导出 / 截图一眼看到）。密钥就存在同一台
 // 机器的 pluginData 下（secretbox.key），与密文同盘 —— 能读本机任意文件的人同样
-// 能解开：这不是强加密，README 如实说明。不做密钥派生自用户口令一类方案
+// 能解开：这不是强加密（已知边界）。不做密钥派生自用户口令一类方案
 // （每次启动都要问一次密码，与「后台自动同步」的产品形态冲突）。
 //
 // 形态：sealSecret/openSecret 均为**同步**函数（dbStorage.setItem 是同步 IPC，
@@ -335,7 +347,7 @@ function secretboxKey(): Buffer | null {
 /**
  * 加密一段明文（同步）。空串原样返回空串（「没有密码」没有可加密的东西）；
  * 密钥不可用（pluginData 不可写等）返回明文原文 —— 混淆是尽力而为，绝不能因它
- * 让密码丢失或阻断保存；该情形 README 已知边界如实说明。
+ * 让密码丢失或阻断保存（已知边界）。
  * @param {string} plain 明文
  * @returns {string} 密文（wdsync1:...）或原样返回的明文/空串
  */
@@ -465,6 +477,140 @@ function replayLogText(text: string, applyFn: (op: LogOp) => void, warnings: str
   return applied
 }
 
+// ---------- 同步记录行编解码（JSONL 逐轮行） ----------
+
+/**
+ * 编码一行同步记录：{ v, c, o }，c = JSON.stringify(单轮记录) 的 CRC32。与
+ * encodeLine 同构但版本独立固定为 SYNC_LOG_V —— 基线日志与同步记录是两套演进
+ * 生命周期，任一方升版不得牵连另一方旧数据不可读。负载不得含纯数字键（与
+ * decodeLine 同款约束：JSON.parse 保留非数字键顺序，重新 stringify 才能与 CRC 一致）。
+ */
+function encodeSyncLogLine(entry: SyncLogEntry): string {
+  const c = crc32(Buffer.from(JSON.stringify(entry), 'utf-8')) >>> 0
+  return `${JSON.stringify({ v: SYNC_LOG_V, c, o: entry })}\n`
+}
+
+/**
+ * 解码一行同步记录；任何不一致（半行 / JSON 损坏 / 版本不识别 / CRC 不符）返回
+ * null（与 decodeLine 同款容错）。返回的是原始单轮记录，尚需 normalizeSyncRound
+ * 做逐字段宽容归一后才可入内存。
+ */
+function decodeSyncLogLine(line: string): any {
+  if (!line) return null
+  let obj: any
+  try {
+    obj = JSON.parse(line)
+  } catch (_) {
+    return null
+  }
+  if (!obj || obj.v !== SYNC_LOG_V || typeof obj.c !== 'number' || !obj.o || typeof obj.o !== 'object') return null
+  if ((crc32(Buffer.from(JSON.stringify(obj.o), 'utf-8')) >>> 0) !== (obj.c >>> 0)) return null
+  return obj.o
+}
+
+/**
+ * 单轮同步记录的磁盘 → 内存宽容归一（新旧两种文件格式共用的唯一校验口径）：
+ * 起止时刻必须是数字、trigger / status 必须是非空串，畸形条目直接丢弃不连累
+ * 整表；计数缺省 0（旧版本 / 手改文件的宽容读取），操作明细逐条轻校验，err
+ * 截断 500 字符、错误清单截断 200 条（与既有整文件读路径语义逐一等价，仅提取复用）。
+ * @param rd 磁盘上的原始单轮对象 @returns 归一后的记录；畸形返回 null
+ */
+function normalizeSyncRound(rd: any): SyncLogEntry | null {
+  if (!rd || typeof rd !== 'object' || typeof rd.at !== 'number' || typeof rd.endAt !== 'number' || typeof rd.trigger !== 'string' || !rd.trigger || typeof rd.status !== 'string' || !rd.status) return null
+  const ops: any[] = []
+  if (Array.isArray(rd.ops)) {
+    for (const op of rd.ops) {
+      if (op && typeof op === 'object' && typeof op.op === 'string' && typeof op.rel === 'string' && op.rel) {
+        const rec: any = { op: op.op, rel: op.rel }
+        if (op.ok === false) rec.ok = false
+        if (typeof op.err === 'string' && op.err) rec.err = String(op.err).slice(0, 500)
+        if (typeof op.bytes === 'number' && op.bytes > 0) rec.bytes = op.bytes
+        if (op.added === true) rec.added = true
+        if (op.choice === 'local' || op.choice === 'remote' || op.choice === 'both') rec.choice = op.choice
+        if (typeof op.from === 'string' && op.from) rec.from = op.from
+        ops.push(rec)
+      }
+    }
+  }
+  const rec: SyncLogEntry = {
+    at: rd.at,
+    endAt: rd.endAt,
+    trigger: rd.trigger,
+    status: rd.status as SyncLogEntry['status'],
+    uploaded: Number(rd.uploaded) || 0,
+    downloaded: Number(rd.downloaded) || 0,
+    deleted: Number(rd.deleted) || 0,
+    conflicts: Number(rd.conflicts) || 0,
+    adopted: Number(rd.adopted) || 0,
+    deferredConflicts: Number(rd.deferredConflicts) || 0,
+    deleteHeld: Number(rd.deleteHeld) || 0,
+    bytesUp: Number(rd.bytesUp) || 0,
+    bytesDown: Number(rd.bytesDown) || 0,
+    totalFiles: Number(rd.totalFiles) || 0,
+    ops,
+    errors: Array.isArray(rd.errors) ? rd.errors.filter((s: any) => typeof s === 'string' && s).slice(0, 200) : [],
+  }
+  if (rd.op === 'pull' || rd.op === 'push' || rd.op === 'pull-full' || rd.op === 'push-full') rec.op = rd.op
+  if (typeof rd.error === 'string' && rd.error) rec.error = String(rd.error).slice(0, 500)
+  if (typeof rd.errorsDropped === 'number' && rd.errorsDropped > 0) rec.errorsDropped = rd.errorsDropped
+  if (typeof rd.renamed === 'number' && rd.renamed > 0) rec.renamed = rd.renamed
+  return rec
+}
+
+// ---------- 版本化 JSON 状态文件加载壳（各状态表共用） ----------
+
+/** readVersionedJson 的结果判别联合（各分支语义见该函数注释） */
+type VersionedJsonOutcome<T> =
+  | { ok: true; data: T }
+  | { ok: false; kind: 'missing' }
+  | { ok: false; kind: 'unreadable' }
+  | { ok: false; kind: 'corrupt'; parsed: any }
+
+/**
+ * 读取一个「整体原子写的版本化 JSON 状态文件」的加载壳（DirStateStore._load 与
+ * ServerStateStore._load 各状态表同构样板的收敛，防未来加表再手抄一份）：
+ * readFile → ENOENT 按合法缺失（首次打开）→ JSON.parse → gate 版本 / 形状门
+ *（调用方谓词，通常为 `parsed.v === V && 容器形状`）→ 通过交回 data，否则按
+ * corrupt 结算。只收壳不收业务：逐条校验与字段装配由调用方续作。
+ * 不变量：绝不抛出（IO / 解析异常都收敛为分支返回），调用方无需 try。
+ * 行为约定（warning 文案由调用方逐字给出 —— 被测试断言过的用户可见行为）：
+ *   - 读失败且非 ENOENT → unreadable 分支并记 unreadableWarning；
+ *   - 解析抛错或 gate 未过 → corrupt 分支并记 corruptWarning，分支附带 parse 出的
+ *     原始值（parse 抛错时为 null）—— pendings 的「主表损坏但同文件附加载荷仍
+ *     尽力读取」与 capabilities / noise 的「parsed 为假值时不记 warning」都依赖它；
+ *   - 文案传 null = 该分支静默（meta 段的既有语义）。
+ * @param file 状态文件绝对路径
+ * @param gate 版本 / 形状门（入参为 parse 成功的任意值，含 null / 原始类型）
+ * @param unreadableWarning 读失败（非 ENOENT）时的 warning 文案（null = 静默）
+ * @param corruptWarning 解析失败 / gate 未过时的 warning 文案（null = 静默）
+ * @param warnings 接收 warning 的数组（各 store 的 this.warnings）
+ */
+async function readVersionedJson<T>(
+  file: string,
+  gate: (parsed: any) => boolean,
+  unreadableWarning: string | null,
+  corruptWarning: string | null,
+  warnings: string[]
+): Promise<VersionedJsonOutcome<T>> {
+  let raw: string | null = null
+  try {
+    raw = await fsp.readFile(file, 'utf-8')
+  } catch (e: any) {
+    if (e && e.code === 'ENOENT') return { ok: false, kind: 'missing' }
+    if (unreadableWarning) warnings.push(unreadableWarning)
+    return { ok: false, kind: 'unreadable' }
+  }
+  let parsed: any = null
+  try {
+    parsed = JSON.parse(raw)
+  } catch (_) {
+    /* 损坏 → 按空处理 */
+  }
+  if (gate(parsed)) return { ok: true, data: parsed as T }
+  if (corruptWarning) warnings.push(corruptWarning)
+  return { ok: false, kind: 'corrupt', parsed }
+}
+
 // ---------- DirStateStore：单目录基线 + WAL ----------
 
 /**
@@ -519,13 +665,31 @@ class DirStateStore {
   /** 决策历史自上次落盘后是否有变更（门面层追加后立即落盘，不积压到轮末） */
   decisionLogDirty: boolean
   /**
-   * 同步记录（sync-log.json，最新在尾）：每次引擎轮（成功 / 失败 / 取消 / 让出）
+   * 同步记录（sync-log.jsonl，最新在尾）：每次引擎轮（成功 / 失败 / 取消 / 让出）
    * 一条，携带触发方式、起止时间、计数摘要与逐文件操作明细。纯展示性审计状态，
    * 不参与 WAL / 基线 / 挂起语义 —— 丢失或损坏的最坏后果是「同步记录」列表变短。
    */
   syncLog: SyncLogEntry[]
   /** 同步记录自上次落盘后是否有变更（引擎轮末追加后立即落盘，不积压） */
   syncLogDirty: boolean
+  /**
+   * 磁盘同步记录形态：true = 已是 sync-log.jsonl（逐轮 append）；false = 旧整文件
+   * sync-log.json 或尚无任何文件 —— 下次落盘走一次原子全量重写完成迁移 / 建档。
+   */
+  syncLogOnJsonl: boolean
+  /**
+   * 磁盘当前暂存的轮数（含已被内存环形淘汰、尚未被重写清掉的旧轮）。append 路径
+   * 累加、重写路径对齐内存长度，是「是否触发摊薄重写」的判据（见 saveSyncLog）。
+   */
+  syncLogDiskLen: number
+  /** 内存追加单调计数（不随环形淘汰回退）—— 与 syncLogAppendsSynced 的差值即待落盘新轮数 */
+  syncLogAppendsTotal: number
+  /** 已落盘的追加计数（append / 重写两路径推进；差值驱动 append 增量写入） */
+  syncLogAppendsSynced: number
+  /** 加载时是否检出损坏行（半行 / CRC）：置位后下次落盘强制全量重写，顺带自愈撕裂尾行 */
+  syncLogTailDamaged: boolean
+  /** 旧整文件 sync-log.json 是否仍在磁盘（迁移重写成功后尽力删除；残留无语义影响） */
+  syncLogLegacyPresent: boolean
   /** scan-cache.json 损坏降级提示是否已记过（getScanCache 每轮重读磁盘，防长驻进程跨轮刷屏） */
   scanCacheWarned: boolean
   /** 元数据（meta.json）：lastDeepVerifyAt 等（噪声标记已迁至服务器粒度存储，见 ServerStateStore） */
@@ -536,6 +700,7 @@ class DirStateStore {
   fds: Map<string, fs.promises.FileHandle>
   /** 内存序号（仅排障用，不参与校验） */
   seq: number
+  /** log.jsonl 行数运行时计数（压缩判据，见 _appendLine 内的不变量论证：仅 log.jsonl 追加时递增，wal 不计） */
   logLines: number
 
   /** @param dirPath 基线存储目录 @param keyInfo { deviceId, localPath, remotePath }（已规范化，写回 meta 备查） */
@@ -556,6 +721,12 @@ class DirStateStore {
     this.decisionLogDirty = false
     this.syncLog = []
     this.syncLogDirty = false
+    this.syncLogOnJsonl = false
+    this.syncLogDiskLen = 0
+    this.syncLogAppendsTotal = 0
+    this.syncLogAppendsSynced = 0
+    this.syncLogTailDamaged = false
+    this.syncLogLegacyPresent = false
     this.scanCacheWarned = false
     this.meta = { v: SCHEMA_V, ...keyInfo }
     this.chain = Promise.resolve()
@@ -587,208 +758,168 @@ class DirStateStore {
 
   async _load() {
     await fsp.mkdir(this.dirPath, { recursive: true })
-    // meta：损坏不致命，按默认值继续（会话内重新累计）
-    try {
-      const meta = JSON.parse(await fsp.readFile(this.metaPath(), 'utf-8'))
-      if (meta && meta.v === SCHEMA_V && typeof meta === 'object') {
-        // 噪声字段（noiseFiles / fingerprintUnstable）已迁移到服务器粒度存储，
-        // 此处即便旧文件带出也不再读入目录粒度
-        this.meta = { ...this.meta, ...meta }
-        delete this.meta.noiseFiles
-        delete this.meta.fingerprintUnstable
-      }
-    } catch (_) {
-      /* 首次打开 */
+    // meta：损坏不致命，按默认值继续（会话内重新累计）。既有语义完全静默 —— 读
+    // 失败 / 解析失败 / 版本不识别都不记 warning（两段文案均传 null）
+    const metaDoc = await readVersionedJson<Record<string, unknown> & { v: number }>(this.metaPath(),
+      (parsed) => !!(parsed && parsed.v === SCHEMA_V && typeof parsed === 'object'), null, null, this.warnings)
+    if (metaDoc.ok) {
+      // 噪声字段（noiseFiles / fingerprintUnstable）已迁移到服务器粒度存储，
+      // 此处即便旧文件带出也不再读入目录粒度
+      this.meta = { ...this.meta, ...metaDoc.data }
+      delete this.meta.noiseFiles
+      delete this.meta.fingerprintUnstable
     }
     // failures（持续失败退避表）：损坏 / 版本不识别一律按空处理并记 warning ——
     // 失败记录只是「避免每轮撞墙」的优化，绝不影响同步安全（基线与 WAL 不受牵连）；
     // 放在快照加载之前，快照损坏触发的提前 return 也不会漏掉本表
-    let failRaw: any = null
-    try {
-      failRaw = await fsp.readFile(this.failuresPath(), 'utf-8')
-    } catch (e: any) {
-      if (e && e.code !== 'ENOENT') this.warnings.push('failures.json 不可读：失败退避记录按空处理')
-    }
-    if (failRaw !== null) {
-      let parsed: any = null
-      try {
-        parsed = JSON.parse(failRaw)
-      } catch (_) {
-        /* 损坏 → 按空处理 */
-      }
-      if (parsed && parsed.v === FAILURES_V && parsed.failures && typeof parsed.failures === 'object') {
-        for (const k of Object.keys(parsed.failures)) {
-          const f = parsed.failures[k]
-          // 逐条轻校验：count / retryAtMs 必须是数字，畸形条目直接丢弃（不连累整表）
-          if (f && typeof f === 'object' && typeof f.count === 'number' && typeof f.retryAtMs === 'number') {
-            this.failures.set(nfc(k), {
-              code: String(f.code || ''),
-              message: String(f.message || '').slice(0, FAILURE_MSG_MAX),
-              count: f.count,
-              firstAt: Number(f.firstAt) || 0,
-              lastAt: Number(f.lastAt) || 0,
-              retryAtMs: f.retryAtMs,
-            })
-          }
+    const failDoc = await readVersionedJson<{ failures: Record<string, any> }>(this.failuresPath(),
+      (parsed) => !!(parsed && parsed.v === FAILURES_V && parsed.failures && typeof parsed.failures === 'object'),
+      'failures.json 不可读：失败退避记录按空处理', 'failures.json 损坏或版本不识别：失败退避记录按空处理', this.warnings)
+    if (failDoc.ok) {
+      for (const k of Object.keys(failDoc.data.failures)) {
+        const f = failDoc.data.failures[k]
+        // 逐条轻校验：count / retryAtMs 必须是数字，畸形条目直接丢弃（不连累整表）
+        if (f && typeof f === 'object' && typeof f.count === 'number' && typeof f.retryAtMs === 'number') {
+          this.failures.set(nfc(k), {
+            code: String(f.code || ''),
+            message: String(f.message || '').slice(0, FAILURE_MSG_MAX),
+            count: f.count,
+            firstAt: Number(f.firstAt) || 0,
+            lastAt: Number(f.lastAt) || 0,
+            retryAtMs: f.retryAtMs,
+          })
         }
-      } else {
-        this.warnings.push('failures.json 损坏或版本不识别：失败退避记录按空处理')
       }
     }
     // pendings（冲突挂起表）：损坏 / 版本不识别一律按空处理并记 warning ——
     // 挂起只是「用户已选择但尚未落地的决策」的辅助状态，绝不影响同步安全
     //（基线与 WAL 不受牵连；最坏情形是丢失后下一轮重新询问用户）。与 failures
     // 同样放在快照加载之前，快照损坏触发的提前 return 也不会漏掉本表。
-    let pendRaw: any = null
-    try {
-      pendRaw = await fsp.readFile(this.pendingPath(), 'utf-8')
-    } catch (e: any) {
-      if (e && e.code !== 'ENOENT') this.warnings.push('pending-conflicts.json 不可读：冲突挂起记录按空处理')
-    }
-    if (pendRaw !== null) {
-      let parsed: any = null
-      try {
-        parsed = JSON.parse(pendRaw)
-      } catch (_) {
-        /* 损坏 → 按空处理 */
-      }
-      if (parsed && parsed.v === PENDINGS_V && parsed.pendings && typeof parsed.pendings === 'object') {
-        for (const k of Object.keys(parsed.pendings)) {
-          const p = parsed.pendings[k]
-            // 逐条轻校验：createdAt 必须是数字、两侧指纹必须是对象；choice 只认合法值，
-            // 其余（含畸形 / 手改的任意串）按「未解决」降级保留条目 —— 畸形条目不连累整表。
-            // kind='delete'（删除确认类）/ 'root-lost'（根丢失决策类）原样保留；其余值按冲突类（无 kind）处理
-            if (p && typeof p === 'object' && typeof p.createdAt === 'number' && p.local && typeof p.local === 'object' && p.remote && typeof p.remote === 'object') {
-              const rec: PendingRecord = {
-                local: { size: Number(p.local.size) || 0, mtimeMs: Number(p.local.mtimeMs) || 0 },
-                remote: { size: Number(p.remote.size) || 0, mtimeMs: Number(p.remote.mtimeMs) || 0, etag: String(p.remote.etag || '') },
-                createdAt: p.createdAt,
-              }
-              if (p.kind === 'delete' || p.kind === 'root-lost') rec.kind = p.kind
-              if (p.choice != null && PENDING_CHOICES.has(p.choice)) rec.choice = p.choice
-              // 范围决策盖章的来源标记（scope 前缀 + 代际）：仅删除确认类可能携带；
-              // 畸形（缺代际 / 非串前缀）按无来源处理 —— 退化为普通逐文件选择，安全侧
-              if (rec.kind === 'delete' && typeof p.scope === 'string' && typeof p.scopeGen === 'number') {
-                rec.scope = p.scope
-                rec.scopeGen = p.scopeGen
-              }
-              this.pendings.set(nfc(k), rec)
-            }
-        }
-      } else {
-        this.warnings.push('pending-conflicts.json 损坏或版本不识别：冲突挂起记录按空处理')
-      }
-      // 附加载荷（同文件，向后兼容：旧版本文件没有这两个字段 → 按缺省空值处理）：
-      // deleteBatch 批量删除快照 / deleteScopes 删除范围决策。畸形一律按「无」降级 ——
-      // 快照缺失时引擎在下一轮触发拦截时重建，scope 丢失只是回到「重新询问」的安全侧。
-      const b = parsed && parsed.deleteBatch
-      if (b && typeof b === 'object' && typeof b.at === 'number' && typeof b.total === 'number' && typeof b.bytes === 'number' && Array.isArray(b.nodes)) {
-        const nodes = b.nodes
-          .filter((nd: any) => nd && typeof nd.rel === 'string' && typeof nd.files === 'number' && typeof nd.bytes === 'number')
-          .map((nd: any) => ({ rel: nfc(nd.rel), isDir: !!nd.isDir, files: Math.max(0, nd.files), bytes: Math.max(0, nd.bytes) }))
-        if (nodes.length) this.deleteBatch = { at: b.at, total: Math.max(0, b.total), bytes: Math.max(0, b.bytes), nodes }
-      }
-      const sc = parsed && parsed.deleteScopes
-      if (Array.isArray(sc)) {
-        for (const s of sc) {
-          // 逐条轻校验：prefix 非空串（'' = 整目录，合法）、choice 只认 delete/keep；
-          // gen 缺失按 0（扁平代际）处理
-          if (s && typeof s === 'object' && typeof s.prefix === 'string' && (s.choice === 'delete' || s.choice === 'keep')) {
-            this.deleteScopes.push({ prefix: nfc(s.prefix), choice: s.choice, at: Number(s.at) || Date.now(), gen: Number(s.gen) || 0 })
+    const pendDoc = await readVersionedJson<{ pendings: Record<string, any> }>(this.pendingPath(),
+      (parsed) => !!(parsed && parsed.v === PENDINGS_V && parsed.pendings && typeof parsed.pendings === 'object'),
+      'pending-conflicts.json 不可读：冲突挂起记录按空处理', 'pending-conflicts.json 损坏或版本不识别：冲突挂起记录按空处理', this.warnings)
+    // 同文件的原始 parse 值（corrupt 分支也交回 —— 附加载荷在主表损坏时仍尽力读取，
+    // 与既有「warning 照记、附加载荷照读」的语义一致；missing / unreadable / parse
+    // 抛错时为 null，附加载荷随之跳过）
+    const pendParsed: any = pendDoc.ok ? pendDoc.data : pendDoc.kind === 'corrupt' ? pendDoc.parsed : null
+    if (pendDoc.ok) {
+      for (const k of Object.keys(pendDoc.data.pendings)) {
+        const p = pendDoc.data.pendings[k]
+        // 逐条轻校验：createdAt 必须是数字、两侧指纹必须是对象；choice 只认合法值，
+        // 其余（含畸形 / 手改的任意串）按「未解决」降级保留条目 —— 畸形条目不连累整表。
+        // kind='delete'（删除确认类）/ 'root-lost'（根丢失决策类）原样保留；其余值按冲突类（无 kind）处理
+        if (p && typeof p === 'object' && typeof p.createdAt === 'number' && p.local && typeof p.local === 'object' && p.remote && typeof p.remote === 'object') {
+          const rec: PendingRecord = {
+            local: { size: Number(p.local.size) || 0, mtimeMs: Number(p.local.mtimeMs) || 0 },
+            remote: { size: Number(p.remote.size) || 0, mtimeMs: Number(p.remote.mtimeMs) || 0, etag: String(p.remote.etag || '') },
+            createdAt: p.createdAt,
           }
+          if (p.kind === 'delete' || p.kind === 'root-lost') rec.kind = p.kind
+          if (p.choice != null && PENDING_CHOICES.has(p.choice)) rec.choice = p.choice
+          // 范围决策盖章的来源标记（scope 前缀 + 代际）：仅删除确认类可能携带；
+          // 畸形（缺代际 / 非串前缀）按无来源处理 —— 退化为普通逐文件选择，安全侧
+          if (rec.kind === 'delete' && typeof p.scope === 'string' && typeof p.scopeGen === 'number') {
+            rec.scope = p.scope
+            rec.scopeGen = p.scopeGen
+          }
+          this.pendings.set(nfc(k), rec)
+        }
+      }
+    }
+    // 附加载荷（同文件，向后兼容：旧版本文件没有这两个字段 → 按缺省空值处理）：
+    // deleteBatch 批量删除快照 / deleteScopes 删除范围决策。畸形一律按「无」降级 ——
+    // 快照缺失时引擎在下一轮触发拦截时重建，scope 丢失只是回到「重新询问」的安全侧。
+    // 挂在主表门之外（经 pendParsed）：主表版本不识别时 warning 照记、附加载荷仍
+    // 尽力读取（既有语义）。
+    const b = pendParsed && pendParsed.deleteBatch
+    if (b && typeof b === 'object' && typeof b.at === 'number' && typeof b.total === 'number' && typeof b.bytes === 'number' && Array.isArray(b.nodes)) {
+      const nodes = b.nodes
+        .filter((nd: any) => nd && typeof nd.rel === 'string' && typeof nd.files === 'number' && typeof nd.bytes === 'number')
+        .map((nd: any) => ({ rel: nfc(nd.rel), isDir: !!nd.isDir, files: Math.max(0, nd.files), bytes: Math.max(0, nd.bytes) }))
+      if (nodes.length) this.deleteBatch = { at: b.at, total: Math.max(0, b.total), bytes: Math.max(0, b.bytes), nodes }
+    }
+    const sc = pendParsed && pendParsed.deleteScopes
+    if (Array.isArray(sc)) {
+      for (const s of sc) {
+        // 逐条轻校验：prefix 非空串（'' = 整目录，合法）、choice 只认 delete/keep；
+        // gen 缺失按 0（扁平代际）处理
+        if (s && typeof s === 'object' && typeof s.prefix === 'string' && (s.choice === 'delete' || s.choice === 'keep')) {
+          this.deleteScopes.push({ prefix: nfc(s.prefix), choice: s.choice, at: Number(s.at) || Date.now(), gen: Number(s.gen) || 0 })
         }
       }
     }
     // decision-log（决策历史）：损坏 / 版本不识别一律按空处理并记 warning —— 纯展示性
     // 审计信息，绝不影响同步安全；与 failures / pendings 同样放在快照加载之前。
-    let dlogRaw: any = null
-    try {
-      dlogRaw = await fsp.readFile(this.decisionLogPath(), 'utf-8')
-    } catch (e: any) {
-      if (e && e.code !== 'ENOENT') this.warnings.push('decision-log.json 不可读：决策历史按空处理')
-    }
-    if (dlogRaw !== null) {
-      let parsed: any = null
-      try {
-        parsed = JSON.parse(dlogRaw)
-      } catch (_) {
-        /* 损坏 → 按空处理 */
-      }
-      if (parsed && parsed.v === DECISION_LOG_V && Array.isArray(parsed.entries)) {
-        for (const en of parsed.entries) {
-          // 逐条轻校验：at 必须是数字、rel/kind/choice 必须是非空串；畸形条目直接丢弃
-          if (en && typeof en === 'object' && typeof en.at === 'number' && typeof en.rel === 'string' && en.rel && typeof en.kind === 'string' && en.kind && typeof en.choice === 'string' && en.choice) {
-            const rec: DecisionLogEntry = { at: en.at, rel: en.rel, kind: en.kind as DecisionLogEntry['kind'], choice: en.choice }
-            if (typeof en.affected === 'number' && en.affected > 0) rec.affected = en.affected
-            this.decisionLog.push(rec)
-          }
+    const dlogDoc = await readVersionedJson<{ entries: any[] }>(this.decisionLogPath(),
+      (parsed) => !!(parsed && parsed.v === DECISION_LOG_V && Array.isArray(parsed.entries)),
+      'decision-log.json 不可读：决策历史按空处理', 'decision-log.json 损坏或版本不识别：决策历史按空处理', this.warnings)
+    if (dlogDoc.ok) {
+      for (const en of dlogDoc.data.entries) {
+        // 逐条轻校验：at 必须是数字、rel/kind/choice 必须是非空串；畸形条目直接丢弃
+        if (en && typeof en === 'object' && typeof en.at === 'number' && typeof en.rel === 'string' && en.rel && typeof en.kind === 'string' && en.kind && typeof en.choice === 'string' && en.choice) {
+          const rec: DecisionLogEntry = { at: en.at, rel: en.rel, kind: en.kind as DecisionLogEntry['kind'], choice: en.choice }
+          if (typeof en.affected === 'number' && en.affected > 0) rec.affected = en.affected
+          this.decisionLog.push(rec)
         }
-      } else {
-        this.warnings.push('decision-log.json 损坏或版本不识别：决策历史按空处理')
       }
     }
-    // sync-log（同步记录）：损坏 / 版本不识别一律按空处理并记 warning —— 纯展示性
-    // 审计信息，绝不影响同步安全；与 failures / pendings 同样放在快照加载之前。
-    let slogRaw: any = null
+    // sync-log（同步记录）：新格式 sync-log.jsonl（逐轮一行、CRC 保护，环形 200 轮
+    // + 重写松弛，见 saveSyncLog 的摊薄论证）；旧版本整文件 JSON sync-log.json 读时
+    // 兼容导入（首次落盘原子迁移为 JSONL 并删除旧文件）。损坏 / 版本不识别一律按空
+    // 处理并记 warning —— 纯展示性审计信息，绝不影响同步安全；与 failures / pendings
+    // 同样放在快照加载之前（快照损坏的提前 return 也不会漏掉本表）。
+    let slogLines: string[] | null = null
     try {
-      slogRaw = await fsp.readFile(this.syncLogPath(), 'utf-8')
+      slogLines = (await fsp.readFile(this.syncLogPath(), 'utf-8')).split('\n')
+      this.syncLogOnJsonl = true
+      // 迁移重写 rename 成功后、删除旧文件前崩溃会短暂双存：以 .jsonl 为准，旧文件
+      // 仅作为待清理残留登记（access 一次判定，下次落盘删），不再读入
+      await fsp.access(this.syncLogLegacyPath()).then(
+        () => { this.syncLogLegacyPresent = true },
+        () => { /* 无旧文件：常态 */ }
+      )
     } catch (e: any) {
-      if (e && e.code !== 'ENOENT') this.warnings.push('sync-log.json 不可读：同步记录按空处理')
+      if (e && e.code !== 'ENOENT') this.warnings.push('sync-log.jsonl 不可读：同步记录按空处理')
     }
-    if (slogRaw !== null) {
-      let parsed: any = null
-      try {
-        parsed = JSON.parse(slogRaw)
-      } catch (_) {
-        /* 损坏 → 按空处理 */
+    if (slogLines !== null) {
+      // JSONL 逐行解码：半行 / CRC 失败 / 版本不识别 → 该行及其后全部丢弃。append-only
+      // 文件的损坏只可能发生在尾部（append 半途崩溃）；两次原子重写之间没有中段写入，
+      // 中段损坏只可能来自磁盘级破坏 —— 其后整段不信任与基线日志同款既定纪律。
+      // 磁盘允许比内存环形多暂存「重写松弛」轮，加载后统一裁回最新上限轮。
+      for (let i = 0; i < slogLines.length; i++) {
+        const rawLine = slogLines[i].trim()
+        if (!rawLine) continue // 容忍末尾空行
+        const rec = normalizeSyncRound(decodeSyncLogLine(rawLine))
+        if (!rec) {
+          this.syncLogTailDamaged = true
+          this.warnings.push(`sync-log.jsonl: 第 ${i + 1} 行损坏（半行/CRC/版本），该行及其后已丢弃`)
+          break
+        }
+        this.syncLog.push(rec)
+        this.syncLogDiskLen++
       }
-      if (parsed && parsed.v === SYNC_LOG_V && Array.isArray(parsed.rounds)) {
-        for (const rd of parsed.rounds) {
-          // 逐条轻校验：起止时刻必须是数字、trigger / status 必须是非空串；畸形条目
-          // 直接丢弃不连累整表（与 decision-log 同款容错）。计数缺省 0（旧版本 /
-          // 手改文件的宽容读取），操作明细逐条校验并做防御性截断。
-          if (rd && typeof rd === 'object' && typeof rd.at === 'number' && typeof rd.endAt === 'number' && typeof rd.trigger === 'string' && rd.trigger && typeof rd.status === 'string' && rd.status) {
-            const ops: any[] = []
-            if (Array.isArray(rd.ops)) {
-              for (const op of rd.ops) {
-                if (op && typeof op === 'object' && typeof op.op === 'string' && typeof op.rel === 'string' && op.rel) {
-                  const rec: any = { op: op.op, rel: op.rel }
-                  if (op.ok === false) rec.ok = false
-                  if (typeof op.err === 'string' && op.err) rec.err = String(op.err).slice(0, 500)
-                  if (typeof op.bytes === 'number' && op.bytes > 0) rec.bytes = op.bytes
-                  if (op.added === true) rec.added = true
-                  if (op.choice === 'local' || op.choice === 'remote' || op.choice === 'both') rec.choice = op.choice
-                  ops.push(rec)
-                }
-              }
-            }
-            const rec: SyncLogEntry = {
-              at: rd.at,
-              endAt: rd.endAt,
-              trigger: rd.trigger,
-              status: rd.status as SyncLogEntry['status'],
-              uploaded: Number(rd.uploaded) || 0,
-              downloaded: Number(rd.downloaded) || 0,
-              deleted: Number(rd.deleted) || 0,
-              conflicts: Number(rd.conflicts) || 0,
-              adopted: Number(rd.adopted) || 0,
-              deferredConflicts: Number(rd.deferredConflicts) || 0,
-              deleteHeld: Number(rd.deleteHeld) || 0,
-              bytesUp: Number(rd.bytesUp) || 0,
-              bytesDown: Number(rd.bytesDown) || 0,
-              totalFiles: Number(rd.totalFiles) || 0,
-              ops,
-              errors: Array.isArray(rd.errors) ? rd.errors.filter((s: any) => typeof s === 'string' && s).slice(0, 200) : [],
-            }
-            if (rd.op === 'pull' || rd.op === 'push' || rd.op === 'pull-full' || rd.op === 'push-full') rec.op = rd.op
-            if (typeof rd.error === 'string' && rd.error) rec.error = String(rd.error).slice(0, 500)
-            if (typeof rd.errorsDropped === 'number' && rd.errorsDropped > 0) rec.errorsDropped = rd.errorsDropped
+    } else {
+      // 旧整文件格式（历史版本写入）：v 与 rounds 形状校验 + 逐条归一导入；
+      // 导入完成后（无论条数）首次落盘即整体迁移为 JSONL。读得到文件（无论好坏）
+      // 即登记旧文件在场标记（下次落盘清理）
+      const legacyDoc = await readVersionedJson<{ rounds: any[] }>(this.syncLogLegacyPath(),
+        (parsed) => !!(parsed && parsed.v === SYNC_LOG_V && Array.isArray(parsed.rounds)),
+        'sync-log.json 不可读：同步记录按空处理', 'sync-log.json 损坏或版本不识别：同步记录按空处理', this.warnings)
+      if (legacyDoc.ok || legacyDoc.kind === 'corrupt') this.syncLogLegacyPresent = true
+      if (legacyDoc.ok) {
+        for (const rd of legacyDoc.data.rounds) {
+          const rec = normalizeSyncRound(rd)
+          if (rec) {
             this.syncLog.push(rec)
+            this.syncLogDiskLen++
           }
         }
-      } else {
-        this.warnings.push('sync-log.json 损坏或版本不识别：同步记录按空处理')
       }
+    }
+    // 统一裁回环形上限：JSONL 磁盘可能多暂存松弛量轮旧记录；旧整文件虽写入即封顶，
+    // 手改文件也在此收敛（内存环形语义在任何加载形态下都成立）
+    if (this.syncLog.length > MAX_SYNC_LOG_ROUNDS) {
+      this.syncLog.splice(0, this.syncLog.length - MAX_SYNC_LOG_ROUNDS)
     }
     // snapshot：不存在 = 合法首轮；存在但不可解析 = 损坏 → 无基线保护
     const snapPath = path.join(this.dirPath, 'snapshot.json')
@@ -868,6 +999,10 @@ class DirStateStore {
     return path.join(this.dirPath, 'decision-log.json')
   }
   syncLogPath(): string {
+    return path.join(this.dirPath, SYNC_LOG_JSONL)
+  }
+  /** 旧版整文件格式的同步记录路径（仅读时兼容导入与迁移后清理，不再写入） */
+  syncLogLegacyPath(): string {
     return path.join(this.dirPath, 'sync-log.json')
   }
   scanCachePath(): string {
@@ -903,6 +1038,16 @@ class DirStateStore {
   _appendLine(name: string, op: LogOp, fsyncKind?: string | null): Promise<void> {
     return this._chain(async () => {
       this.seq++
+      // logLines 是压缩判据（compactIfNeeded 的 logLines >= COMPACT_LOG_LINES）的
+      // 运行时计数：仅追加 log.jsonl 时递增，wal.jsonl 不计（WAL 行数由轮末
+      // truncateWal 整体清空约束，无需阈值压缩）。自增必须放在 _chain 任务体内：
+      // compact() 的 _truncateFileNow('log.jsonl') + logLines = 0 也在本链上执行，
+      // 二者严格串行 —— 不存在「压缩清零后又被先前追加的计数 +1 反弹」或「清零
+      // 被覆盖」的互踩窗口；若在链外自增，则与链内清零无序交错，计数必然漂移。
+      // 计数点收敛在本方法而非各调用方：未来新增 log.jsonl 写入点自动被覆盖，不会
+      // 漏计。取写前计数：追加失败至多多计一行，只可能提前触发一次无害压缩（压缩
+      // 后按实际截断重置为 0），不会退回漏计的无界增长。
+      if (name === 'log.jsonl') this.logLines++
       const fh = await this._fdFor(name)
       await fh.writeFile(encodeLine(this.seq, op), 'utf-8')
       if (fsyncKind) {
@@ -1358,10 +1503,17 @@ class DirStateStore {
 
   // ---- 同步记录 ----
   //
-  // 语义：sync-log.json（整体原子写）保存每次引擎轮一条的同步审计记录（引擎
-  // syncDirectory 收尾处 appendSyncLog，最新在尾，环形上限 MAX_SYNC_LOG_ROUNDS
-  // 轮 —— 超限丢弃最旧）。与 decision-log 同为「展示 / 审计」性质：不承载任何
-  // 数据事实，删除本文件不影响同步正确性，只影响「同步记录」页可回看的范围。
+  // 语义：sync-log.jsonl（逐轮一行 append）保存每次引擎轮一条的同步审计记录
+  //（引擎 syncDirectory 收尾处 appendSyncLog，最新在尾，内存环形上限
+  // MAX_SYNC_LOG_ROUNDS 轮 —— 超限丢弃最旧）。与 decision-log 同为「展示 / 审计」
+  // 性质：不承载任何数据事实，删除本文件不影响同步正确性，只影响「同步记录」页
+  // 可回看的范围。
+  //
+  // 落盘形态（对比旧版整文件每轮全量重写的写放大——大目录稳态下 200 轮 × 每轮
+  // 全量 ops 明细可达数十 MB/轮的重复写）：常规轮仅 append 本轮一行（写放大 ∝
+  // 单轮增量）；仅当磁盘暂存轮数超过「环形上限 + SYNC_LOG_REWRITE_SLACK」、或
+  // 首次建档 / 旧格式迁移 / 加载检出损坏尾行时，才做一次原子全量重写 —— 稳态下
+  // 重写频率 ≈ 1/松弛量，整表写成本被摊薄同倍数，环形淘汰语义不变。
 
   /**
    * 追加一条同步记录（引擎 syncDirectory 轮末收尾时调用）。环形上限：超出后
@@ -1371,6 +1523,10 @@ class DirStateStore {
    */
   appendSyncLog(entry: SyncLogEntry): void {
     this.syncLog.push(entry)
+    // 单调追加计数：即使本轮在落盘前就被环形淘汰（批量追加场景），计数也不回退 ——
+    // 与 syncLogAppendsSynced 的差值始终等于「尚未落盘的新轮数」，append 路径据此
+    // 取增量尾段；被淘汰未落盘的轮次本就属可丢的展示数据（旧整文件实现同语义）
+    this.syncLogAppendsTotal++
     if (this.syncLog.length > MAX_SYNC_LOG_ROUNDS) {
       this.syncLog.splice(0, this.syncLog.length - MAX_SYNC_LOG_ROUNDS)
     }
@@ -1385,12 +1541,100 @@ class DirStateStore {
     return [...this.syncLog].reverse()
   }
 
-  /** 落盘同步记录（引擎轮末追加后立即调用，不积压；经 chain 与其他表写入串行） */
+  /**
+   * 落盘同步记录（引擎轮末追加后立即调用，不积压；经 chain 与其他表写入串行）。
+   * 路径选择见上方「落盘形态」注释：append 增量（常态）/ 原子全量重写（建档、
+   * 旧格式迁移、环形淘汰摊薄点、损坏尾行自愈）。
+   */
   async saveSyncLog(): Promise<void> {
-    return this._chain(async () => {
-      await atomicWriteJson(this.syncLogPath(), { v: SYNC_LOG_V, rounds: this.syncLog })
+    return this._chain(() => this._saveSyncLogNow())
+  }
+
+  /**
+   * saveSyncLog 的内部实现（调用方必须已持有 chain；不得直接外部调用，否则与
+   * 其他表写入失去串行化）。两个不变量：
+   *   - append 路径只写「上次落盘后新增的尾段」：环形淘汰只移除内存头部，尾段
+   *     切片恒为最新追加且顺序与磁盘衔接；磁盘暂存的已淘汰旧轮只会被后续重写
+   *     清掉，加载侧统一裁回最新上限轮，环形语义不受影响；
+   *   - 任何写失败最终要么重写成功（自愈 append 半途留下的撕裂尾行）、要么向上
+   *     抛出（与旧整文件实现的失败语义同层 —— 纯展示数据，调用方 catch 后无害）。
+   */
+  async _saveSyncLogNow(): Promise<void> {
+    const newAppends = this.syncLogAppendsTotal - this.syncLogAppendsSynced
+    if (
+      !this.syncLogOnJsonl || // 尚无文件 / 旧整文件格式：首次落盘整体建档或迁移
+      this.syncLogTailDamaged || // 加载检出损坏尾行：全量重写自愈，append 不得续在撕裂行之后
+      this.syncLogDiskLen + newAppends > MAX_SYNC_LOG_ROUNDS + SYNC_LOG_REWRITE_SLACK // 环形淘汰摊薄重写点
+    ) {
+      await this._rewriteSyncLogNow()
+      return
+    }
+    if (newAppends === 0) {
+      // 无新轮且磁盘已是最新：落盘结果不变，仅省去整表重写的写放大
       this.syncLogDirty = false
-    })
+      return
+    }
+    // append 路径：增量尾段一次续写（单轮常规场景恰为一行）
+    const tail = newAppends >= this.syncLog.length ? this.syncLog : this.syncLog.slice(-newAppends)
+    try {
+      const fh = await this._fdFor(SYNC_LOG_JSONL)
+      await fh.writeFile(tail.map(encodeSyncLogLine).join(''), 'utf-8')
+      // 每次落盘 fsync 一次（append 模式句柄的内容持久化只需句柄 fsync；文件目录项
+      // 已在建档重写的 rename + 目录 fsync 中落盘）：维持旧整文件实现「轮末 = 已
+      // 持久化」的掉电级语义，同频（每轮一次）而代价只剩单行
+      await fh.sync().catch(() => {})
+      noteFsync('synclog', path.join(this.dirPath, SYNC_LOG_JSONL))
+    } catch (_) {
+      // append 半途失败可能留下撕裂尾行：退化为全量重写自愈（重写也失败才上抛）
+      await this._rewriteSyncLogNow()
+      return
+    }
+    this.syncLogDiskLen += tail.length
+    this.syncLogAppendsSynced = this.syncLogAppendsTotal
+    this.syncLogDirty = false
+    await this._cleanupLegacySyncLog()
+  }
+
+  /**
+   * 全量重写同步记录为 JSONL（调用方必须已持有 chain）：关 append 句柄 → 写 tmp →
+   * fsync → rename → 目录 fsync —— 与 atomicWriteJson 同款崩溃安全（安全点 5：rename
+   * 前旧文件始终完整可读，rename 后新文件完整，任意断点不出现半表状态）。必须先关
+   * 句柄再 rename：POSIX rename 只替换目录项，已打开的 fd 仍指向旧 inode，不关则
+   * 后续 append 会写进被换下的孤儿文件（与 _truncateFileNow 同款先关后写纪律）。
+   */
+  async _rewriteSyncLogNow(): Promise<void> {
+    const old = this.fds.get(SYNC_LOG_JSONL)
+    if (old) {
+      this.fds.delete(SYNC_LOG_JSONL)
+      await old.close().catch(() => {})
+    }
+    const file = this.syncLogPath()
+    const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
+    const fh = await fsp.open(tmp, 'w')
+    try {
+      await fh.writeFile(this.syncLog.map(encodeSyncLogLine).join(''), 'utf-8')
+      await fh.sync()
+      noteFsync('json-file', tmp)
+    } finally {
+      await fh.close()
+    }
+    await fsp.rename(tmp, file)
+    await fsyncDirIfPossible(this.dirPath, 'json-dir')
+    // 重写以内存环形窗口为准：已被淘汰未落盘的轮次在此正式放弃（展示性数据，
+    // 与旧整文件实现「落盘即写内存窗口」的语义一致）
+    this.syncLogOnJsonl = true
+    this.syncLogDiskLen = this.syncLog.length
+    this.syncLogAppendsSynced = this.syncLogAppendsTotal
+    this.syncLogTailDamaged = false
+    this.syncLogDirty = false
+    await this._cleanupLegacySyncLog()
+  }
+
+  /** 迁移完成后尽力删除旧整文件（不存在 / 删除失败均静默：残留文件无语义影响，下次落盘再试） */
+  async _cleanupLegacySyncLog(): Promise<void> {
+    if (!this.syncLogLegacyPresent) return
+    await fsp.unlink(this.syncLogLegacyPath()).catch(() => {})
+    this.syncLogLegacyPresent = false
   }
 
   // ---- etag 跳过扫描缓存----
@@ -1574,6 +1818,18 @@ function serverStateDirPath(origin: string, username: string): string {
 }
 
 /**
+ * capabilities.json 落盘与缓存的实际形状：DavCapabilities 的**公共字段**部分 ——
+ * 不含 tier / writable（两者是 services 侧 effectiveCaps 按目标远端根路径组装的
+ * 「生效视图」，随调用方即时计算、不落盘），另带 writePaths（各远端根路径的写
+ * 结论表；retry 型结论从不落盘，见 services 探测函数）。探测方（services）在本
+ * 类型上读写 writePaths，故类型必须如实包含，不能只用 DavCapabilities。
+ */
+type CachedCapabilities = Omit<DavCapabilities, 'tier' | 'writable'> & {
+  /** 规范化远端根路径 → 写结论（writable / probedAt 必有；reason / tech 为 C 档降级说明） */
+  writePaths?: Record<string, { writable: boolean; probedAt: number; reason?: string; tech?: string }>
+}
+
+/**
  * 单个「origin + username」的服务器状态存储。
  * 与 DirStateStore 的目录粒度不同，这里存放跨目录共享的服务器级事实：
  *   - capabilities.json：probeCapabilities 的探测结果（档位 / etag / 条件请求等），
@@ -1590,7 +1846,7 @@ class ServerStateStore {
   /** { origin, username }（写回文件备查） */
   keyInfo: { origin: string; username: string }
   /** 最近一次成功探测的结果（null = 从未探测 / 缓存不可用） */
-  capabilities: any
+  capabilities: CachedCapabilities | null
   /**
    * 指纹噪声状态：{ fingerprintUnstable, noiseFiles, concurrencyWarned }。
    * concurrencyWarned：B 档并发安全提示是否已在本服务器（origin+username）提醒过 ——
@@ -1625,47 +1881,43 @@ class ServerStateStore {
     return store
   }
 
-  /** 加载两个状态文件：缺失 = 首次；损坏 / 版本不识别 = 按默认值继续并记 warning（探测可重做） */
+  /** 加载两个状态文件：缺失 = 首次；损坏 / 版本不识别 = 按默认值继续并记 warning（探测可重做）。warning 只在「parse 出真值但版本 / 形状不识别」时记（parsed 为假值 / 读失败静默），与既有语义一致 */
   async _load(): Promise<void> {
     await fsp.mkdir(this.dirPath, { recursive: true }).catch(() => {})
-    try {
-      const parsed: any = JSON.parse(await fsp.readFile(path.join(this.dirPath, 'capabilities.json'), 'utf-8'))
-      if (parsed && parsed.v === SERVER_STATE_V && parsed.caps && typeof parsed.caps === 'object' && typeof parsed.caps.probedAt === 'number') {
-        this.capabilities = parsed.caps
-      } else if (parsed) {
-        this.warnings.push('capabilities.json 版本不识别：忽略缓存，待重新探测')
-      }
-    } catch (_) {
-      /* 不存在或损坏：视为未探测 */
+    const capDoc = await readVersionedJson<{ caps: CachedCapabilities }>(path.join(this.dirPath, 'capabilities.json'),
+      (parsed) => !!(parsed && parsed.v === SERVER_STATE_V && parsed.caps && typeof parsed.caps === 'object' && typeof parsed.caps.probedAt === 'number'), null, null, this.warnings)
+    if (capDoc.ok) {
+      this.capabilities = capDoc.data.caps
+    } else if (capDoc.kind === 'corrupt' && capDoc.parsed) {
+      this.warnings.push('capabilities.json 版本不识别：忽略缓存，待重新探测')
     }
-    try {
-      const parsed: any = JSON.parse(await fsp.readFile(path.join(this.dirPath, 'noise.json'), 'utf-8'))
-      if (parsed && parsed.v === SERVER_STATE_V && typeof parsed === 'object') {
-        this.noise = {
-          fingerprintUnstable: !!parsed.fingerprintUnstable,
-          noiseFiles: parsed.noiseFiles && typeof parsed.noiseFiles === 'object' ? parsed.noiseFiles : {},
-          concurrencyWarned: !!parsed.concurrencyWarned,
-        }
-      } else if (parsed) {
-        this.warnings.push('noise.json 版本不识别：噪声计数重新累计')
+    const noiseDoc = await readVersionedJson<{ fingerprintUnstable?: boolean; noiseFiles?: Record<string, number>; concurrencyWarned?: boolean }>(
+      path.join(this.dirPath, 'noise.json'), (parsed) => !!(parsed && parsed.v === SERVER_STATE_V && typeof parsed === 'object'), null, null, this.warnings)
+    if (noiseDoc.ok) {
+      const parsed = noiseDoc.data
+      this.noise = {
+        fingerprintUnstable: !!parsed.fingerprintUnstable,
+        noiseFiles: parsed.noiseFiles && typeof parsed.noiseFiles === 'object' ? parsed.noiseFiles : {},
+        concurrencyWarned: !!parsed.concurrencyWarned,
       }
-    } catch (_) {
-      /* 不存在或损坏：按默认值重新累计 */
+    } else if (noiseDoc.kind === 'corrupt' && noiseDoc.parsed) {
+      this.warnings.push('noise.json 版本不识别：噪声计数重新累计')
     }
   }
 
   /**
    * 读取未过期的能力缓存；过期或缺失返回 null（调用方现场探测）。
    * @param ttlMs 缓存有效期（毫秒），缺省 7 天（能力探测的默认 TTL）
+   * @returns 落盘形态的能力缓存（公共字段 + writePaths，生效视图由调用方组装）
    */
-  getCachedCapabilities(ttlMs: number = 7 * 24 * 3600 * 1000): any {
+  getCachedCapabilities(ttlMs: number = 7 * 24 * 3600 * 1000): CachedCapabilities | null {
     if (!this.capabilities) return null
     if (Date.now() - this.capabilities.probedAt > ttlMs) return null
     return this.capabilities
   }
 
   /** 原子保存能力探测结果（probedAt 由探测方写入，作为 TTL 起点） */
-  async saveCapabilities(caps: any): Promise<void> {
+  async saveCapabilities(caps: CachedCapabilities): Promise<void> {
     this.capabilities = caps
     await atomicWriteJson(path.join(this.dirPath, 'capabilities.json'), {
       v: SERVER_STATE_V,
@@ -1751,6 +2003,8 @@ export {
   closeAllStores,
   serverStateDirPath,
   openServerState,
+  /** 引擎侧轮次存储的具名类型（RoundContext.store / recoverIntents 的参数形态） */
+  DirStateStore,
 }
 /** 测试与审计直检入口（渲染层公共类型不含本对象） */
 export const _internals = { encodeLine, decodeLine, replayLogText, DirStateStore, ServerStateStore, crc32, fsyncSpy }

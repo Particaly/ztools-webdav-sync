@@ -126,6 +126,11 @@ export interface SyncDir {
     phase?: 'scan' | 'plan' | 'transfer'
     filesDone: number
     filesTotal: number
+    /**
+     * 传输段已完成的「真实字节」：随上传读流 / 下载落盘逐块增长（大文件传输期间
+     * 持续递进，不再按整文件完成跳变），任务完结时补齐尾差；终值 = 计划传输字节。
+     * plan 段该字段承载内容校验字节（UI 只按 stage / phase 折算，不混用）。
+     */
     bytesDone: number
     bytesTotal: number
     verifyDone?: number
@@ -201,10 +206,15 @@ export interface SyncDir {
   pluginSyncInfo?: ZtoolsPluginsSyncDesc | null
 }
 
+/**
+ * preload 注入的全局能力（可选）：渲染层可能在无 preload 的环境运行（纯浏览器
+ * 预览 / 测试），取用处一律按可能缺席处理 —— `?.` 可选链或 `if (!window.services)`
+ * 守卫窄化后再直取，与库内既有约定一致。
+ */
 declare global {
   interface Window {
-    services: ServicesPublic
-    ztools: ZToolsApi
+    services?: ServicesPublic
+    ztools?: ZToolsApi
   }
 }
 

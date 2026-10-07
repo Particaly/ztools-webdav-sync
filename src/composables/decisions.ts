@@ -19,12 +19,15 @@ export const HISTORY_SHOWN = 50
  * 浏览器预览（无 preload）与演示形态没有磁盘侧日志，返回空数组由调用方兜底。
  */
 export async function loadDecisionHistory(dirs: SyncDir[]): Promise<DecisionHistoryRow[]> {
-  if (!window.services) return []
+  // 窄化结果存局部常量：函数守卫的收窄进不了下方异步回调，直取 window.services
+  // 会重新摊开「可能缺席」
+  const services = window.services
+  if (!services) return []
   const rows: DecisionHistoryRow[] = []
   await Promise.all(
     dirs.map(async (d) => {
       try {
-        const entries = (await window.services.sync.listDecisionLog({
+        const entries = (await services.sync.listDecisionLog({
           id: d.id,
           localPath: d.localPath,
           remotePath: d.remotePath,

@@ -1,6 +1,6 @@
 /**
  * e2e 分片「misc」：解析与删除安全组（V1 / RD / RL / NE / FSW / X1-X5 / B1 / B3 / B4 / ES0-1 / DP / HP / DS1-6 / FN0-5）
- * 由 test/sync-e2e.mjs 机械拆分（节体逐字保留）；每文件独立 dav-server / 端口 / 根目录，
+ * 每文件独立 dav-server / 端口 / 根目录，
  * vitest 按文件并行、文件内保持原节顺序。共享基建见 test/harness.mjs。
  * 日常回归：npm run test:fast（跳过 slow tag）；等待组单独回归：npm run test:slow。
  */
@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP } from './harness.mjs'
+import { setupShard, teardownShard, section, slowSection, check, sleep, isNoop, SP, makeTrashStub } from './harness.mjs'
 
 const {
     HERE, ROOT, PORT, LOCAL, server, services, cfg, storeModule, BUILT, preloadPath,
@@ -22,30 +22,12 @@ const {
     setThrottle, waitForReqLine, waitAbortLine, runCancelRound, readWalOps, findTempResidue,
     PUP, setNetcut, setPartialPut, puBuf,
     SC_DB, SC_KEY, setSCConfig, createTestSched, makeFakeClock, waitReal, pumpUntil, readLeaderLock, writeLeaderLock,
-  } = await setupShard({ shard: 'misc', port: 5379 })
+  } = await setupShard({ shard: 'misc' })
 
-  const TRASH_DIR = path.join(os.tmpdir(), `wdsync-e2e-trash-${Date.now()}-${process.pid}`)
-  fs.mkdirSync(TRASH_DIR, { recursive: true })
-  const trashLog = []
-  let trashFailNext = 0
-  let trashMissing = false
-  const installTrash = () => {
-    if (trashMissing) {
-      delete global.window.ztools
-      return
-    }
-    global.window.ztools = {
-      shellTrashItem: async (p) => {
-        trashLog.push(p)
-        if (trashFailNext > 0) {
-          trashFailNext--
-          throw new Error('EACCES: permission denied (injected trash failure)')
-        }
-        const dest = path.join(TRASH_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(p)}`)
-        await fsp.rename(p, dest)
-      },
-    }
-  }
+  // 宿主回收站桩（原分片内逐字复制的 installTrash 块，统一收敛到 harness 工厂；
+  // 失败注入 / 缺端口模拟经 trash.failNext / trash.missing 存取器控制）
+  const trash = makeTrashStub()
+  const { install: installTrash, trashLog, TRASH_DIR } = trash
   installTrash()
 
   // ============================================================
@@ -101,11 +83,13 @@ const {
   await section('RD：重定向跟随', async () => {
   fs.writeFileSync(path.join(ROOT, '.wdsync-test-redirect'), 'x')
   // 跨源重定向源：任何请求都 302 到另一个源（127.0.0.1:9），引擎必须拒绝跟随
+  //（listen(0) 内核随机分配 —— 主 dav 端口已随机化，PORT+1 推算会撞端口）
   const crossServer = http.createServer((req, res) => {
     req.resume()
     res.writeHead(302, { Location: 'http://127.0.0.1:9/dav/' }).end()
   })
-  await new Promise((r) => crossServer.listen(PORT + 1, '127.0.0.1', r))
+  await new Promise((r) => crossServer.listen(0, '127.0.0.1', r))
+  const crossPort = crossServer.address().port
   try {
     await fsp.mkdir(path.join(ROOT, 'rd', 'sub'), { recursive: true })
     await fsp.writeFile(path.join(ROOT, 'rd', 'sub', 'f.txt'), 'rd-content')
@@ -118,14 +102,14 @@ const {
     // 跨源重定向必须拒绝，且报错信息包含源与目标 URL
     let crossErr = null
     try {
-      await services.sync._internals.davRequest({ serverUrl: `http://127.0.0.1:${PORT + 1}/dav/`, username: 'u', password: 'p' }, 'PROPFIND', 'x', {})
+      await services.sync._internals.davRequest({ serverUrl: `http://127.0.0.1:${crossPort}/dav/`, username: 'u', password: 'p' }, 'PROPFIND', 'x', {})
     } catch (e) {
       crossErr = e
     }
     check(
       'RD cross-origin redirect rejected (target in summary, source in detail)',
       !!crossErr && /另一个网站/.test(crossErr.message) && crossErr.message.includes('127.0.0.1:9') &&
-        String(crossErr.detail || '').includes(`127.0.0.1:${PORT + 1}`),
+        String(crossErr.detail || '').includes(`127.0.0.1:${crossPort}`),
       crossErr && crossErr.message
     )
     // 完整同步：引擎对集合请求已统一带尾斜杠，档位服务器不再触发重定向，流程照常成功
@@ -184,14 +168,14 @@ const {
       // 回收站失败（注入一次 EACCES）→ 放弃本次覆盖：本地旧版原地保留、明确报错
       //（文件级失败轮末以 err.summary 汇总抛出，需接住取 summary）
       await fsp.writeFile(path.join(ROOT, 'to', TO_NAME), 'to-v3-by-peer')
-      trashFailNext = 1
+      trash.failNext = 1
       let s3 = null
       try {
         s3 = await syncP(TO_LOCAL, '/to')
       } catch (e) {
         s3 = (e && e.summary) || { downloaded: 0, errors: [String(e && e.message)] }
       }
-      trashFailNext = 0
+      trash.failNext = 0
       check(
         'TO trash failure skips the overwrite and keeps the local version',
         s3.downloaded === 0 && (await fsp.readFile(path.join(TO_LOCAL, TO_NAME), 'utf-8')) === 'to-v2-by-peer' && (s3.errors || []).some((e) => /回收站/.test(String(e && (e.message || e)))),
@@ -513,7 +497,7 @@ const {
     check('B3c round returns to normal after server behavior restored', isNoop(b3c2), JSON.stringify(b3c2))
 
     // B3d 探测硬化：探测期服务器就「207 但只回第一层」→ depthInfinity 必须判 false
-    //（旧实现只看状态码会误判 true，引擎单请求扫描拿到残缺树 → 误删风险）
+    //（只看状态码会误判 true，引擎单请求扫描拿到残缺树 → 误删风险）
     await freshStore('b3d')
     fs.writeFileSync(path.join(ROOT, '.wdsync-test-shallowinf'), 'x')
     try {
@@ -982,7 +966,7 @@ const {
       // 存续、仅被引擎轮消费，轮询等待不改变断言语义：登记 / NFC 归一 / 临时过滤）。
       // vitest 并行分片 + 机器同时跑其他任务时事件送达可达 10s+，超时放宽到 20s
       let peek1 = services.fsx.peekDirtyPaths('dp-e')
-      // macOS FSEvents 对同目录快速连续写可能合并丢事件（W10 已知边界）：轮询 + 过半
+      // macOS FSEvents 对同目录快速连续写可能合并丢事件（已知边界）：轮询 + 过半
       // 窗口补写缺失文件重触发一次 —— 断言语义是「登记即时 + NFC 归一 + 临时过滤」，
       // 与单次事件必达无关
       let gotEvents = false
@@ -1741,7 +1725,7 @@ const {
     check('DS2 回收目录保留文件本体（可找回）', trashedNames.some((n) => n.endsWith('a.txt')) && trashedNames.some((n) => n.endsWith('b.txt')), trashedNames.join(','))
     check('DS2 回收站删除后基线条目移除', (await services.sync._internals.baselineEntry(d(), 'a.txt')) === null, '')
     // —— 保护生效 ①：回收站调用抛错 → 跳过并记录，不退化 unlink
-    trashFailNext = 1
+    trash.failNext = 1
     await fsp.rm(path.join(ROOT, 'ds2', 'c.txt'))
     let e1 = null
     try {
@@ -1756,7 +1740,7 @@ const {
     )
     check('DS2 失败路径确实调用了回收站 API（未绕过）', trashLog.some((p) => p.endsWith('c.txt')), trashLog.map((p) => path.basename(p)).join(','))
     // —— 保护生效 ②：宿主未注入回收站接口 → 同样跳过并记录
-    trashMissing = true
+    trash.missing = true
     installTrash()
     await fsp.rm(path.join(ROOT, 'ds2', 'e.txt'))
     let e2 = null
@@ -1770,7 +1754,7 @@ const {
       !!e2 && /不支持放入回收站/.test(e2.message) && fs.existsSync(path.join(L, 'e.txt')) && (await services.sync._internals.baselineEntry(d(), 'e.txt')) != null,
       e2 && e2.message
     )
-    trashMissing = false
+    trash.missing = false
     installTrash()
     // 接口恢复后（模拟下一轮）删除收敛
     const ok2 = await services.sync.syncDirectory(cfg, d(), SP, {})
@@ -1803,7 +1787,7 @@ const {
     )
     await fsp.rename(`${L}-gone`, L)
     // —— 保护 ②：根目录不可读（POSIX chmod 000；Windows 该形态由 icacls 类 ACL 承担，
-    // 属平台差异，此处不重复注入 —— 见 README 已知边界）
+    // 属平台差异，此处不重复注入）
     if (process.platform !== 'win32') {
       await fsp.chmod(L, 0o000)
       let e2 = null

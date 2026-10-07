@@ -111,9 +111,17 @@ function decisionText(r: DecisionHistoryRow): string {
   return decisionActionText(r)
 }
 
-/** 详尽视图的逐文件操作分组（云端 / 本地 / 冲突三段） */
+/** groupOps 结果缓存：记录一次载入后 ops 数组不可变（重载时整体换新数组），
+ *  以 ops 数组本身为键，WeakMap 随记录回收不泄漏 */
+const groupsCache = new WeakMap<object, ReturnType<typeof groupOps>>()
+
+/** 详尽视图的逐文件操作分组（云端 / 本地 / 冲突三段）。展开行模板多处引用同一
+ *  分组，这里按 ops 缓存 —— 大轮次（数千条）不必每处引用都全量扫描 r.ops */
 function groupsOf(r: SyncRecordRow) {
-  return r.type === 'round' ? groupOps(r.ops) : null
+  if (r.type !== 'round') return null
+  let g = groupsCache.get(r.ops)
+  if (!g) groupsCache.set(r.ops, (g = groupOps(r.ops)))
+  return g
 }
 </script>
 

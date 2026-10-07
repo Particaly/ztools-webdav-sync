@@ -15,17 +15,14 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { test } from 'vitest'
+import { makeCheck, UNIT_HERE as HERE } from '../harness.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PRELOAD = path.join(HERE, '..', '..', 'src-ztools', 'preload')
 
-const results = []
-function check(name, cond, detail = '') {
-  results.push({ name, ok: !!cond })
-  console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`)
-}
+// 软失败登记收敛到 harness 的 makeCheck（两个 test 块共用同一张登记表，与原实现一致）
+const { check, assertAtEnd } = makeCheck()
 
 const zr = await import(pathToFileURL(path.join(PRELOAD, 'ztools-registry.mts')).href)
 
@@ -280,11 +277,10 @@ test('ZTools 注册表对账单元（ZR1–ZR7，强顺序链）', async () => {
     await fsp.rm(TMP, { recursive: true, force: true }).catch(() => {})
   }
 
-  const failed = results.filter((r) => !r.ok)
-  console.log(`zr-unit: ${results.length - failed.length}/${results.length} passed`)
-  if (failed.length) {
-    throw new Error('注册表对账单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'))
-  }
+  assertAtEnd({
+    passLine: (passed, total) => `zr-unit: ${passed}/${total} passed`,
+    fail: (failed) => '注册表对账单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'),
+  })
 })
 
 /**
@@ -418,9 +414,8 @@ test('ZTools 注册表对账权限闸单元（ZR8，强顺序链）', async () =
     await fsp.rm(path.join(TMP, 'plugins-perm'), { recursive: true, force: true }).catch(() => {})
   }
 
-  const failed = results.filter((r) => !r.ok)
-  console.log(`zr-perm-unit: ${results.length - failed.length}/${results.length} passed`)
-  if (failed.length) {
-    throw new Error('权限闸单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'))
-  }
+  assertAtEnd({
+    passLine: (passed, total) => `zr-perm-unit: ${passed}/${total} passed`,
+    fail: (failed) => '权限闸单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'),
+  })
 })

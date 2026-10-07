@@ -1,5 +1,70 @@
+<script lang="ts">
+/**
+ * 全局监听共享单例（模块级）：使用方含目录行（每行一个）、顶栏、表单与设置页
+ *（经 AppSelect），逐实例自挂「document mousedown 捕获 + window scroll 捕获 +
+ * window resize」三份监听会随实例数线性累积。改为一份全局监听 + 打开实例注册表：
+ * 首个实例打开时挂监听、最后一个注销时移除，事件发生时广播给全部登记实例，
+ * 由各实例沿用自身原有的判定与关闭逻辑（捕获阶段、同款判定，语义与逐实例挂载一致）。
+ * 卸载钩子兜底注销（含 HMR 重挂载时旧实例的卸载路径），监听不会跨模块版本滞留累积。
+ */
+
+/** 注册表成员：实例把两类全局事件的处置逻辑交给单例广播 */
+interface DropdownClient {
+  /** document mousedown（捕获）广播：实例自行判定目标是否在自身外部并收起 */
+  onDocMousedown(e: MouseEvent): void
+  /** window scroll（捕获）/ resize 广播：teleport 实例收起 fixed 面板 */
+  onViewportChange(): void
+}
+
+/** 打开中的实例注册表（Set 成员唯一，重复登记幂等） */
+const openClients = new Set<DropdownClient>()
+
+/** 全局监听是否已挂载 */
+let listenersAttached = false
+
+/** mousedown 广播：快照遍历 —— 广播过程中实例可能收起并注销自身 */
+function sharedDocMousedown(e: MouseEvent): void {
+  for (const c of Array.from(openClients)) c.onDocMousedown(e)
+}
+
+/** scroll / resize 广播（同样快照遍历，防遍历中增删成员） */
+function sharedViewportChange(): void {
+  for (const c of Array.from(openClients)) c.onViewportChange()
+}
+
+/** 挂载全局监听（幂等）：首个实例打开时调用 */
+function attachListeners(): void {
+  if (listenersAttached) return
+  listenersAttached = true
+  document.addEventListener('mousedown', sharedDocMousedown, true)
+  window.addEventListener('scroll', sharedViewportChange, true)
+  window.addEventListener('resize', sharedViewportChange)
+}
+
+/** 移除全局监听（幂等）：最后一个实例注销时调用 */
+function detachListeners(): void {
+  if (!listenersAttached) return
+  listenersAttached = false
+  document.removeEventListener('mousedown', sharedDocMousedown, true)
+  window.removeEventListener('scroll', sharedViewportChange, true)
+  window.removeEventListener('resize', sharedViewportChange)
+}
+
+/** 登记打开中的实例：需要时先挂全局监听 */
+function registerClient(c: DropdownClient): void {
+  attachListeners()
+  openClients.add(c)
+}
+
+/** 注销实例（关闭 / 卸载）：最后一个注销时移除全局监听 */
+function unregisterClient(c: DropdownClient): void {
+  openClients.delete(c)
+  if (openClients.size === 0) detachListeners()
+}
+</script>
+
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { pushEscLayer } from '../../composables/esc'
 
 /** 浮层弹出位置：bottom-* 在触发器下方，top-* 在上方（空间不足时自动翻转用） */
@@ -100,10 +165,13 @@ function onViewportChange() {
   if (open.value && props.teleport) close()
 }
 
-onMounted(() => {
-  document.addEventListener('mousedown', onDocMousedown, true)
-  window.addEventListener('scroll', onViewportChange, true)
-  window.addEventListener('resize', onViewportChange)
+// 本实例在共享单例中的登记项：广播回调直接复用上面两个处置函数（判定与关闭逻辑不变）
+const sharedClient: DropdownClient = { onDocMousedown, onViewportChange }
+
+// 打开期间登记进共享单例（首个打开挂全局监听）；关闭即注销（最后一个注销时移除监听）
+watch(open, (v) => {
+  if (v) registerClient(sharedClient)
+  else unregisterClient(sharedClient)
 })
 
 // ESC 退层：浮层打开期间入全局退层栈（composables/esc，后开先关）—— 全局路由
@@ -120,9 +188,8 @@ watch(open, (v) => {
 })
 
 onBeforeUnmount(() => {
-  document.removeEventListener('mousedown', onDocMousedown, true)
-  window.removeEventListener('scroll', onViewportChange, true)
-  window.removeEventListener('resize', onViewportChange)
+  // 卸载兜底注销（打开中被卸载也要退出注册表，否则单例持有死引用、监听永不摘除）
+  unregisterClient(sharedClient)
   unregisterEsc?.()
   unregisterEsc = null
 })
