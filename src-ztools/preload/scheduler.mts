@@ -39,7 +39,7 @@ import { getHostPorts } from './host.mts'
 import { ZTOOLS_PLUGINS_DIR_ID, describeZtoolsPluginsSync } from './ztools-plugins.mts'
 import { resolveDirPrefs } from './types.mts'
 import { reconcilePluginRegistry } from './ztools-registry.mts'
-import { netTraffic } from './svc/net.mts'
+import { applyNetLimits, netTraffic } from './svc/net.mts'
 import type { ConflictChoice, ConflictInfo, Prefs, RoundDisplay, SchedulerApi, SchedulerEvent, SchedulerSnapshot, SchedulerSlotView, SyncProgress, SyncSummary } from './types.mts'
 // 仅类型导入（编译期擦除，不构成对 services 的运行时依赖 / 循环 require）：
 // SchedulerEngine.syncDirectory 的签名与引擎侧 syncDirectory 完全同形
@@ -778,6 +778,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       net.ratePerSec = o.ratePerSec
       base.netOpts = net
     }
+    // 调度器轮次标记：带宽限速走网络层的实时限额表（applyNetLimits 随配置应用
+    // 推送）—— 设置保存后在途传输的下一个切片即按新速率执行；渲染层直调 / 测试
+    // 路径不打标记，维持请求侧 netOpts 的旧口径
+    base.__wdsyncLiveLimits = true
     return base
   }
 
@@ -932,6 +936,19 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     const prevSlots = slots
     configV = v
     config = cfg
+    // 带宽限额实时推送：把每台服务器当前生效的上传 / 下载限速写进网络层活值表
+    // —— 设置保存（防抖落盘 → reload → 走到这里）后在途传输的下一个 64KB 切片
+    // 与本轮后续新请求立即按新限额执行（此前字节桶只在首次创建时读一次速率，
+    // 改动要重启插件才生效）。请求限速（ratePerSec）不在此列：它逐请求按轮次
+    // 快照现算，改动从下一轮起生效。
+    for (const s of cfg.servers) applyNetLimits(s.serverUrl, s.netOpts)
+    // 目录级地址覆盖（历史遗留）：按覆盖后的生效地址补推同款限额，与 cfgOf 的
+    // 服务器解析同口径（serverId 显式指向优先，缺省回落第一台）
+    for (const d of cfg.dirs) {
+      if (!d.serverUrl) continue
+      const entry = (d.serverId ? cfg.servers.find((x) => x.id === d.serverId) : null) || cfg.servers[0]
+      if (entry) applyNetLimits(d.serverUrl, entry.netOpts)
+    }
     // 目录锁键缓存全量失效：configV 自检已保证只在配置**真变**时走到这里，全量清
     // 一次的代价可忽略（每目录下次取锁多一次 getDeviceId + hash16）。一次 clear
     // 覆盖三类情形：① 目录路径变化（normalizeLocalKey/RemoteKey 输入变 → 键必变，

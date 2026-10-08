@@ -431,6 +431,7 @@ export function destroyNetPools(): void {
   agentPool.clear()
   rateLimiters.clear()
   byteBuckets.clear()
+  liveLimits.clear()
   digestChallenges.clear()
 }
 
@@ -462,24 +463,80 @@ function acquireRateSlot(origin: string, ratePerSec: number): Promise<void> {
 // 同一总额（限的是总量，不是单流）。取令牌按 ≤64KB 的小块进行，且「有多少取
 // 多少、取到就放行」—— 低限速下 socket 持续有小块流量，不会触发空闲 / 无进展
 // 超时；容量 = 1 秒速率，允许约 1 秒的突发吸收。
+//
+// 速率的生效口径分两路：调度器轮次（cfg.__wdsyncLiveLimits）以实时限额表
+// （liveLimits）为准，设置保存推送后「正在传输的文件」的下一个 64KB 切片即按
+// 新速率执行；直调 / 测试路径沿用请求侧快照值（显式限速才挂桶），互不干扰。
 
 /** 带宽桶的最小取块（字节）：低于 1 秒速率的限速仍按此粒度放行首块 */
 const BW_SLICE_BYTES = 64 * 1024
 
-/** 每源 × 方向的字节带宽桶（rate 单位为字节/秒） */
+/**
+ * 「不限制」的桶速率哨兵（字节/秒）：用超大有限值而非 Infinity —— 补充公式
+ * dt × rate 在 dt=0（同毫秒连续取块）时 0 × Infinity = NaN，会静默截断传输
+ * （NaN < 1 为 false 跳过补眠、floor(NaN) 放行空块）；有限值下 0 × r = 0 安全。
+ */
+export const BW_UNLIMITED_BPS = 1e15
+
+/**
+ * 每源实时带宽限额（KB/s）：调度器 applyConfig 在配置应用时经 applyNetLimits
+ * 逐台推送，是「限速修改立即生效」的数据源。字段缺省 = 不限制（渲染层对
+ * 「不限」写 undefined，持久化后与「从未配置」同形 —— 推送语义按当前配置
+ * 全量覆盖，不存在「保留旧值」的中间态）。
+ */
+export const liveLimits = new Map<string, { uploadKBps: number; downloadKBps: number }>()
+
+/**
+ * 推送一台服务器的实时带宽限额（调度器 applyConfig 每次应用配置时逐台调用；
+ * 同源多入口以最后一次推送为准）。serverUrl 不合法时忽略 —— 配置错误不应放大
+ * 成运行时异常；非法数值（负数 / 非有限）按 0（不限制）处理，与 resolveNetOpts
+ * 的防御口径一致。
+ */
+export function applyNetLimits(serverUrl: unknown, netOpts: unknown): void {
+  let origin: string
+  try {
+    origin = new URL(String(serverUrl || '')).origin
+  } catch (_) {
+    return
+  }
+  const raw = netOpts && typeof netOpts === 'object' ? (netOpts as Record<string, unknown>) : {}
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+  liveLimits.set(origin, { uploadKBps: num(raw.uploadKBps), downloadKBps: num(raw.downloadKBps) })
+}
+
+/** 请求侧的生效带宽（KB/s）：调度器轮次读实时限额表（表外源回退快照值），直调路径用快照值 */
+function liveBandwidthKBps(origin: string, dirKey: 'up' | 'down', snapshotKBps: number, live: boolean): number {
+  if (!live) return snapshotKBps
+  const l = liveLimits.get(origin)
+  if (!l) return snapshotKBps
+  return dirKey === 'up' ? l.uploadKBps : l.downloadKBps
+}
+
+/** 每源 × 方向的字节带宽桶（rate 单位为字节/秒；BW_UNLIMITED_BPS = 不限制） */
 export const byteBuckets = new Map()
 
 /**
  * 从带宽桶取至多 want 字节：先等桶补充到 ≥1 字节，再取 min(want, floor(tokens))。
  * 返回实际取得的字节数（恒 ≥1）—— 调用方按返回值放行数据块，令牌渐补渐放。
+ * 速率每次取块现算（live 路径读实时限额表）：与桶记录值不同则原地迁移
+ * （容量按新速率重算、余量按新容量封顶），正在补眠的取块下一轮循环即读到新值 ——
+ * 这是「改限速立即生效，含传输中的文件」的落地机制。
  */
-function takeBytes(origin: string, dirKey: 'up' | 'down', rateBps: number, want: number): Promise<number> {
+function takeBytes(origin: string, dirKey: 'up' | 'down', snapshotKBps: number, want: number, live: boolean): Promise<number> {
   const key = `${origin}|${dirKey}`
+  const kb = liveBandwidthKBps(origin, dirKey, snapshotKBps, live)
+  const rate = kb > 0 ? kb * 1024 : BW_UNLIMITED_BPS
   let bucket = byteBuckets.get(key)
   if (!bucket) {
-    const cap = Math.max(rateBps, 4096)
-    bucket = { rate: rateBps, capacity: cap, tokens: cap, last: Date.now(), chain: Promise.resolve() }
+    const cap = Math.max(rate, 4096)
+    bucket = { rate, capacity: cap, tokens: cap, last: Date.now(), chain: Promise.resolve() }
     byteBuckets.set(key, bucket)
+  } else if (live && rate !== bucket.rate) {
+    // 原地迁移仅限调度器轮次（live）：直调 / 测试路径沿用既有桶的速率（旧口径），
+    // 避免渲染层直调流量与调度器轮次在同一源上互相翻转速率
+    bucket.rate = rate
+    bucket.capacity = Math.max(rate, 4096)
+    bucket.tokens = Math.min(bucket.tokens, bucket.capacity)
   }
   const run = bucket.chain.then(async (): Promise<number> => {
     for (;;) {
@@ -502,16 +559,18 @@ function takeBytes(origin: string, dirKey: 'up' | 'down', rateBps: number, want:
 
 /**
  * 带宽限速 Transform：把数据块按 ≤64KB 小块经字节令牌桶放行（边取边 push）。
- * 失败 / 销毁语义交由 pipeline 传播（与 hashTransform 同构）。
+ * live = 调度器轮次：每次取块都从实时限额表现算速率（修改限速对在途传输即时生效）；
+ * 直调 / 测试路径 live=false，沿用请求发起时的快照速率。失败 / 销毁语义交由
+ * pipeline 传播（与 hashTransform 同构）。
  */
-function throttleTransform(origin: string, dirKey: 'up' | 'down', rateBps: number): Transform {
+function throttleTransform(origin: string, dirKey: 'up' | 'down', snapshotKBps: number, live: boolean): Transform {
   return new Transform({
     async transform(chunk: any, _enc: any, cb: any) {
       try {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
         for (let off = 0; off < buf.length; ) {
           const want = Math.min(buf.length - off, BW_SLICE_BYTES)
-          const got = await takeBytes(origin, dirKey, rateBps, want)
+          const got = await takeBytes(origin, dirKey, snapshotKBps, want, live)
           this.push(buf.subarray(off, off + got))
           off += got
         }
@@ -800,7 +859,11 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
           if (!firstErrFrom) firstErrFrom = 'res'
         })
         const chain = [res]
-        if (netOpts.downloadKBps > 0) chain.push(throttleTransform(url.origin, 'down', netOpts.downloadKBps * 1024))
+        // 调度器轮次（live）一律挂限速 Transform：速率每次取块从实时限额表现算，
+        // 修改限速（含改 0 = 不限制）对传输中的文件即时生效；直调 / 测试路径维持
+        // 「显式限速才挂桶」的旧口径（请求侧快照速率，全程不变）
+        const liveBW = !!(cfg && cfg.__wdsyncLiveLimits)
+        if (liveBW || netOpts.downloadKBps > 0) chain.push(throttleTransform(url.origin, 'down', netOpts.downloadKBps, liveBW))
         if (h) chain.push(hashTransform(h))
         // 下载流量计数（挂管道末端 = 实际落盘的字节；限速开启时反映被限后的真实速率）
         // onBytes：下载进度的逐块回调（引擎侧推进 bytesDone）
@@ -907,7 +970,9 @@ function singleRequest(cfg: EngineCfg, method: string, url: URL, opts: ReqOpts, 
         if (!firstErrFrom) firstErrFrom = 'req'
       })
       const chain: any[] = [rs]
-      if (netOpts.uploadKBps > 0) chain.push(throttleTransform(url.origin, 'up', netOpts.uploadKBps * 1024))
+      // 口径同下载分支（liveBW 见彼处注释）：调度器轮次一律挂桶、速率实时可变
+      const liveBW = !!(cfg && cfg.__wdsyncLiveLimits)
+      if (liveBW || netOpts.uploadKBps > 0) chain.push(throttleTransform(url.origin, 'up', netOpts.uploadKBps, liveBW))
       if (h) chain.push(hashTransform(h))
       // 上传流量计数（挂管道末端 = 实际交给网络的字节；限速开启时反映被限后的真实速率）
       // onBytes：上传进度的逐块回调（引擎侧推进 bytesDone）

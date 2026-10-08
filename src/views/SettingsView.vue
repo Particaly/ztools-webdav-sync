@@ -541,14 +541,14 @@ function save() {
                 <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
                   <div class="flex items-center gap-[3px]">
                     <span class="text-[11px] font-medium text-ink-2">上传限速</span>
-                    <InfoTip text="上传到这台服务器的总带宽上限（KB/s），同一服务器的多个文件夹共享该额度；留空或 0 表示不限制" />
+                    <InfoTip text="上传到这台服务器的总带宽上限（KB/s），同一服务器的多个文件夹共享该额度；留空或 0 表示不限制。修改立即生效，正在同步中的文件也会按新限速执行" />
                   </div>
                   <AppInput v-model="uploadKBpsInput" sm type="number" placeholder="不限" />
                 </div>
                 <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
                   <div class="flex items-center gap-[3px]">
                     <span class="text-[11px] font-medium text-ink-2">下载限速</span>
-                    <InfoTip text="从这台服务器下载的总带宽上限（KB/s），口径同上传限速" />
+                    <InfoTip text="从这台服务器下载的总带宽上限（KB/s），口径同上传限速；修改立即生效" />
                   </div>
                   <AppInput v-model="downloadKBpsInput" sm type="number" placeholder="不限" />
                 </div>

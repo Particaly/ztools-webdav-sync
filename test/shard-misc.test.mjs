@@ -1825,7 +1825,10 @@ const {
   // DS4 远端根 404 重建保护：远端整根消失（404）且本地基线非空时，先进入「根丢失
   // 决策闸」—— 登记 kind='root-lost' 挂起并停轮（零删除零传输、不自动重建）；用户
   // 选择「重新上传」后按重建保护语义执行 —— delete-local 改判为恢复上传（远端缺失
-  // 是根消失伪象，复活取向）；和解完成后自动恢复删除传播。基线为空（首次同步）
+  // 是根消失伪象，复活取向）。策略载体 meta.rootRebuilt 遵循「成功即忘」：重建轮
+  // 强干净收场（无错误 / 无退避跳过 / 无开放意图）时待和解当轮清零，标记当轮解除
+  // —— 用户选择的策略随首次成功同步取消，云端再丢失必重新进入决策闸，绝不静默
+  // 复用上次的选择；带债务的轮次保守保留标记（见 DS4d）。基线为空（首次同步）
   // 不触发决策闸，维持自动重建。
 
   await section('DS4：远端根 404 重建保护', async () => {
@@ -1856,7 +1859,7 @@ const {
       !!lostPending && !lostPending.choice && lostPending.local && lostPending.local.size === 8,
       JSON.stringify(lostPending)
     )
-    // —— 用户选择「重新上传」→ 重建轮：零删除 + 恢复上传 + 保护标记
+    // —— 用户选择「重新上传」→ 重建轮：零删除 + 恢复上传；强干净收场 → 策略当轮取消
     await services.sync.setPendingChoice(d(), '.', 'upload')
     const r2 = await services.sync.syncDirectory(cfg, d(), SP, {})
     localLeft = 0
@@ -1868,15 +1871,35 @@ const {
     )
     check('DS4 根丢失挂起随选择消费清除', (await services.sync._internals.getPendings(d())).length === 0, JSON.stringify(await services.sync._internals.getPendings(d())))
     check('DS4 远端恢复全部 8 个文件', fs.readdirSync(path.join(ROOT, 'ds4')).length === 8, '')
-    check('DS4 保护标记写入 meta', (await services.sync._internals.getDirMeta(d())).rootRebuilt != null, '')
-    // —— 和解完成 → 保护解除（干净轮 guard=0 自动清标记）
+    check(
+      'DS4 重建轮强干净收场即取消策略标记（成功即忘，防下次静默复用）',
+      (await services.sync._internals.getDirMeta(d())).rootRebuilt === undefined,
+      JSON.stringify(await services.sync._internals.getDirMeta(d()))
+    )
+    // —— 和解完成后的干净轮为 no-op（标记已解除，无恢复动作残留）
     const r3 = await services.sync.syncDirectory(cfg, d(), SP, {})
     check('DS4 和解后干净轮为 no-op', isNoop(r3), JSON.stringify(r3))
-    check('DS4 和解完成自动解除保护标记', (await services.sync._internals.getDirMeta(d())).rootRebuilt === undefined, '')
     // —— 正常通过：解除后删除传播恢复正常
     await fsp.unlink(path.join(L, 'f0.txt'))
     const r4 = await services.sync.syncDirectory(cfg, d(), SP, {})
     check('DS4 解除后删除传播恢复（单文件删除正常执行）', r4.deleted === 1 && !fs.existsSync(path.join(ROOT, 'ds4', 'f0.txt')), JSON.stringify({ deleted: r4.deleted }))
+    // —— 回归（成功即忘的核心场景）：策略已随首次成功取消，再次删根必须重新进入
+    //    决策闸询问用户，不得命中残留标记静默重建
+    await services.dav.remove(cfg, '/ds4')
+    let e2nd = null
+    try {
+      await services.sync.syncDirectory(cfg, d(), SP, {})
+    } catch (e) {
+      e2nd = e
+    }
+    localLeft = 0
+    for (let i = 1; i < 8; i++) if (fs.existsSync(path.join(L, `f${i}.txt`))) localLeft++
+    const pending2nd = (await services.sync._internals.getPendings(d())).find((p) => p.kind === 'root-lost')
+    check(
+      'DS4 成功同步后再次删根：重新进入决策闸（重新登记挂起、零删除零传输）',
+      !!e2nd && /已不存在/.test(e2nd.message) && !!pending2nd && !pending2nd.choice && localLeft === 7 && !fs.existsSync(path.join(ROOT, 'ds4')),
+      JSON.stringify({ msg: e2nd && e2nd.message, pending2nd, localLeft })
+    )
     await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
   })
 
@@ -2008,6 +2031,61 @@ const {
       'DS4c 标记解除后删除传播恢复',
       r4.deleted === 1 && r4.uploaded === 1 && !fs.existsSync(path.join(ROOT, 'ds4c', 'f0.txt')),
       JSON.stringify({ deleted: r4.deleted, uploaded: r4.uploaded })
+    )
+    await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
+  })
+
+  // DS4d 重建轮的「看不见债务」保守解除：退避中的文件（permSkipped）不进删除安全闸、
+  // 不计入 deleteRootGuard —— 若解除判定只看「本轮干净 + guard=0」，干净表象下带着
+  // 待恢复文件解除保护后，退避到期的「本地未变 + 远端缺失」会被当新鲜删除执行
+  // （低于阈值直接删本地）。因此：重建轮带退避债务 → 标记保守保留；债务清零轮
+  //（改判上传落地，guard>0）→ 仍保留；下一个无债务干净轮 → 解除。
+
+  await section('DS4d：退避债务下重建保护保守保留', async () => {
+    const L = path.join(os.tmpdir(), `wdsync-e2e-ds4d-${Date.now()}`)
+    const d = () => ({ id: 'ds4d', localPath: L, remotePath: '/ds4d', mode: 'two-way' })
+    await fsp.mkdir(L, { recursive: true })
+    for (let i = 0; i < 4; i++) await fsp.writeFile(path.join(L, `f${i}.txt`), `ds4d-${i}`)
+    await services.sync.syncDirectory(cfg, d(), SP, {})
+    // 删根 → 停轮 → 植入 f3 的退避记录（模拟此前永久失败、尚未到重试时间）→ 选择重新上传
+    await services.dav.remove(cfg, '/ds4d')
+    let eLost = null
+    try {
+      await services.sync.syncDirectory(cfg, d(), SP, {})
+    } catch (e) {
+      eLost = e
+    }
+    check('DS4d 根丢失停轮（待决策）', !!eLost && /已不存在/.test(eLost.message), eLost && eLost.message)
+    await services.sync._internals.seedFailure(d(), 'f3.txt', 'TEST', 'seeded backoff debt')
+    await services.sync.setPendingChoice(d(), '.', 'upload')
+    // 重建轮：f0-f2 恢复上传；f3 被退避跳过（permSkipped，不进删除闸）—— 本轮无错误
+    // 但带「看不见债务」→ 保护标记必须保守保留（不得当轮解除）
+    const r2 = await services.sync.syncDirectory(cfg, d(), SP, {})
+    check(
+      'DS4d 重建轮：未退避文件恢复上传、退避文件跳过',
+      r2.uploaded === 3 && r2.deleteRootGuard === 3 && r2.deleted === 0 && fs.existsSync(path.join(L, 'f3.txt')) && !fs.existsSync(path.join(ROOT, 'ds4d', 'f3.txt')),
+      JSON.stringify({ uploaded: r2.uploaded, guard: r2.deleteRootGuard, deleted: r2.deleted })
+    )
+    check(
+      'DS4d 重建轮带退避债务：保护标记保守保留（不当轮解除）',
+      (await services.sync._internals.getDirMeta(d())).rootRebuilt != null,
+      JSON.stringify(await services.sync._internals.getDirMeta(d()))
+    )
+    // 退避到期 → f3 的 delete-local 被改判为恢复上传并落地（guard>0）→ 本轮仍不解除
+    await services.sync._internals.ageFailures(d(), 24 * 3600 * 1000)
+    const r3 = await services.sync.syncDirectory(cfg, d(), SP, {})
+    check(
+      'DS4d 退避到期：债务文件改判恢复上传（不误删）',
+      r3.uploaded === 1 && r3.deleteRootGuard === 1 && r3.deleted === 0 && fs.existsSync(path.join(ROOT, 'ds4d', 'f3.txt')) && fs.existsSync(path.join(L, 'f3.txt')),
+      JSON.stringify({ uploaded: r3.uploaded, guard: r3.deleteRootGuard, deleted: r3.deleted })
+    )
+    check('DS4d 债务清零轮（guard>0）：标记仍保留', (await services.sync._internals.getDirMeta(d())).rootRebuilt != null, '')
+    // 下一个无债务干净轮 → 解除，恢复正常删除传播
+    const r4 = await services.sync.syncDirectory(cfg, d(), SP, {})
+    check(
+      'DS4d 债务清零后的干净轮解除保护',
+      isNoop(r4) && (await services.sync._internals.getDirMeta(d())).rootRebuilt === undefined,
+      JSON.stringify({ r: r4, meta: await services.sync._internals.getDirMeta(d()) })
     )
     await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
   })

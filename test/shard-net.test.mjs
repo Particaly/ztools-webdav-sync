@@ -189,6 +189,74 @@ section('BW：上传 / 下载带宽限速的总量约束', async () => {
 })
 
 // ============================================================
+// NL：限速修改即时生效（applyConfig 推送活值表 + 在途轮迁移）
+// ============================================================
+
+section('NL：限速设置修改后立即生效（活值表推送与在途轮迁移）', async () => {
+  mountScDb()
+  await freshStore('nl')
+  const lp = await tmpLocal('nl')
+  // 远端预置 256KB 下载目标（调度器轮次经 GET 流式落盘，带宽桶在其字节流上生效）
+  await fsp.mkdir(path.join(ROOT, 'nl'), { recursive: true })
+  await fsp.writeFile(path.join(ROOT, 'nl', 'big.bin'), Buffer.alloc(256 * 1024, 9))
+  const internals = services.sync._internals
+  const origin = `http://127.0.0.1:${PORT}`
+  const writeCfg = (netOpts) => {
+    SC_DB[SC_KEY] = {
+      servers: [
+        {
+          id: 'srv',
+          serverUrl: `${origin}/dav/`,
+          username: 'u',
+          password: services.secure.sealSecret('p'),
+          ...(netOpts ? { netOpts } : {}),
+        },
+      ],
+      dirs: [{ id: 'dn', localPath: lp, remotePath: '/nl', mode: 'two-way' }],
+      prefs: { autoSync: false, intervalMin: 15, conflictStrategy: 'ask', ignoreHidden: true, concurrency: 4 },
+    }
+  }
+  writeCfg({ uploadKBps: 64, downloadKBps: 64 })
+  const sched = createTestSched()
+  try {
+    await sched.init()
+    check('NL init 推送服务器限额入活值表', internals.liveLimits.get(origin)?.uploadKBps === 64 && internals.liveLimits.get(origin)?.downloadKBps === 64, JSON.stringify([...internals.liveLimits]))
+
+    // 改设置 → 落盘 → reload：活值表立即更新（不含「重启才生效」的中间态）
+    writeCfg({ uploadKBps: 128, downloadKBps: 0 })
+    await sched.reload()
+    check('NL reload 后活值表更新（改 0 = 不限）', internals.liveLimits.get(origin)?.uploadKBps === 128 && internals.liveLimits.get(origin)?.downloadKBps === 0, JSON.stringify([...internals.liveLimits]))
+
+    // 在途轮即时迁移：下载限 32KB/s 启动轮（256KB 全程约需 8s），1.5s 后（轮仍在途）
+    // 改 512KB/s 并 reload —— 轮内后续切片按新速率放行，总耗时应显著小于 8s
+    writeCfg({ downloadKBps: 32 })
+    await sched.reload()
+    check('NL 重设下载 32KB/s', internals.liveLimits.get(origin)?.downloadKBps === 32)
+    const t0 = Date.now()
+    const roundP = sched.syncNow()
+    await sleep(1500)
+    writeCfg({ downloadKBps: 512 })
+    await sched.reload()
+    const r = await roundP
+    const ms = Date.now() - t0
+    const perDir = (r && r.perDir) || []
+    check('NL 在途轮正常收尾', perDir.length === 1 && perDir[0].ok === true, JSON.stringify(perDir))
+    check('NL 前段确实被限速（至少经历 1.5s 节流窗）', ms >= 1500, `${ms}ms`)
+    check('NL 改限速后在途轮提前完成（全程 32KB/s 需约 8s）', ms <= 5000, `${ms}ms`)
+    check('NL 落盘内容完整', fs.statSync(path.join(lp, 'big.bin')).size === 256 * 1024)
+    check('NL 轮末桶速率停留在最后一次推送值', internals.byteBuckets.get(`${origin}|down`)?.rate === 512 * 1024, String(internals.byteBuckets.get(`${origin}|down`)?.rate))
+  } finally {
+    try {
+      sched.cleanup()
+    } catch {
+      /* 收尾失败不影响断言 */
+    }
+    // 活值表是模块级状态：显式复位为不限，避免泄入后续用例
+    internals.applyNetLimits(`${origin}/dav/`, {})
+  }
+})
+
+// ============================================================
 // PX：HTTP 代理（http 绝对 URI 转发 + https CONNECT 隧道）
 // ============================================================
 

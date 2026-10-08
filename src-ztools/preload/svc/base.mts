@@ -38,7 +38,7 @@ export const fsp = fs.promises
 
 // ---------- 引擎领域类型（内部形态；公共形态见 types.mts） ----------
 
-/** 引擎连接配置：DavConfig + 网络层注入通道（取消 / 熔断器 / 每轮流量袋）。导出供调度器 SchedulerEngine 签名引用 */
+/** 引擎连接配置：DavConfig + 网络层注入通道（取消 / 熔断器 / 每轮流量袋 / 实时限速）。导出供调度器 SchedulerEngine 签名引用 */
 export interface EngineCfg extends DavConfig {
   __wdsyncAbort?: (() => boolean) | null
   __wdsyncBreaker?: RoundBreaker | null
@@ -47,6 +47,12 @@ export interface EngineCfg extends DavConfig {
    * 「每目录实时速率」）。缺省（渲染层直调引擎的降级形态）只累计程总量。
    */
   __wdsyncTraffic?: { upBytes: number; downBytes: number } | null
+  /**
+   * 调度器轮次标记（cfgOf 挂载）：带宽限速改读网络层实时限额表（随配置应用
+   * 推送，限速修改对在途传输即时生效）。缺省（渲染层直调 / 测试）维持请求侧
+   * netOpts 快照的旧口径。
+   */
+  __wdsyncLiveLimits?: boolean
 }
 
 /** 本地文件指纹（扫描产物） */

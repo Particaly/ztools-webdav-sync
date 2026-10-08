@@ -63,10 +63,13 @@ import {
   parseDigestChallenge,
 } from './svc/dav-parse.mts'
 import {
+  applyNetLimits,
+  BW_UNLIMITED_BPS,
   byteBuckets,
   createRoundBreaker,
   davRequest,
   destroyNetPools,
+  liveLimits,
   mkOpError,
   netTraffic,
   normalizeTlsError,
@@ -2200,6 +2203,9 @@ async function roundBootstrap(ctx: RoundContext): Promise<void> {
    * 重建轮之后仍可能有上传失败的文件停留在「本地未变 + 远端缺失」状态，下一轮
    * 若照常规划会把它们 delete-local 误删 —— 标记保持生效直至「待和解」清零
    *（全部基线文件要么重新上传成功、要么两侧皆无），届时自动恢复正常删除传播。
+   * 例外：消费「重新上传」决策的重建轮本身强干净收场（无错误 / 无退避跳过 /
+   * 无开放意图，见 applyRootGuardReleases）时，待和解当轮即清零 —— 标记当轮解除
+   *（「成功即忘」：用户选择的策略随首次成功同步取消，云端再丢失必重新询问）。
    * 用户经挂起通道显式确认过的删除（kind='delete', choice='delete'）不受此保护拦截。
    */
   ctx.rootWasRebuilt = ctx.rootProbeStatus === 404 && ctx.store.entries.size > 0
@@ -3959,13 +3965,37 @@ async function commitBatchUploads(ctx: RoundContext): Promise<void> {
 }
 /** 阶段 8a：远端根重建 / 移除本地标记的解除判定（和解完成才恢复删除传播）。 */
 async function applyRootGuardReleases(ctx: RoundContext): Promise<void> {
-  // ---- 远端根重建保护解除判定（和解完成才恢复删除传播）----
-  // 本轮根探测正常（未再 404）、非只读档、无任何错误且未取消（传输全部收尾成功）、
-  // 且本轮没有因该保护跳过的删除（「本地未变 + 远端缺失」的待和解集合已清零：
-  // 全部基线文件要么重新上传成功、要么两侧皆无）→ 清除标记，下一轮恢复正常删除传播。
-  // 仍有跳过或本轮有失败 → 保守保留保护（下一轮干净轮次重新评估），并提示原因。
-  // 预演轮不动任何 meta（零副作用：内存态变更会经缓存的 store 实例泄给真实轮）。
-  if (ctx.store.meta.rootRebuilt && !ctx.rootWasRebuilt && !ctx.dryRun && !ctx.aborted && !ctx.roundBreaker.open && ctx.caps.tier !== 'C' && ctx.store.loadedOk && ctx.errorNetCount + ctx.errorOtherCount === 0) {
+  // ---- 解除的安全前提：强干净轮（即时解除与延续轮解除共用）----
+  // 除「无错误 / 未取消 / 非熔断 / 非只读档 / 基线可信 / 非崩溃轮」外，还必须没有任何
+  // 「本轮看不见的待和解债务」：持续失败退避跳过的文件（permSkipped —— 它们在退避
+  // 期间不进删除安全闸，deleteRootGuard 计不到，「干净」表象下可能藏着「本地未变 +
+  // 远端缺失」的待恢复文件，解除后会被当新鲜删除执行造成误删）与仍未了结的 WAL
+  // 开放意图（半截上传未落地、基线未提交）。预演轮不动任何 meta（零副作用：内存态
+  // 变更会经缓存的 store 实例泄给真实轮）。
+  const strongClean =
+    !ctx.dryRun &&
+    !ctx.aborted &&
+    !ctx.crashErr &&
+    !ctx.roundBreaker.open &&
+    ctx.caps.tier !== 'C' &&
+    ctx.store.loadedOk &&
+    ctx.errorNetCount + ctx.errorOtherCount === 0 &&
+    ctx.permSkipped.length === 0 &&
+    ctx.store.pendingIntents.size === 0
+  // ---- 远端根重建保护（= 「重新上传」决策的策略载体）解除判定 ----
+  // 即时解除（决策消费轮，rootWasRebuilt）：本轮强干净 ⇒ 电脑上的文件已全部重新落地
+  // 云端（改动文件已重传 / 两侧皆无的基线已清理），「直到成功同步一次之前保持上传」
+  // 的使命完成 —— 策略当轮取消（成功即忘）。此后云端再丢失属于「全新丢失」，必须
+  // 重新登记决策挂起询问用户，绝不静默复用上次的选择；含跨重启场景（解除随轮末
+  // saveMeta 落盘，重建轮成功后不再有残留标记可被复用）。
+  if (ctx.store.meta.rootRebuilt && ctx.rootWasRebuilt && strongClean) {
+    delete ctx.store.meta.rootRebuilt
+  }
+  // 延续轮解除（保守口径）：本轮根探测正常（未再 404）且没有因该保护跳过的删除
+  //（「本地未变 + 远端缺失」的待和解集合已清零：全部基线文件要么重新上传成功、
+  // 要么两侧皆无）→ 清除标记，下一轮恢复正常删除传播。仍有债务（退避未到期 /
+  // 本轮有失败等）→ 保守保留保护（债务清零后的强干净轮重新评估），并提示原因。
+  if (ctx.store.meta.rootRebuilt && !ctx.rootWasRebuilt && strongClean) {
     if (ctx.summary.deleteRootGuard === 0) {
       delete ctx.store.meta.rootRebuilt
     }
@@ -3981,19 +4011,15 @@ async function applyRootGuardReleases(ctx: RoundContext): Promise<void> {
   }
 
   // ---- 远端根丢失「移除本地」标记的解除判定 ----
-  // 与 rootRebuilt 解除同口径的干净轮（无错误 / 未取消 / 非熔断 / 非只读 / 基线可信）
+  // 与 rootRebuilt 解除同口径的强干净轮（见上方 strongClean：含退避 / 开放意图债务
+  // 检查 —— 退避中的待移除文件不进删除闸，不带债务判定会在「干净」表象下提前解除）
   // 且本轮再无经标记放行的删除（待移除集合已和解：要么已删除、要么因本地改动改走
   // 上传；keep 保留类由逐文件挂起独立抑制，不依赖本标记）→ 解除标记，恢复正常
   // 删除语义（含批量阈值保护）。仍有待移除或本轮有失败 → 保守保留标记，下一轮继续。
   if (
     ctx.store.meta.rootLostRemoval &&
     ctx.removalForced === 0 &&
-    !ctx.dryRun &&
-    !ctx.aborted &&
-    !ctx.roundBreaker.open &&
-    ctx.caps.tier !== 'C' &&
-    ctx.store.loadedOk &&
-    ctx.errorNetCount + ctx.errorOtherCount === 0
+    strongClean
   ) {
     delete ctx.store.meta.rootLostRemoval
     await ctx.store.saveMeta().catch(() => {})
@@ -4529,6 +4555,12 @@ const services = {
       digestChallenges,
       /** 带宽字节桶（e2e 断言限速生效后的桶状态） */
       byteBuckets,
+      /** 「不限制」的桶速率哨兵（e2e 断言改 0 即放开时的桶速率） */
+      BW_UNLIMITED_BPS,
+      /** 每源实时带宽限额表（e2e 断言调度器推送与限速修改的即时生效） */
+      liveLimits,
+      /** 推送一台服务器的实时带宽限额（调度器 applyConfig 的推送通道；测试直检用） */
+      applyNetLimits,
       /** 进程级累计流量（实时速率的数据源；单测断言 PUT/GET 字节计数） */
       netTraffic,
       /** saxes 解析器直检：畸形 XML 抛错 / 前缀变体 / 流式块边界 */
@@ -4582,6 +4614,16 @@ const services = {
       async ageFailures(d: any, ms: any) {
         const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
         st.ageFailures(ms)
+      },
+      /**
+       * 测试专用：为某文件植入一条持续失败退避记录（构造「重建轮带退避债务」场景，
+       * 验证解除判定对 permSkipped 债务的保守处理）。与引擎 noteFailure 同一入口，
+       * 计数 / 退避时长按真实规则推导；植入即落盘（与真实失败同口径）。
+       */
+      async seedFailure(d: any, rel: any, code: any, message: any) {
+        const st = await storage.openDirStore({ localPath: d.localPath, remotePath: d.remotePath })
+        st.noteFailure(String(rel), { code: String(code || 'TEST'), message: String(message || 'seeded') })
+        if (st.failuresDirty) await st.saveFailures().catch(() => {})
       },
       /** 读取某目录的元数据副本（测试断言左锁标记 lockLeftover 等） */
       async getDirMeta(d: any) {
