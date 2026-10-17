@@ -1,12 +1,34 @@
-# WebDAV 同步
+<h1 align="center">WebDAV 同步</h1>
 
-> 把电脑上的文件夹与网盘保持一致的 ZTools 插件
+<div align="center">
 
-让电脑上的文件夹与任意支持 WebDAV 的网盘（坚果云、Nextcloud、群晖 NAS 等）自动保持一致。文件发生变化后自动同步到其他设备，支持双向同步 / 只上传 / 只下载，内置冲突处理、删除保护与同步记录。
+<img src="https://raw.githubusercontent.com/Particaly/ztools-webdav-sync/main/src-ztools/logo.png" alt="WebDAV 同步" width="120">
 
-<div>
-  <img src="https://raw.githubusercontent.com/Particaly/ztools-webdav-sync/main/docs/screenshots/main.png" alt="主界面" width="550" />
+**电脑文件夹 ↔ 任意 WebDAV 网盘自动保持一致 —— 双向同步 / 只上传 / 只下载 + 冲突与删除保护**
+
+_一个让 [ZTools](https://github.com/ztool-center/ztools) 支持 WebDAV 同步的插件_
+
+[![ZTools](https://img.shields.io/badge/ZTools-插件-orange)](https://github.com/ztool-center/ztools)
+[![Platform](https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-blue)](#快速上手)
+[![License](https://img.shields.io/badge/License-MIT-green)](#开源协议)
+
 </div>
+
+---
+
+把电脑上的文件夹和坚果云、Nextcloud、群晖 NAS 等任意支持 WebDAV 的网盘连起来，文件一有变化就自动同步到其他设备。双向同步、只上传备份、只下载三种方式按需选；冲突弹窗让你拍板、绝不静默覆盖，删除与被覆盖的旧版都进回收站可找回，配好之后基本不用管。
+
+## 🖼️ 界面预览
+
+| 主界面：多文件夹管理 | 正在同步：实时进度与速率 |
+|---|---|
+| <img src="https://raw.githubusercontent.com/Particaly/ztools-webdav-sync/main/docs/screenshots/main.png" alt="主界面" width="420"> | <img src="https://raw.githubusercontent.com/Particaly/ztools-webdav-sync/main/docs/screenshots/syncing.png" alt="正在同步" width="420"> |
+| 多个文件夹各自显示状态与最近同步时间 | 文件数 + 字节量进度条，实时显示上传 / 下载速率 |
+
+| 冲突处理 | 同步记录 |
+|---|---|
+| <img src="https://raw.githubusercontent.com/Particaly/ztools-webdav-sync/main/docs/screenshots/conflict.png" alt="冲突处理" width="420"> | <img src="https://raw.githubusercontent.com/Particaly/ztools-webdav-sync/main/docs/screenshots/records.png" alt="同步记录" width="420"> |
+| 两台设备改了同一文件时对比修改时间与大小，保留任一侧或同时保留 | 每轮同步的触发方式与逐文件明细，改动全程可回溯 |
 
 ## 功能特性
 
