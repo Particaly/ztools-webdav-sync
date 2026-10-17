@@ -144,7 +144,7 @@ function onTriggerKeydown(e: KeyboardEvent) {
   transition: border-color 0.15s ease, background 0.15s ease;
 
   &:hover:not(:disabled) {
-    border-color: #c9d0d7;
+    border-color: var(--br-input-hover);
   }
 
   &:disabled {
@@ -193,7 +193,7 @@ function onTriggerKeydown(e: KeyboardEvent) {
   transition: background 0.1s ease;
 
   &.active {
-    background: #f1f3f6;
+    background: var(--bg-seg);
   }
 
   &.selected {

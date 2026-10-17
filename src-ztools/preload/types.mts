@@ -249,12 +249,6 @@ export interface Prefs {
   concurrency: number
   /** 默认 WebDAV 目录：添加同步目录时预填的云端路径，空字符串表示不预填 */
   defaultRemoteDir: string
-  /**
-   * 功能测试目录：设置页「功能测试」在该目录内实际建删临时文件夹实测写权限
-   *（WebDAV 服务器不同子树的写权限可能不同，根目录不一定可写）。空字符串 =
-   * 未选择（渲染层在首次执行功能测试时弹远端目录选择器让用户指定）。
-   */
-  probeRemoteDir?: string
   /** 内容消歧上限（字节）：指纹模糊时下载到临时文件比对 hash 的最大文件大小，默认 50MB */
   verifyMaxBytes?: number
   /**
@@ -328,8 +322,13 @@ export interface Prefs {
    *（'B' / 'C'）。档位变化后（服务器变更或重新检测出不同结论）重新提示。
    */
   tierHintDismissed?: string
-  /** 插件同步行「本机插件目录尚未发现」提示条不再显示（永久；目录出现后提示条本就会消失） */
-  pluginUnavailableDismissed?: boolean
+  /**
+   * 插件同步行「本机插件目录尚未发现」提示条不再显示：记录关闭时的提示原因
+   *（pluginSyncInfo.reason，目录未发现的原因恒非空）。同一原因不再提示，原因
+   * 变化（目录出现过又以别的原因丢失）后重新提示。历史遗留的 boolean true 视为
+   * 「已关闭」（旧版永久关闭语义；与新指纹不匹配时提示条复出一次，再关即写入指纹）。
+   */
+  pluginUnavailableDismissed?: boolean | string
   /**
    * 插件同步行「注册表对账降级」提示条不再显示：记录关闭时的对账状态
    *（'pending' / 'denied' / 'unavailable'）。状态变化（如批准授权、宿主升级）后重新提示。
@@ -665,8 +664,8 @@ export interface SchedulerApi {
   resume(): void
   /** 重读 dbStorage 配置（渲染层 persist 后调用；配置权威只有 dbStorage） */
   reload(): Promise<{ applied: boolean; error?: string }>
-  /** 应答转发来的冲突（kind=manual 且渲染层在线时的弹窗选择） */
-  resolveConflict(conflictId: string, choice: 'local' | 'remote' | 'both', applyToRemaining?: boolean): boolean
+  /** 应答转发来的冲突（kind=manual 且渲染层在线时的弹窗选择）；'defer' = 弹窗「稍后处理」 */
+  resolveConflict(conflictId: string, choice: 'local' | 'remote' | 'both' | 'defer', applyToRemaining?: boolean): boolean
   /**
    * 轮末展示摘要（纯函数）—— 熔断轮归因「服务器连续无响应」+ 最后失败摘要、
    * 相同错误消息折叠为一条、挂起冲突轮收尾「部分完成，有 N 个待处理冲突」。
@@ -929,6 +928,15 @@ export interface SyncLogEntry {
   errors: string[]
   /** 被截断未记录的错误数 */
   errorsDropped?: number
+  /**
+   * 本轮轮末注册表对账新登记进宿主注册表的插件名（「ZTools 插件」虚拟行专属：
+   * 从云端回来的 manifest 记录 / 孤儿实体被采纳 —— 即「本轮安装了哪些来自云端的
+   * 插件」）。仅确有登记时存在（上限 50 个名字）；旧版本记录与其它目录不带。
+   * 注意与 adopted（规划期收敛文件数）无关 —— 对账发生在轮末，无法折进 SyncSummary。
+   */
+  registryAdopted?: string[]
+  /** 本轮对账移除的插件名（实体连续两轮缺位后的幽灵登记清理）；形态同上 */
+  registryRemoved?: string[]
 }
 
 /** 基线 / WAL 日志行负载（t 为六种负载类型之一，见字段注释） */

@@ -33,12 +33,12 @@ test('渲染层 store：全局暂停自动同步（P1–P6）', async () => {
     // P1 默认未暂停
     check('P1 default: not paused, pauseUntil=0', store.autoSyncPaused.value === false && store.globalPauseUntil.value === 0, JSON.stringify({ paused: store.autoSyncPaused.value, until: store.globalPauseUntil.value }))
 
-    // P2 定时暂停：未来时刻归一保留，状态文案含「已暂停」
+    // P2 定时暂停：未来时刻归一保留，状态文案写明恢复时间点（至今日 / 明日 HH:MM）
     store.pauseAutoSync(60 * 60000)
     const until2 = store.globalPauseUntil.value
     check(
-      'P2 pauseAutoSync(60min) books a future expiry and reports paused',
-      store.autoSyncPaused.value === true && until2 - Date.now() > 55 * 60000 && until2 - Date.now() <= 60 * 60000 && /已暂停/.test(store.pauseStatusText.value),
+      'P2 pauseAutoSync(60min) books a future expiry and reports paused until an absolute clock time',
+      store.autoSyncPaused.value === true && until2 - Date.now() > 55 * 60000 && until2 - Date.now() <= 60 * 60000 && /^已暂停同步至(今日|明日) \d{2}:\d{2}$/.test(store.pauseStatusText.value),
       JSON.stringify({ until: until2, text: store.pauseStatusText.value })
     )
 

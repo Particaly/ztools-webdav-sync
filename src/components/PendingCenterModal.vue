@@ -60,7 +60,7 @@ function openDecisionsPage() {
     <AppModal
       v-if="open"
       title="待处理与处理记录"
-      :subtitle="groups.length ? '各同步文件夹的待决策事项集中在这里处理' : '没有待处理的记录'"
+      :subtitle="groups.length ? '各同步文件夹的待处理事项集中在此处理' : '没有待处理的记录'"
       :width="460"
       @close="open = false"
     >
@@ -74,13 +74,13 @@ function openDecisionsPage() {
             :class="{ 'grp-danger': g.rootLost > 0 }"
           >
             <div class="min-w-0 flex-1 flex flex-col gap-[3px]">
-              <span class="truncate text-[12px] font-semibold" :class="g.rootLost > 0 ? 'text-[#b3261e]' : 'text-ink-1'">{{ g.dir.name }}</span>
-              <span class="flex flex-wrap items-center gap-x-[8px] gap-y-[2px] text-[11px]" :class="g.rootLost > 0 ? 'text-[#b3261e]' : 'text-ink-3'">
+              <span class="truncate text-[12px] font-semibold" :class="g.rootLost > 0 ? 'text-danger-deep' : 'text-ink-1'">{{ g.dir.name }}</span>
+              <span class="flex flex-wrap items-center gap-x-[8px] gap-y-[2px] text-[11px]" :class="g.rootLost > 0 ? 'text-danger-deep' : 'text-ink-3'">
                 <span v-if="g.rootLost > 0" class="inline-flex items-center gap-[4px]">
-                  <AppIcon name="warn" :size="12" class="text-danger" />云端的同步文件夹不见了，同步已暂停
+                  <AppIcon name="warn" :size="12" class="text-danger" />云端同步文件夹丢失，同步已暂停
                 </span>
-                <span v-if="g.deleteConfirm > 0">{{ g.deleteConfirm }} 项删除等你确认</span>
-                <span v-if="g.conflict > 0">{{ g.conflict }} 个文件两边都被改过</span>
+                <span v-if="g.deleteConfirm > 0">{{ g.deleteConfirm }} 项删除待确认</span>
+                <span v-if="g.conflict > 0">{{ g.conflict }} 个文件在本地与云端均被修改</span>
               </span>
             </div>
             <button type="button" class="act" @click="store.goPendingDir(g.dir)">去处理</button>
@@ -94,7 +94,7 @@ function openDecisionsPage() {
             <span class="text-[11px] font-semibold text-ink-3">最近处理记录</span>
           </div>
           <div v-if="historyLoading" class="text-[11px] text-ink-4 px-[2px]">读取中…</div>
-          <div v-else-if="!history.length" class="text-[11px] text-ink-4 px-[2px]">还没有处理记录</div>
+          <div v-else-if="!history.length" class="text-[11px] text-ink-4 px-[2px]">暂无处理记录</div>
           <div v-else class="flex flex-col gap-[4px] max-h-[180px] overflow-y-auto">
             <div v-for="(h, i) in history" :key="`${h.at}-${i}`" class="hist">
               <span class="min-w-0 flex-1 truncate" :title="`${h.dirName} / ${h.rel}`">
@@ -129,8 +129,8 @@ function openDecisionsPage() {
   border-radius: 7px;
 
   &.grp-danger {
-    border-color: var(--red-strip-br, #f3cfcb);
-    background: var(--red-strip-bg, #fdf5f4);
+    border-color: var(--red-strip-br);
+    background: var(--red-strip-bg);
   }
 }
 
@@ -146,8 +146,8 @@ function openDecisionsPage() {
   transition: background 0.12s ease, border-color 0.12s ease;
 
   &:hover {
-    background: #f1f3f6;
-    border-color: #d3d9df;
+    background: var(--bg-seg);
+    border-color: var(--br-input-hover);
   }
 }
 

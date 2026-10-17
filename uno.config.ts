@@ -28,7 +28,10 @@ export default defineConfig({
         icon: 'var(--amber-icon)',
         bg: 'var(--amber-bg)',
       },
-      danger: 'var(--red)',
+      danger: {
+        DEFAULT: 'var(--red)',
+        deep: 'var(--red-deep)',
+      },
       // 特定用途的文字色
       'btn-text': 'var(--btn-text)',
       'icon-dark': 'var(--icon-dark)',

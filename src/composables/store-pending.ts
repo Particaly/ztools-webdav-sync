@@ -171,20 +171,30 @@ export function goPendingDir(d: SyncDir) {
 }
 
 /**
- * 为一批冲突挂起记录落 choice（逐条或「对剩余都这样处理」）：local / remote / both。
+ * 为一批冲突挂起记录落 choice（逐条或「对剩余都这样处理」，也承载面板「重新选择」
+ * 的改选 —— setPendingChoice 按同键覆盖旧值）：local / remote / both。
  * （删除确认类不走这里 —— 目录树决策走 applyDeleteScope 的范围通道，覆盖逐文件
  * 记录装不下的部分。）落完刷新面板并触发一轮手动同步（下一轮按 choice 自动解决）；
  * 同步进行中不排队（下一轮自动消费选择），改为明确提示而不是静默吞掉。
+ * 全部条目都写入失败（返回 false = 挂起记录已不存在，最近一轮同步已按原选择执行
+ * 完毕并清除记录）时如实提示「无法再修改」，不触发同步也不报成功。
  */
 export async function applyPendingChoices(dir: SyncDir, rels: string[], choice: 'local' | 'remote' | 'both') {
   if (!window.services || state.demo || !rels.length) return
   const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
+  let okCount = 0
   try {
-    for (const rel of rels) await window.services.sync.setPendingChoice(dirArg, rel, choice)
+    for (const rel of rels) {
+      if (await window.services.sync.setPendingChoice(dirArg, rel, choice)) okCount++
+    }
   } catch (e) {
-    toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
+    toast.error('操作失败，请重试', e instanceof Error ? e.message : String(e))
   }
   await refreshPendingConflicts(dir)
+  if (!okCount) {
+    toast.info('这些事项已随最近一次同步处理完成', '记录已生效，无法再修改')
+    return
+  }
   const remaining = (dir.pendingConflicts ?? []).filter((p) => !p.choice && p.kind !== 'delete' && p.kind !== 'root-lost').length
   toast.success('已记录处理方式', remaining > 0 ? `还有 ${remaining} 个待处理` : '下次同步时生效')
   if (dir.status === 'syncing') {
@@ -211,7 +221,7 @@ export async function applyDeleteScope(dir: SyncDir, rel: string, choice: 'delet
       res && res.covered > 0 ? `${scope}影响 ${res.covered} 个文件，下次同步时生效` : '下次同步时生效'
     )
   } catch (e) {
-    toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
+    toast.error('操作失败，请重试', e instanceof Error ? e.message : String(e))
     return
   }
   await refreshPendingConflicts(dir)
@@ -248,10 +258,18 @@ export async function resolveRootLost(dir: SyncDir, choice: 'upload' | 'remove-l
   state.rootLostPromptDirId = null
   if (!window.services || state.demo) return
   const dirArg = { id: dir.id, localPath: dir.localPath, remotePath: dir.remotePath, mode: dir.mode }
+  let ok = false
   try {
-    await window.services.sync.setPendingChoice(dirArg, '.', choice)
+    ok = (await window.services.sync.setPendingChoice(dirArg, '.', choice)) === true
   } catch (e) {
-    toast.error('操作没有成功，请重试', e instanceof Error ? e.message : String(e))
+    toast.error('操作失败，请重试', e instanceof Error ? e.message : String(e))
+    return
+  }
+  if (!ok) {
+    // 挂起记录已不存在 = 最近一轮同步已按原选择消费（根重建 / 移除已启动或完成）：
+    // 迟到的改选无法再生效，如实提示而不是误报失败
+    await refreshPendingConflicts(dir)
+    toast.info('该决策已随最近一次同步执行', '记录已生效，无法再修改')
     return
   }
   await refreshPendingConflicts(dir)

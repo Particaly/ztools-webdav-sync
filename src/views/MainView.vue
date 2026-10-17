@@ -38,7 +38,7 @@ const store = useStore()
           </TransitionGroup>
           <!-- 已配置但还没有同步目录：flex-1 会把空块撑满高度，用占位说明避免一片空白 -->
           <div v-if="!store.state.dirs.length" class="h-full flex items-center justify-center">
-            <span class="text-[12px] text-ink-4">还没有同步文件夹，点击右上角「添加文件夹」开始</span>
+            <span class="text-[12px] text-ink-4">暂无同步文件夹，点击右上角「添加文件夹」开始</span>
           </div>
         </div>
       </template>
@@ -75,14 +75,14 @@ const store = useStore()
             </svg>
           </div>
           <h1 class="m-0 text-[18px] font-semibold text-ink-1">开始使用 WebDAV 同步</h1>
-          <p class="mt-[6px] mb-0 text-[12px] text-ink-2">连接你的网盘，再选择要同步的电脑文件夹</p>
+          <p class="mt-[6px] mb-0 text-[12px] text-ink-2">连接网盘，并选择要同步的电脑文件夹</p>
           <div class="h-[22px]" />
           <div class="flex gap-[10px]">
             <AppButton variant="primary" size="lg" strong pad="0 16px" @click="store.state.route = 'settings'">
               <AppIcon name="cloud-up" :size="15" />
               配置 WebDAV
             </AppButton>
-            <AppButton size="lg" @click="store.openGuide()">WebDAV 是什么？</AppButton>
+            <AppButton size="lg" @click="store.openGuide()">什么是 WebDAV？</AppButton>
           </div>
           <div class="h-[26px]" />
           <p class="m-0 text-[11px] text-ink-4">支持坚果云、Nextcloud、群晖 NAS 等提供 WebDAV 功能的网盘</p>
@@ -94,7 +94,7 @@ const store = useStore()
     <StatusBar v-if="store.configured.value" />
     <footer v-else class="flex items-center gap-2 h-[44px] px-4 bg-fill-bar border-t border-solid border-line-bar shrink-0">
       <AppIcon name="info" :size="13" class="text-ink-4" />
-      <span class="text-[12px] text-ink-2">第一次使用？看看教程，学会怎么连接网盘</span>
+      <span class="text-[12px] text-ink-2">首次使用请先查看配置指南，了解如何连接网盘</span>
       <button type="button" class="help-link" @click="store.openGuide()">查看指南</button>
     </footer>
 

@@ -22,6 +22,7 @@ export type TestResult = {
 }
 import { toast } from './toast'
 import { MIN_INTERVAL_MIN } from './options'
+import { fmtClock } from './format'
 import { ZTOOLS_PLUGINS_DIR_ID } from '../../src-ztools/preload/types.mts'
 
 
@@ -52,8 +53,6 @@ export function defaultPrefs(): Prefs {
     ignoreHidden: true,
     concurrency: 4,
     defaultRemoteDir: '',
-    // 功能测试目录：'' = 未选择（首次执行功能测试时弹目录选择器让用户指定）
-    probeRemoteDir: '',
     verifyMaxBytes: 50 * 1024 * 1024,
     deepVerify: false,
     deepVerifyDays: 7,
@@ -75,7 +74,8 @@ export function defaultPrefs(): Prefs {
     // 情境指纹类关闭后条件变化会重新提示，时间戳类有新挂起会重新提示
     insecureHttpDismissedFor: '',
     tierHintDismissed: '',
-    pluginUnavailableDismissed: false,
+    // 插件目录未发现提示：'' = 从未关闭；关闭后记录当时的提示原因（指纹）
+    pluginUnavailableDismissed: '',
     registrySyncDismissed: '',
     pendingBarMutedAt: 0,
   }
@@ -117,9 +117,9 @@ export function tierLabel(t?: DavTier | null): string {
 
 /** 档位提示文案（B 档的并发安全边界与 C 档的只读说明） */
 export function tierHint(t?: DavTier | null): string {
-  if (t === 'A') return '这个服务器支持多台设备安全地同时同步'
-  if (t === 'B') return '多台设备同时修改同一个文件时，可能互相覆盖。覆盖或删除前会先逐个确认，建议尽量错开使用'
-  if (t === 'C') return '服务器不允许上传或删除，目前只会下载云端文件'
+  if (t === 'A') return '该服务器支持多台设备安全地同时同步'
+  if (t === 'B') return '多台设备同时修改同一文件时可能相互覆盖。覆盖或删除前会逐个确认，建议尽量错开使用'
+  if (t === 'C') return '服务器不允许上传或删除，当前仅下载云端文件'
   return ''
 }
 
@@ -157,8 +157,6 @@ export const state = reactive({
   capabilities: null as DavCapabilities | null,
   probing: false, // 「重新探测」进行中
   showAdd: false,
-  /** 功能测试目录选择弹窗显隐：首次功能测试与设置页「修改测试目录」入口共用 */
-  showProbeDirPicker: false,
   conflictQueue: [] as ConflictInfo[],
   activeConflict: null as ConflictInfo | null,
   /** 冲突弹窗「对本轮剩余冲突都这样处理」勾选：置位后本轮后续冲突不再弹窗 */
@@ -180,7 +178,6 @@ export const state = reactive({
   pendingPanelDirId: null as string | null,
   syncingAll: false,
   demo: false,
-  saved: false, // 设置页「保存设置」反馈
   /**
    * 全局实时传输速率（字节/秒；调度器 net-speed 事件驱动，1s 一拍、EMA 平滑）。
    * 纯运行时展示字段：persist 只序列化显式列出的字段，不落盘。
@@ -374,8 +371,8 @@ export const insecureHttp = computed(() => {
 // ---------- 全局暂停自动同步（顶栏一键暂停） ----------
 
 /**
- * 暂停剩余时间展示用的跳动时钟：仅暂停期间运转的 30s 周期 ref，驱动
- * autoSyncPaused / pauseRemainingText 随时间翻转（到期自动显示为未暂停，
+ * 暂停展示用的跳动时钟：仅暂停期间运转的 30s 周期 ref，驱动 globalPauseUntil /
+ * autoSyncPaused / pauseStatusText 随时间翻转（到期自动显示为未暂停，
  * 调度器侧由到期定时器自行恢复，渲染层不承担恢复动作）。
  */
 const pauseTicker = ref(0)
@@ -405,14 +402,17 @@ export const globalPauseUntil = computed(() => {
 })
 /** 自动同步是否处于全局暂停中（手动「立即同步」不受影响，见 scheduler.dirEligible） */
 export const autoSyncPaused = computed(() => globalPauseUntil.value !== 0)
-/** 顶栏状态位的暂停文案（title 里带恢复时机） */
+/** 顶栏状态位的暂停文案：写明自动恢复时间点（至今日 / 明日 HH:MM；-1 一直暂停不带时间） */
 export const pauseStatusText = computed(() => {
   const until = globalPauseUntil.value
   if (until === -1) return '已暂停同步'
-  const remainMs = until - (pauseTicker.value || Date.now())
-  const min = Math.max(1, Math.round(remainMs / 60000))
-  const remain = min >= 60 ? `${Math.floor(min / 60)} 小时${min % 60 ? ` ${min % 60} 分` : ''}` : `${min} 分钟`
-  return `已暂停同步，约 ${remain} 后自动恢复`
+  // 按日历日差分决定「今日 / 明日」：暂停菜单最长 4 小时只会跨到明天，但
+  // pauseAutoSync 是公开入口，更远的到期回退「M月D日」保文案任何入参下不出错
+  const now = new Date()
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const dayDiff = Math.floor((until - startToday) / 86400000)
+  const day = dayDiff <= 0 ? '今日' : dayDiff === 1 ? '明日' : `${new Date(until).getMonth() + 1}月${new Date(until).getDate()}日`
+  return `已暂停同步至${day} ${fmtClock(until)}`
 })
 
 /**

@@ -93,14 +93,14 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
     } catch (e) {
       sc1err2 = e
     }
-    check('SC1 syncNow unknown dir rejects explicitly', !!sc1err2 && /找不到这个同步文件夹/.test(sc1err2.message), sc1err2 && sc1err2.message)
+    check('SC1 syncNow unknown dir rejects explicitly', !!sc1err2 && /找不到该同步文件夹/.test(sc1err2.message), sc1err2 && sc1err2.message)
     let sc1err3 = null
     try {
       await sc1.syncNow()
     } catch (e) {
       sc1err3 = e
     }
-    check('SC1 syncNow with no enabled dirs rejects explicitly', !!sc1err3 && /没有正在开启的同步文件夹/.test(sc1err3.message), sc1err3 && sc1err3.message)
+    check('SC1 syncNow with no enabled dirs rejects explicitly', !!sc1err3 && /没有已启用的同步文件夹/.test(sc1err3.message), sc1err3 && sc1err3.message)
 
     // plugin-out / plugin-enter 事件转发（渲染层只经订阅接收，不自行注册钩子）
     const sc1events = []
@@ -1286,7 +1286,7 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
         const p1 = pendings()[0]
         check(
           'SC10 first deferred conflict emits pending event and notifies once',
-          p1 && p1.dirId === 'd1' && p1.newlyNotified === true && p1.items.some((it) => it.rel === 'c1.txt' && !it.choice) && notes.length === 1 && /1 个文件需要你选择保留哪一个/.test(notes[0] || ''),
+          p1 && p1.dirId === 'd1' && p1.newlyNotified === true && p1.items.some((it) => it.rel === 'c1.txt' && !it.choice) && notes.length === 1 && /1 个冲突文件待选择保留版本/.test(notes[0] || ''),
           JSON.stringify({ newly: p1 && p1.newlyNotified, notes: notes.length })
         )
         // 第 2 个 interval 轮：同一挂起集合 → 不再提醒（同批去重）
@@ -1313,7 +1313,7 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
         const lastPending = [...pendings()].pop()
         check(
           'SC10 a NEW pending set notifies again only after the previous one was handled',
-          notes.length === 2 && /1 个文件需要你选择保留哪一个/.test(notes[1]) && lastPending && lastPending.newlyNotified === true && lastPending.items.some((it) => it.rel === 'c2.txt'),
+          notes.length === 2 && /1 个冲突文件待选择保留版本/.test(notes[1]) && lastPending && lastPending.newlyNotified === true && lastPending.items.some((it) => it.rel === 'c2.txt'),
           JSON.stringify({ notes: notes.length, newly: lastPending && lastPending.newlyNotified })
         )
         // 「暂时忽略」：清除挂起（该文件再冲突时才重新询问），不触发提醒
@@ -1330,11 +1330,11 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
       const rBreaker = sr({ breaker: { open: true, consecutive: 5, reason: 'PUT 127.0.0.1:5360：HTTP 503' }, errors: [noise, noise, noise, 'other'] }, null, false)
       check(
         'SC10 summarizeRound: breaker tone with folded CIRCUIT_OPEN noise',
-        rBreaker.tone === 'breaker' && rBreaker.title === '服务器一直没有响应，本次同步已暂停，稍后自动重试' && /HTTP 503/.test(rBreaker.detail) && rBreaker.errors.length === 2 && rBreaker.errors[0].startsWith(noise) && rBreaker.errors[0].includes('重复 3 次') && rBreaker.errors[1] === 'other',
+        rBreaker.tone === 'breaker' && rBreaker.title === '服务器连续无响应，本次同步已暂停，稍后将自动重试' && /HTTP 503/.test(rBreaker.detail) && rBreaker.errors.length === 2 && rBreaker.errors[0].startsWith(noise) && rBreaker.errors[0].includes('重复 3 次') && rBreaker.errors[1] === 'other',
         JSON.stringify(rBreaker)
       )
       const rPartial = sr({ deferredConflicts: 3, errors: [] }, null, false)
-      check('SC10 summarizeRound: deferred round reads as partial completion', rPartial.tone === 'partial' && rPartial.title === '部分完成：3 个文件等你选择', JSON.stringify(rPartial))
+      check('SC10 summarizeRound: deferred round reads as partial completion', rPartial.tone === 'partial' && rPartial.title === '部分完成：3 个冲突文件待选择', JSON.stringify(rPartial))
       const rCancel = sr(null, '同步已中止：用户取消', true)
       check('SC10 summarizeRound: cancelled tone', rCancel.tone === 'cancelled' && rCancel.title === '已取消同步', '')
       const rOk = sr({ errors: [] }, null, false)
@@ -1515,6 +1515,61 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
         r11b.ok === true && r11b.summary && r11b.summary.uploaded === 2 && fs.existsSync(path.join(remoteBase11b, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11b, 'demo-b-0.1.0-ab12cd34.asar')),
         JSON.stringify(r11b.ok ? r11b.summary : r11b.error)
       )
+
+      // ④c 登记产出折进当轮同步记录：注入 internal 端口桩（空注册表 + fullAccess，
+      // 通知捕获），云端放一台「他机安装」的新插件 → 拉取轮末对账孤儿采纳 → 当轮
+      // 记录带 registryAdopted、系统通知点名插件；无新增的下一轮记录不带、不再通知
+      // （对账原先挂在调度器轮末 fire-and-forget，结果被丢弃 —— 记录里体现不出来）
+      {
+        const realPorts11 = services.host.getHostPorts()
+        const notifyBodies11 = []
+        const registryWrites11 = []
+        let registryStore11 = null
+        services.host.setHostPorts({
+          ...realPorts11,
+          notify: (body) => notifyBodies11.push(String(body)),
+          permissions: { getStatus: async () => ({ fullAccess: true, granted: [], pending: [] }), request: async () => ({ success: true, status: 'granted' }) },
+          internal: {
+            dbGet: async () => registryStore11,
+            dbPut: async (_k, v) => {
+              registryStore11 = v
+              registryWrites11.push(v)
+            },
+            notifyPluginsChanged: async () => {},
+          },
+        })
+        try {
+          await fsp.mkdir(path.join(remoteBase11b, 'plugin-c'), { recursive: true })
+          await fsp.writeFile(path.join(remoteBase11b, 'plugin-c', 'plugin.json'), '{"name":"plugin-c","title":"插件C"}')
+          const remotePath11c = services.ztoolsPlugins.describe('/sc11-custom').remotePath
+          const r11c = await sc11Sched.syncNow('ztools-plugins')
+          check('SC11 registry round pulls the cloud-only plugin', r11c.ok === true && r11c.summary && r11c.summary.downloaded >= 1, JSON.stringify(r11c.ok ? r11c.summary : r11c.error))
+          const rounds11c = await services.sync.listSyncLog({ id: 'ztools-plugins', localPath: PLUGINS, remotePath: remotePath11c })
+          const withAdopt11 = rounds11c.filter((e) => e.registryAdopted && e.registryAdopted.length)
+          check(
+            'SC11 round log records which plugins were installed from cloud (registryAdopted)',
+            withAdopt11.length === 1 && withAdopt11[0].registryAdopted.includes('plugin-c'),
+            JSON.stringify(rounds11c.map((e) => ({ at: e.at, adopted: e.registryAdopted || null })))
+          )
+          check(
+            'SC11 host registry actually received the adopted records',
+            registryWrites11.length === 1 && Array.isArray(registryWrites11[0]) && registryWrites11[0].some((rec) => rec && rec.name === 'plugin-c'),
+            JSON.stringify(registryWrites11)
+          )
+          check('SC11 system notification names the installed plugin', notifyBodies11.length === 1 && notifyBodies11[0].includes('plugin-c'), JSON.stringify(notifyBodies11))
+          // 无新增的下一轮：登记无变化 → 记录不带 registryAdopted、不再发通知
+          const r11d = await sc11Sched.syncNow('ztools-plugins')
+          const rounds11d = await services.sync.listSyncLog({ id: 'ztools-plugins', localPath: PLUGINS, remotePath: remotePath11c })
+          const last11d = rounds11d[rounds11d.length - 1]
+          check(
+            'SC11 follow-up round without new plugins logs no adoption and re-notifies nothing',
+            r11d.ok === true && !(last11d && last11d.registryAdopted && last11d.registryAdopted.length) && notifyBodies11.length === 1,
+            JSON.stringify({ last: last11d ? { adopted: last11d.registryAdopted || null, at: last11d.at } : null, notifyBodies: notifyBodies11 })
+          )
+        } finally {
+          services.host.setHostPorts(null)
+        }
+      }
 
       // ⑤ 行级暂停（ztoolsPluginSyncPaused → enabled=false）：全量手动同步不含该目录
       setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: true, ztoolsPluginSyncPaused: true })

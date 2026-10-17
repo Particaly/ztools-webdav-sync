@@ -391,7 +391,7 @@ let SAFE_LOCAL = null
     s2err = e
     s2summary = e.summary
   }
-  check('S2 corrupt snapshot surfaces conflict error (baseline note is log-only now)', !!s2err && /冲突还没处理/.test(s2err.message), s2err && s2err.message)
+  check('S2 corrupt snapshot surfaces conflict error (baseline note is log-only now)', !!s2err && /冲突尚未处理/.test(s2err.message), s2err && s2err.message)
   check('S2 corrupt snapshot blocks delete propagation', fs.existsSync(path.join(ROOT, 'safe', 'del.txt')))
   check('S2 corrupt snapshot blocks overwrite', (await fsp.readFile(path.join(ROOT, 'safe', 'a.txt'), 'utf-8')) === 'safe-a-v1')
   check(
@@ -439,7 +439,7 @@ let SAFE_LOCAL = null
   } catch (e) {
     s5err = e
   }
-  check('S5 unresolved conflict fails the round', !!s5err && /冲突还没处理/.test(s5err.message), s5err && s5err.message)
+  check('S5 unresolved conflict fails the round', !!s5err && /冲突尚未处理/.test(s5err.message), s5err && s5err.message)
   check(
     'S5 both versions intact',
     (await fsp.readFile(path.join(SAFE_LOCAL, 'a.txt'), 'utf-8')) === 'safe-a-v4-local-x' &&

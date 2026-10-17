@@ -36,6 +36,7 @@ import type {
   SyncProgress,
   ZtoolsPluginsSyncDesc,
 } from './types.mts'
+import { ZTOOLS_PLUGINS_DIR_ID } from './types.mts'
 import {
   LIVE_TEMPS,
   REMOTE_FP_TOL_MS,
@@ -310,7 +311,7 @@ async function uploadOne(cfg: EngineCfg, dir: DirCfg, rel: string, expected: any
   if (badName) throw badFilenameError(rel, badName)
   // PRE-UPLOAD-CHECK：扫描之后文件若已变化，绝不能按旧计划上传（基线指纹必须对应实际上传的内容）
   const st1 = await statOrNull(expected.abs)
-  if (!st1) throw new Error(`「${rel}」未上传：文件已经不在电脑上了`)
+  if (!st1) throw new Error(`「${rel}」未上传：文件已不在电脑上`)
   if (st1.size !== expected.size || Math.abs(st1.mtimeMs - expected.mtimeMs) > tolMs) {
     throw new Error(`「${rel}」未上传：同步过程中文件被改动了，下次同步会重新处理`)
   }
@@ -363,7 +364,7 @@ async function uploadOne(cfg: EngineCfg, dir: DirCfg, rel: string, expected: any
   // POST-CHECK：上传期间文件被修改 → 本次上传不能视为最终同步状态
   const st2 = await statOrNull(expected.abs)
   if (!st2 || st2.size !== st1.size || Math.abs(st2.mtimeMs - st1.mtimeMs) > tolMs) {
-    throw new Error(`「${rel}」上传时又被修改了，请再同步一次`)
+    throw new Error(`「${rel}」在上传时再次被修改，请重新同步`)
   }
   // 远端核验（VERIFY）已移至 syncDirectory 的批量校验阶段：PUT 成功 + 本地双 stat
   // 一致即返回，远端存在性 / size 与写基线用的指纹由所在目录的一次 PROPFIND Depth 1 统一提供
@@ -407,13 +408,13 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
   const abs = path.join(dir.localPath, ...segs)
   const before = await statOrNull(abs)
   if (guards.expectedLocal) {
-    if (!before) throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
+    if (!before) throw new Error(`「${rel}」未下载：电脑上的文件刚被修改，已保留现有版本，未覆盖`)
     if (before.size !== guards.expectedLocal.size || Math.abs(before.mtimeMs - guards.expectedLocal.mtimeMs) > tolMs) {
-      throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
+      throw new Error(`「${rel}」未下载：电脑上的文件刚被修改，已保留现有版本，未覆盖`)
     }
   } else if (before) {
     // 计划时目标不存在，现在却存在：计划外出现的内容一律不覆盖
-    throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
+    throw new Error(`「${rel}」未下载：电脑上的文件刚被修改，已保留现有版本，未覆盖`)
   }
   await fsp.mkdir(path.dirname(abs), { recursive: true })
   const tmp = path.join(tmpDir, `.wdsync-dl-${Date.now()}-${Math.random().toString(36).slice(2)}`)
@@ -451,7 +452,7 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
     // LOCAL_TARGET_CHANGED?：下载期间目标被用户修改 → 不 rename、不覆盖
     const after = await statOrNull(abs)
     if ((before == null) !== (after == null) || (before && after && (before.size !== after.size || Math.abs(before.mtimeMs - after.mtimeMs) > tolMs))) {
-      throw new Error(`「${rel}」未下载：电脑上的文件刚被修改或出现变化，已保留你的版本，没有覆盖`)
+      throw new Error(`「${rel}」未下载：电脑上的文件刚被修改，已保留现有版本，未覆盖`)
     }
     // 计划内覆盖（expectedLocal 守卫已通过、目标仍存在）：先把本地旧版本移入
     // 系统回收站再落地新内容 —— 与删除语义统一，被覆盖的旧版可从回收站找回
@@ -769,13 +770,13 @@ async function recoverIntents(store: storage.DirStateStore, cfg: EngineCfg, dir:
       if (r && remoteDiffers && r.size >= 0 && r.size < lp.size && lp.size > 0) {
         if (r.size > vMax) {
           // 超上限：无法安全判定 → 保持开放 + 冲突弹窗提示（经 onConflict info.hint）
-          pushWarning(`「${it.rel}」在云端可能是上次没传完的不完整文件，但文件太大无法自动对比，请你选择保留哪一个`)
+          pushWarning(`「${it.rel}」在云端可能是上次传输中断留下的不完整文件，但文件过大无法自动比对，请选择要保留的版本`)
           continue
         }
         const verdict = await remoteIsLocalPrefix(cfg, dir, rel, l.abs, r.size)
         if (verdict === 'match') {
           // 同 rel 多个开放意图（历史残留 / 崩溃窗口）只提示一次，forceUploads 天然去重
-          if (!forceUploads.has(rel)) pushWarning(`「${it.rel}」在云端是上次没传完的不完整文件，已自动重新上传`)
+          if (!forceUploads.has(rel)) pushWarning(`「${it.rel}」在云端是上次传输中断留下的不完整文件，已自动重新上传`)
           forceUploads.add(rel)
           continue // 意图保持开放：强制重传的新意图将以「新者取代旧者」了结它
         }
@@ -1012,8 +1013,29 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
     if (!(roundError && roundError.__wdsyncCrash)) {
       try {
         const cancelled = !!(roundError && (roundError.code === 'ABORTED' || (typeof handlers?.shouldAbort === 'function' && handlers.shouldAbort())))
+        // 插件注册表对账（实验功能「无感同步」的第二段）：实体与 manifest 本轮已
+        // 落盘，落盘记录**之前** await 完成 —— 登记/移除的插件名直接折进当轮同步
+        // 记录（registryAdopted / registryRemoved），用户在同步记录页能看到「本轮
+        // 从云端装了哪些插件」，无需轮后再回写。（原先挂在调度器轮末 fire-and-forget，
+        // 结果被丢弃 —— 记录里体现不出来。）门控与原位语义一致：仅虚拟行、取消轮
+        // 跳过（半截状态等下一轮）、预演轮跳过；挂起等待宿主审批（pending）与
+        // 降级（denied / unavailable / error）不产生登记，自然不折入。对账整体
+        // 串行化在 ztools-registry.mts 内部；15s 兜底超时防宿主 IPC 病理性挂起
+        // 拖死轮次收尾（超时后对账继续在后台完成，只是本轮记录不带登记信息）。
+        let registry: { adopted: string[]; removed: string[] } | null = null
+        if (dir && dir.id === ZTOOLS_PLUGINS_DIR_ID && !cancelled && !(handlers && handlers.hints && handlers.hints.dryRun === true)) {
+          try {
+            const r = await Promise.race([reconcilePluginRegistry(dir.localPath), sleep(15000).then(() => null)])
+            if (r && ((r.adopted && r.adopted.length > 0) || (r.removed && r.removed.length > 0))) {
+              registry = { adopted: r.adopted || [], removed: r.removed || [] }
+              notifyRegistryOutcome(registry)
+            }
+          } catch (_) {
+            /* 对账失败不阻断记录落盘：登记信息缺席优于记录缺席 */
+          }
+        }
         const st = await storage.openDirStore({ localPath: dir && dir.localPath, remotePath: dir && dir.remotePath })
-        st.appendSyncLog(buildSyncLogEntry({ handlers, at: roundStartAt, summary: roundSummary || (roundError && roundError.summary) || null, error: roundError, cancelled }))
+        st.appendSyncLog(buildSyncLogEntry({ handlers, at: roundStartAt, summary: roundSummary || (roundError && roundError.summary) || null, error: roundError, cancelled, registry }))
         await st.saveSyncLog().catch(() => {})
       } catch (_) {
         /* 同步记录写入失败无害：纯展示性审计信息 */
@@ -1023,6 +1045,23 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
     // 不得随 round-end 事件进渲染层、更不能被渲染层持久化进配置（非展示字段）
     if (roundSummary) delete roundSummary.__syncOps
     if (roundError && roundError.summary) delete roundError.summary.__syncOps
+  }
+}
+
+/**
+ * 注册表登记产出的系统通知（轮末对账确有登记 / 移除时尽力发一条）：装了哪些
+ * 来自云端的插件属于「用户应该知道但不会盯着看」的事，通知是主触达渠道，同步
+ * 记录页是回查渠道。实现内部吞异常 —— 通知失败绝不影响轮次收尾与记录落盘。
+ * @param registry 轮末对账的登记产出（adopted / removed 均为插件名清单，至少一个非空）
+ */
+function notifyRegistryOutcome(registry: { adopted: string[]; removed: string[] }): void {
+  try {
+    const parts: string[] = []
+    if (registry.adopted.length > 0) parts.push(`已从云端安装插件 ${registry.adopted.join('、')}`)
+    if (registry.removed.length > 0) parts.push(`已清理失效插件登记 ${registry.removed.join('、')}`)
+    getHostPorts().notify(`WebDAV 同步：${parts.join('；')}`)
+  } catch (_) {
+    /* 通知失败无害 */
   }
 }
 
@@ -1040,8 +1079,10 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
  * @param opts.summary 轮次摘要（成功轮为返回值；失败轮取 err.summary；缺失按零计数）
  * @param opts.error 失败轮的错误（成功轮为 null）
  * @param opts.cancelled 是否以取消语义收场（shouldAbort 仍为真 / ABORTED 错误码）
+ * @param opts.registry 轮末注册表对账的登记产出（仅虚拟行、确有登记/移除时携带；
+ *        null / 缺省 = 本轮无登记信息，记录不带 registryAdopted / registryRemoved）
  */
-function buildSyncLogEntry(opts: { handlers: any; at: number; summary: any; error: any; cancelled: boolean }): SyncLogEntry {
+function buildSyncLogEntry(opts: { handlers: any; at: number; summary: any; error: any; cancelled: boolean; registry?: { adopted: string[]; removed: string[] } | null }): SyncLogEntry {
   const handlers = opts.handlers || {}
   const hints = handlers.hints || {}
   const rawTrigger = typeof hints.source === 'string' && hints.source ? hints.source : 'manual'
@@ -1068,6 +1109,9 @@ function buildSyncLogEntry(opts: { handlers: any; at: number; summary: any; erro
   }
   if (Number(summary.errorsDropped) > 0) entry.errorsDropped = Number(summary.errorsDropped)
   if (hints.op === 'pull' || hints.op === 'push' || hints.op === 'pull-full' || hints.op === 'push-full') entry.op = hints.op
+  // 登记产出折入（名字清单防御性截断 50 个 —— manifest 异常膨胀时不无限写盘）
+  if (opts.registry && opts.registry.adopted.length > 0) entry.registryAdopted = opts.registry.adopted.slice(0, 50)
+  if (opts.registry && opts.registry.removed.length > 0) entry.registryRemoved = opts.registry.removed.slice(0, 50)
   if (opts.cancelled) {
     entry.status = 'cancelled'
   } else if (summary.yielded) {
@@ -1920,7 +1964,7 @@ function makeRoundContext(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, handl
         }
         // 无法识别的选择：按「未解决」登记挂起（无 choice），照旧抛错 —— 供后续统一处理
         ctx.registerPendingChoice(it, null)
-        throw new Error(`「${it.rel}」的冲突还没处理，电脑和云端的文件都保持原样`)
+        throw new Error(`「${it.rel}」的冲突尚未处理，电脑与云端的文件均保持原样`)
       }
       // 'defer' = 冲突挂起（典型：后台轮渲染层不可见，
       // 调度器不等一个看不见的弹窗）。走现有「无 choice 挂起」登记通道（与 ask 无回调
@@ -1935,12 +1979,12 @@ function makeRoundContext(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, handl
         return res
       }
       ctx.registerPendingChoice(it, null)
-      throw new Error(`「${it.rel}」的冲突还没处理，电脑和云端的文件都保持原样`)
+      throw new Error(`「${it.rel}」的冲突尚未处理，电脑与云端的文件均保持原样`)
     }
     if (choice === 'ask') {
       // ask 且无回调：同样按「未解决」登记挂起后抛错（挂起记录供 UI / setPendingChoice 后续处理）
       ctx.registerPendingChoice(it, null)
-      throw new Error(`「${it.rel}」的冲突还没处理，电脑和云端的文件都保持原样`)
+      throw new Error(`「${it.rel}」的冲突尚未处理，电脑与云端的文件均保持原样`)
     }
     return choice
   }
@@ -2297,7 +2341,7 @@ async function roundBody(ctx: RoundContext): Promise<any> {
     await ctx.store.saveScanCache({ ...ctx.newScanCache, lastFullScanAt: 0 }).catch(() => {})
   }
   // C 档跳过汇总（每轮一条，不随文件数刷屏；信息明确到动作计数）
-  if (ctx.roSkipped > 0) ctx.pushWarning(`服务器只能下载，本次跳过了 ${ctx.roSkipped} 个上传/删除操作，电脑上的文件都还在`)
+  if (ctx.roSkipped > 0) ctx.pushWarning(`服务器仅允许下载，本次跳过 ${ctx.roSkipped} 个上传/删除操作，电脑上的文件均保留`)
   // 持续失败退避汇总（每轮一条）：最多列 3 个示例（文件名 + 失败原因 + 下次重试时间），
   // 其余以「等」带过 —— 不随文件数刷屏，用户能看到是哪些文件、为什么被跳过、何时自动恢复
   if (ctx.permSkipped.length > 0) {
@@ -2310,26 +2354,26 @@ async function roundBody(ctx: RoundContext): Promise<any> {
       .slice(0, 3)
       .map(({ rel, fr }) => `${rel}：${String(fr.message || fr.code || '').slice(0, 80)}（下次重试 ${fmtRetry(fr.retryAtMs)}）`)
       .join('；')
-    ctx.pushWarning(`有 ${ctx.permSkipped.length} 个文件一直同步失败（${examples}${ctx.permSkipped.length > 3 ? ' 等' : ''}），已暂时跳过，稍后会自动重试`)
+    ctx.pushWarning(`有 ${ctx.permSkipped.length} 个文件多次同步失败（${examples}${ctx.permSkipped.length > 3 ? ' 等' : ''}），已暂时跳过，稍后将自动重试`)
   }
   // 冲突挂起延续汇总（每轮一条）：本轮按上次的选择自动解决、未再次
   // 询问的冲突清单（最多列 3 个示例）—— 让用户感知决策被沿用；解决失败的仍留在
   // 挂起表里（choice 保留），下一轮继续沿用
   if (ctx.pendingResolved.length > 0) {
-    const fmtChoice = (c: any) => (c === 'local' ? '保留电脑版本' : c === 'remote' ? '保留云端版本' : '两个都留')
+    const fmtChoice = (c: any) => (c === 'local' ? '保留电脑版本' : c === 'remote' ? '保留云端版本' : '同时保留')
     const pendExamples = ctx.pendingResolved.slice(0, 3).map(({ rel, choice }) => `${rel} → ${fmtChoice(choice)}`).join('；')
-    ctx.pushWarning(`按你上次的选择自动处理了 ${ctx.pendingResolved.length} 个冲突（${pendExamples}${ctx.pendingResolved.length > 3 ? ' 等' : ''}），没有再询问你`)
+    ctx.pushWarning(`已按上次的选择自动处理 ${ctx.pendingResolved.length} 个冲突（${pendExamples}${ctx.pendingResolved.length > 3 ? ' 等' : ''}），未再次询问`)
   }
   // 删除安全汇总（每轮一条）：批量删除超阈值时闸内已推送详细 warning，这里补
   // 跨轮存量挂起与「保留 / 根重建保护」的可见性 —— 待处理面板逐条 / 批量确认
   if (ctx.summary.deleteHeld > 0 && !ctx.deleteThresholdTripped) {
-    ctx.pushWarning(`有 ${ctx.summary.deleteHeld} 项删除在等你确认，确认前不会删除任何文件`)
+    ctx.pushWarning(`有 ${ctx.summary.deleteHeld} 项删除待确认，确认前不会删除任何文件`)
   }
   if (ctx.summary.deleteRestored > 0) {
-    ctx.pushWarning(`按你之前选的「不删除」，${ctx.summary.deleteRestored} 个文件已从电脑重新上传，云端已恢复`)
+    ctx.pushWarning(`按此前选择的「不删除」，${ctx.summary.deleteRestored} 个文件已重新上传，云端已恢复`)
   }
   if (ctx.summary.deleteKept > 0) {
-    ctx.pushWarning(`按你之前选的「不删除」，${ctx.summary.deleteKept} 个文件的云端副本保留了下来（电脑上已删除的文件不会恢复）`)
+    ctx.pushWarning(`按此前选择的「不删除」，${ctx.summary.deleteKept} 个文件的云端副本已保留（电脑上已删除的文件不会恢复）`)
   }
   // 空目录清理汇总（有清理动作才提示）
   if (ctx.summary.dirsPrunedLocal > 0 || ctx.summary.dirsPrunedRemote > 0) {
@@ -2337,7 +2381,7 @@ async function roundBody(ctx: RoundContext): Promise<any> {
   }
   // 预演汇总（每轮一条，结果弹窗与同步记录共同携带）：如实说明预演的时效边界
   if (ctx.dryRun) {
-    ctx.pushWarning('这是预演结果，没有改动任何文件。实际同步前文件内容可能又有变化，以真实同步为准')
+    ctx.pushWarning('以上为预演结果，未改动任何文件。实际同步前文件内容可能已发生变化，以实际同步为准')
   }
 
   // 9. 文件级失败 / 中止 → 以错误状态上报（已成功文件的基线保留，summary 附带）。
@@ -2633,7 +2677,7 @@ async function consumeCapabilities(ctx: RoundContext): Promise<void> {
     // 服务器真实档位未知）不携带也不消耗。
     if (!ctx.caps.degraded && !ctx.serverNoise.noise.concurrencyWarned) {
       ctx.tierBNoticePending = true
-      ctx.pushWarning('这个服务器无法保证多台设备同时修改时的安全。覆盖或删除云端文件前会先确认，但仍有极小概率覆盖其他设备刚做的修改')
+      ctx.pushWarning('该服务器无法保证多台设备同时修改时的安全。覆盖或删除云端文件前会先确认，但仍有较小概率覆盖其他设备刚做出的修改')
     }
   } else if (ctx.caps.tier === 'C') {
     ctx.pushWarning(`服务器不允许上传，本次只会下载文件${ctx.caps.writeReason ? `（${ctx.caps.writeReason}）` : ''}`)
@@ -2673,10 +2717,10 @@ async function buildNfcViews(ctx: RoundContext): Promise<void> {
   ctx.caseSkip = caseCollisions.skip
   caseCollisions.groups.slice(0, 5).forEach((g: any) => {
     const sideText = g.side === 'local' ? '电脑上' : g.side === 'remote' ? '云端' : '电脑和云端'
-    ctx.pushError(`${sideText}同时有 ${g.rels.join(' 和 ')} 两个文件，只有大小写不同，在 Windows 和 macOS 上会被当成同一个文件，已跳过，请改名其中一个`, false)
+    ctx.pushError(`${sideText}同时存在 ${g.rels.join(' 和 ')} 两个文件，仅大小写不同，在 Windows 和 macOS 上会被视为同一文件，已跳过，请重命名其中一个`, false)
   })
   if (caseCollisions.groups.length > 5) {
-    ctx.pushError(`另有 ${caseCollisions.groups.length - 5} 组这样的文件未逐条列出（同样已跳过），请检查文件夹`, false)
+    ctx.pushError(`另有 ${caseCollisions.groups.length - 5} 组同类文件未逐条列出（同样已跳过），请检查文件夹`, false)
   }
 
   ctx.localTol = await localFpTolMs(ctx.dir.localPath)
@@ -3060,7 +3104,7 @@ async function planRoundPassTwo(ctx: RoundContext): Promise<void> {
           newBoth = 'conflict'
         }
       } else {
-        ctx.pushWarning(`「${it.rel}」文件太大，无法自动对比两边是否一致，请你选择保留哪一个`)
+        ctx.pushWarning(`「${it.rel}」文件过大，无法自动比对两侧内容，请选择要保留的版本`)
         newBoth = 'conflict'
       }
       flags.newBoth = newBoth
@@ -3213,7 +3257,7 @@ async function planRoundPassTwo(ctx: RoundContext): Promise<void> {
           return undefined
         }
         if (choice === 'local') {
-          if (!it.l) throw new Error(`你选择了保留电脑版本，但电脑上的「${it.rel}」已经不在了`)
+          if (!it.l) throw new Error(`已选择保留电脑版本，但电脑上的「${it.rel}」已不存在`)
           const meter = ctx.byteMeter() // 上传读流逐块累加 bytesDone；完结补尾差
           uploadPending = await ctx.runUploadOp(it, r && r.origName, async (uh: any) => {
             const up = await uploadOne(ctx.cfg, ctx.dir, it.rel, it.l, ctx.createdDirs, ctx.uploadGuards(r), { onBeforePut: uh.onBeforePut, onBytes: meter.onBytes }, ctx.localTol)
@@ -3222,7 +3266,7 @@ async function planRoundPassTwo(ctx: RoundContext): Promise<void> {
             return up
           }, true)
         } else if (choice === 'remote') {
-          if (!it.r || it.r.isDir) throw new Error(`你选择了保留云端版本，但云端的「${it.rel}」已经不在了`)
+          if (!it.r || it.r.isDir) throw new Error(`已选择保留云端版本，但云端的「${it.rel}」已不存在`)
           const meter = ctx.byteMeter() // 下载落盘流逐块累加 bytesDone；完结补尾差
           await ctx.runOp(it, 'download', async (commitSet: any) => {
             const dl = await downloadOne(ctx.cfg, ctx.dir, it.rel, ctx.tmpDir, null, {
@@ -3239,7 +3283,7 @@ async function planRoundPassTwo(ctx: RoundContext): Promise<void> {
           }, { conflict: true })
         } else {
           // 同时保留：云端版本另存为 <name>.conflict.<ext>，本地版本原样上传覆盖云端
-          if (!it.l || !it.r) throw new Error(`你选择了两个都留，但「${it.rel}」有一侧已经不在了`)
+          if (!it.l || !it.r) throw new Error(`已选择同时保留，但「${it.rel}」有一侧已不存在`)
           const segs = it.rel.split('/')
           const fileName = segs[segs.length - 1]
           const dot = fileName.lastIndexOf('.')
@@ -3599,10 +3643,10 @@ async function enqueueRenameTasks(ctx: RoundContext): Promise<void> {
           //（与 localFpTolMs 同源，防 FAT 盘操作级误报「刚被改动」）
           const st = await statOrNull(oldAbs)
           if (!st || st.size !== oldIt.l.size || Math.abs(st.mtimeMs - oldIt.l.mtimeMs) > ctx.localTol) {
-            throw new Error(`「${pair.oldRel}」刚被改动，本次先不同步改名，下次同步会重新判断`)
+            throw new Error(`「${pair.oldRel}」刚被改动，本次暂不同步改名，下次同步将重新判断`)
           }
           if (await statOrNull(newAbs)) {
-            throw new Error(`「${pair.newRel}」已出现在电脑上，本次先不同步改名，下次同步会重新判断`)
+            throw new Error(`「${pair.newRel}」已出现在电脑上，本次暂不同步改名，下次同步将重新判断`)
           }
           await fsp.mkdir(path.dirname(newAbs), { recursive: true })
           await fsp.rename(oldAbs, newAbs)
@@ -3702,7 +3746,7 @@ async function acquireRoundLock(ctx: RoundContext): Promise<void> {
       ctx.summary.yielded = true
       ctx.summary.totalFiles = 0
       ctx.summary.planned = ctx.tasks.length
-      ctx.pushWarning('另一台设备正在同步这个文件夹，本次先等一等')
+      ctx.pushWarning('另一台设备正在同步该文件夹，本次已跳过')
       await ctx.persistPlannedLocalState()
       ctx.finalizeSummaryMeta() // 让出轮同样补齐机器可读字段（openIntents 对 follow-up 有意义）
       ctx.roundYielded = true // 让出：roundBody 检查该标记后按零计数成功返回
@@ -4006,7 +4050,7 @@ async function applyRootGuardReleases(ctx: RoundContext): Promise<void> {
         `云端文件夹之前丢失过，已把 ${ctx.summary.deleteRootGuard} 个原本会被当作「已删除」的文件改为重新上传，传完后恢复正常`
       )
     } else {
-      ctx.pushWarning('云端文件夹之前丢失过，还有文件没传完，暂时不会同步「删除」操作，传完后恢复正常')
+      ctx.pushWarning('云端文件夹此前丢失过，仍有文件未传输完成，暂不同步「删除」操作，传输完成后恢复')
     }
   }
 

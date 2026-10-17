@@ -59,9 +59,9 @@ export function decisionActionText(h: DecisionHistoryRow): string {
     const scope = h.rel && h.rel !== '.' ? `「${h.rel}」` : ''
     return `${scope}${h.choice === 'delete' ? '确认删除' : '选择不删除'}${n}`
   }
-  if (h.kind === 'ignore') return '忽略了这条提醒（再次出现才会询问）'
+  if (h.kind === 'ignore') return '已忽略该提醒（再次出现时才会询问）'
   if (h.choice === 'local') return '冲突：保留电脑版本'
   if (h.choice === 'remote') return '冲突：保留云端版本'
-  if (h.choice === 'both') return '冲突：两个都保留'
+  if (h.choice === 'both') return '冲突：同时保留'
   return h.choice
 }

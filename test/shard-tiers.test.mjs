@@ -373,7 +373,7 @@ const {
   const p8s1 = await syncP(P8_A, '/px8')
   check(
     'P8 read-only round downloads only, uploads skipped, round does not fail',
-    p8s1.downloaded === 2 && p8s1.uploaded === 0 && p8s1.warnings.some((w) => /只能下载/.test(w)) && p8s1.errors.length === 0,
+    p8s1.downloaded === 2 && p8s1.uploaded === 0 && p8s1.warnings.some((w) => /仅允许下载/.test(w)) && p8s1.errors.length === 0,
     JSON.stringify(p8s1)
   )
   check('P8 local-only file not uploaded', !fs.existsSync(path.join(ROOT, 'px8', 'new-local.txt')))
@@ -593,7 +593,7 @@ const {
       const w4sum = await syncP(W4_LOCAL, '/shared-ro')
       check(
         'W4 sync into read-only subpath downloads only',
-        w4sum.downloaded === 1 && w4sum.uploaded === 0 && w4sum.errors.length === 0 && w4sum.warnings.some((w) => /只能下载/.test(w)),
+        w4sum.downloaded === 1 && w4sum.uploaded === 0 && w4sum.errors.length === 0 && w4sum.warnings.some((w) => /仅允许下载/.test(w)),
         JSON.stringify(w4sum)
       )
       check('W4 read-only subpath keeps local-only file off remote', !fs.existsSync(path.join(ROOT, 'shared-ro', 'local-only.txt')))

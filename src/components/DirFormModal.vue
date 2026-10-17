@@ -305,7 +305,7 @@ function browseRemote() {
               <AppButton @click="browse">浏览…</AppButton>
             </div>
             <div class="text-[11px]" :class="localError ? 'text-danger' : 'text-ink-4'">
-              {{ localError || '这个文件夹里的文件改动会同步到云端' }}
+              {{ localError || '该文件夹内的文件改动将同步到云端' }}
             </div>
           </div>
 
@@ -323,7 +323,7 @@ function browseRemote() {
           <div v-if="serverOptions.length > 1" class="flex flex-col gap-[6px]">
             <div class="flex items-center gap-[6px]">
               <span class="text-[12px] font-medium text-btn-text">服务器</span>
-              <InfoTip text="这个文件夹同步到哪台 WebDAV 服务器（可在「设置 → WebDAV」添加多台，如坚果云 + 家用 NAS）；账号与网络设置按服务器各自独立" />
+              <InfoTip text="该文件夹同步到哪台 WebDAV 服务器（可在「设置 → WebDAV」添加多台，如坚果云 + 家用 NAS）；账号与网络设置按服务器各自独立" />
             </div>
             <AppSelect v-model="serverId" :options="serverOptions" />
           </div>
@@ -368,7 +368,7 @@ function browseRemote() {
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">自动同步</span>
-                    <InfoTip text="关闭后这个文件夹不再自动同步，只在点「立即同步」或菜单里的单向同步时执行" />
+                    <InfoTip text="关闭后该文件夹不再自动同步，仅在点击「立即同步」或菜单中的单向同步时执行" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="autoSync" :disabled="!overrideOn" />
@@ -377,7 +377,7 @@ function browseRemote() {
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">检查频率</span>
-                    <InfoTip text="自动同步开启时，检查这个文件夹变更的时间间隔" />
+                    <InfoTip text="自动同步开启时，检查该文件夹变更的时间间隔" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSelect v-model="intervalMin" :options="intervalOptions" :width="104" :disabled="!overrideOn" />
@@ -505,7 +505,7 @@ function browseRemote() {
   transition: background 0.12s ease;
 
   &:hover {
-    background: #f1f3f6;
+    background: var(--bg-seg);
   }
 
   .adv-chev {
@@ -568,7 +568,7 @@ function browseRemote() {
   }
 
   &:hover:not(:disabled) {
-    border-color: #c9d0d7;
+    border-color: var(--br-input-hover);
   }
 
   &:focus:not(:disabled) {

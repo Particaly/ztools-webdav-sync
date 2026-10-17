@@ -554,6 +554,17 @@ function normalizeSyncRound(rd: any): SyncLogEntry | null {
   if (typeof rd.error === 'string' && rd.error) rec.error = String(rd.error).slice(0, 500)
   if (typeof rd.errorsDropped === 'number' && rd.errorsDropped > 0) rec.errorsDropped = rd.errorsDropped
   if (typeof rd.renamed === 'number' && rd.renamed > 0) rec.renamed = rd.renamed
+  // 注册表登记产出（「ZTools 插件」虚拟行轮末对账折入；白名单逐名过滤 + 截断 50，
+  // 与写入侧 buildSyncLogEntry 同上限）：畸形条目（非字符串 / 空名）剔除不连累整条
+  const adoptNames = (v: any): string[] | null => {
+    if (!Array.isArray(v)) return null
+    const names = v.filter((s: any) => typeof s === 'string' && s).slice(0, 50)
+    return names.length > 0 ? names : null
+  }
+  const regAdopted = adoptNames(rd.registryAdopted)
+  if (regAdopted) rec.registryAdopted = regAdopted
+  const regRemoved = adoptNames(rd.registryRemoved)
+  if (regRemoved) rec.registryRemoved = regRemoved
   return rec
 }
 

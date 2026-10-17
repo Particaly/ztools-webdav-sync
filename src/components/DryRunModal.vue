@@ -57,7 +57,7 @@ async function run() {
   try {
     const r = await store.dryRunDir(props.dir)
     if (!r.ok) {
-      runError.value = r.error || '预演没有完成'
+      runError.value = r.error || '预演未完成'
       phase.value = 'failed'
       return
     }
@@ -102,8 +102,8 @@ watch(
     <template v-else>
       <div v-if="!summary || (!chips.length && !(summary.errors || []).length)" class="flex flex-col items-center gap-2 py-8">
         <AppIcon name="check-circle" :size="22" class="text-primary" />
-        <p class="text-[13px] font-medium text-ink-1">两边已经一致</p>
-        <p class="text-[11px] text-ink-3">预演没有发现需要同步的改动</p>
+        <p class="text-[13px] font-medium text-ink-1">本地与云端内容一致</p>
+        <p class="text-[11px] text-ink-3">预演未发现需要同步的改动</p>
       </div>
       <div v-else class="flex flex-col gap-3">
         <!-- 计划改动 chips -->
@@ -122,10 +122,10 @@ watch(
           <template v-for="(items, key) in groups" :key="key">
             <template v-if="items.length">
               <p class="group-title">
-                {{ key === 'cloudUp' ? '将上传到云端' : key === 'cloudDel' ? '将从云端删除' : key === 'cloudRename' ? '将在云端改名' : key === 'localDown' ? '将下载到电脑' : key === 'localDel' ? '将从电脑删除' : key === 'localRename' ? '将在电脑上改名' : '将询问你怎么处理' }}
+                {{ key === 'cloudUp' ? '将上传到云端' : key === 'cloudDel' ? '将从云端删除' : key === 'cloudRename' ? '将在云端重命名' : key === 'localDown' ? '将下载到电脑' : key === 'localDel' ? '将从电脑删除' : key === 'localRename' ? '将在电脑上重命名' : '将询问处理方式' }}
               </p>
               <p v-for="(o, i) in items" :key="key + i" class="op-line">
-                <span class="truncate">{{ o.rel }}</span>
+                <span class="truncate select-text">{{ o.rel }}</span>
                 <span class="shrink-0 text-ink-4">{{ opLineText(o) }}</span>
               </p>
             </template>
@@ -135,13 +135,13 @@ watch(
         <!-- 待确认删除（预演如实反映删除安全闸的拦截） -->
         <p v-if="summary && (summary.deleteHeld ?? 0) > 0" class="flex items-start gap-[5px] text-[11px] leading-[1.7] text-warning-icon">
           <AppIcon name="warn" :size="11" class="shrink-0 mt-[2px]" />
-          有 {{ summary!.deleteHeld }} 项删除数量偏多，真实同步时会先挂起等你确认，不会直接删除
+          有 {{ summary!.deleteHeld }} 项删除数量超过阈值，真实同步时将挂起待确认，不会直接删除
         </p>
         <!-- 预演错误（预检中止等；警告不落同步记录，已在计划明细中体现） -->
         <p v-for="(e, i) in (summary && summary.errors) || []" :key="'e' + i" class="text-[11px] leading-[1.7] text-warning-icon">{{ e }}</p>
       </div>
 
-      <p class="note-line">预演只是提前看一眼，没有改动任何文件。文件内容在真正同步前可能又有变化，以真实同步为准。</p>
+      <p class="note-line">预演仅扫描与比对，未改动任何文件。真实同步前文件内容可能已发生变化，请以实际同步结果为准。</p>
     </template>
 
     <template #footer>
@@ -166,7 +166,7 @@ watch(
 .detail-box {
   max-height: 220px;
   overflow: auto;
-  border: 1px solid var(--border-card);
+  border: 1px solid var(--br-card);
   border-radius: 8px;
   padding: 8px 10px;
 }
@@ -174,7 +174,7 @@ watch(
 .group-title {
   font-size: 10px;
   font-weight: 600;
-  color: var(--text-4);
+  color: var(--text-muted);
   margin: 6px 0 2px;
 }
 
@@ -193,11 +193,11 @@ watch(
 }
 
 .note-line {
-  border-top: 1px solid var(--border-card);
+  border-top: 1px solid var(--br-card);
   padding-top: 8px;
   font-size: 11px;
   line-height: 1.7;
-  color: var(--text-4);
+  color: var(--text-muted);
 }
 
 .spin {

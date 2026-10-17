@@ -12,7 +12,7 @@ const leftText = computed(() => `共 ${store.state.dirs.length} 个同步文件�
 const pendingTotal = computed(() => store.pendingConflictTotal.value)
 const syncLabel = computed(() => {
   if (pendingTotal.value > 0) return `最近一次同步：${fmtRelTime(store.lastSyncAt.value)} · ${pendingTotal.value} 项待处理`
-  return `${store.anySyncing.value ? '上次同步' : '最近一次同步'}：${fmtRelTime(store.lastSyncAt.value)}`
+  return `最近一次同步：${fmtRelTime(store.lastSyncAt.value)}`
 })
 /**
  * 实时传输速率（调度器 1s 采样、EMA 平滑）：仅同步中且近秒有流量时显示 ——
@@ -93,12 +93,12 @@ const speedVisible = computed(() => store.anySyncing.value && (speed.value.upBps
   border-radius: 5px;
   font-size: 12px;
   font-weight: 500;
-  color: var(--warning-deep, #8a5a00);
+  color: var(--amber-deep);
   cursor: pointer;
   transition: background 0.12s ease;
 
   &:hover {
-    background: var(--warn-strip-bg, #fdf6e7);
+    background: var(--amber-strip-bg);
   }
 }
 </style>

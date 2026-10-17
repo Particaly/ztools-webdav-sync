@@ -122,7 +122,7 @@ const tlsTrustVisible = computed(() => {
         </div>
         <div class="flex items-center gap-[7px] min-w-0">
           <AppIcon name="globe" :size="13" class="text-ink-4" />
-          <span class="font-mono text-[12px] text-ink-2 truncate">{{ store.state.server.serverUrl || '尚未配置服务器地址' }}</span>
+          <span class="font-mono text-[12px] text-ink-2 truncate select-text">{{ store.state.server.serverUrl || '尚未配置服务器地址' }}</span>
         </div>
         <div class="flex items-center gap-[6px]">
           <span class="dot" :class="store.connStatus.value" />
@@ -181,7 +181,7 @@ const tlsTrustVisible = computed(() => {
   }
 
   &.disconnected {
-    background: #d97706;
+    background: var(--amber-icon);
     box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.14);
   }
 }

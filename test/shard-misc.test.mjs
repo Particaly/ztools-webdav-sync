@@ -1285,7 +1285,7 @@ const {
       const hpNotified = await hpWait(() => HP_NOTES.length >= 1, 15000)
       check(
         'HPa deferred-conflict notification routed through the injected notify port',
-        hpNotified && HP_NOTES.length === 1 && /1 个文件需要你选择保留哪一个/.test(HP_NOTES[0] || ''),
+        hpNotified && HP_NOTES.length === 1 && /1 个冲突文件待选择保留版本/.test(HP_NOTES[0] || ''),
         JSON.stringify({ notified: hpNotified, notes: HP_NOTES })
       )
       hpSched.cleanup()
@@ -2457,7 +2457,7 @@ const {
     )
     // 第二轮：退避期内规划层跳过 → 轮次成功（不再报错，仅提示）
     const s2 = await services.sync.syncDirectory(cfg, d, SP, {})
-    check('FN2 退避期内跳过（轮次成功 + 汇总提示）', s2.uploaded === 0 && s2.errors.length === 0 && s2.warnings.some((w) => /一直同步失败/.test(w)), JSON.stringify({ up: s2.uploaded, errs: s2.errors.length }))
+    check('FN2 退避期内跳过（轮次成功 + 汇总提示）', s2.uploaded === 0 && s2.errors.length === 0 && s2.warnings.some((w) => /多次同步失败/.test(w)), JSON.stringify({ up: s2.uploaded, errs: s2.errors.length }))
     // 重命名恢复：新 rel 无失败记录 → 自动恢复上传
     await fsp.rename(path.join(L, 'a<b.txt'), path.join(L, 'fixed.txt'))
     const s3 = await services.sync.syncDirectory(cfg, d, SP, {})
@@ -2484,7 +2484,7 @@ const {
     }
     check(
       'FN3 跨侧大小写冲突：零传输 + 明确报错（不静默覆盖）',
-      !!e1 && s1.uploaded === 0 && s1.downloaded === 0 && s1.errors.some((m) => /只有大小写不同/.test(m) && m.includes('Case.txt') && m.includes('case.txt')),
+      !!e1 && s1.uploaded === 0 && s1.downloaded === 0 && s1.errors.some((m) => /仅大小写不同/.test(m) && m.includes('Case.txt') && m.includes('case.txt')),
       JSON.stringify(s1 && s1.errors)
     )
     check(
@@ -2518,7 +2518,7 @@ const {
       }
       check(
         'FN3 远端同名对：两个都不下载 + 报错',
-        !!e4 && s4.downloaded === 0 && s4.errors.some((m) => /只有大小写不同/.test(m) && m.includes('Pair.txt') && m.includes('pair.txt')),
+        !!e4 && s4.downloaded === 0 && s4.errors.some((m) => /仅大小写不同/.test(m) && m.includes('Pair.txt') && m.includes('pair.txt')),
         JSON.stringify(s4 && s4.errors)
       )
       check('FN3 本地未落任何同名文件（下载即互相覆盖）', !fs.existsSync(path.join(L2, 'pair.txt')) && !fs.existsSync(path.join(L2, 'Pair.txt')), '')
@@ -2535,7 +2535,7 @@ const {
       } catch (e) {
         s6 = e.summary
       }
-      check('FN3 冲突复现：非冲突文件照常同步，冲突文件零传输', s6.uploaded === 1 && s6.downloaded === 0 && s6.errors.some((m) => /只有大小写不同/.test(m)), JSON.stringify(s6 && s6.errors))
+      check('FN3 冲突复现：非冲突文件照常同步，冲突文件零传输', s6.uploaded === 1 && s6.downloaded === 0 && s6.errors.some((m) => /仅大小写不同/.test(m)), JSON.stringify(s6 && s6.errors))
       // 删除本地 pair.txt → delete-remote 放行（caseSkip 只挡传输，不挡删除传播）。
       // 本轮孪生仍在 → 冲突错误依旧存在（轮次 throw），断言基于 summary
       await fsp.rm(path.join(L2, 'pair.txt'))

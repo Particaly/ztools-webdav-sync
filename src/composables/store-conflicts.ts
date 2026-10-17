@@ -24,6 +24,23 @@ export function resolveConflict(choice: 'local' | 'remote' | 'both') {
 }
 
 /**
+ * 用户在冲突弹窗中选择「稍后处理」：以 'defer' 结算当前冲突 —— 与转发超时同语义，
+ * 引擎两侧保持原样、登记为待处理挂起，稍后在待处理中心逐条处理。手动打开的冲突
+ * （openConflictFor）无引擎在等，defer 为 no-op，等价于关闭弹窗。
+ * 队列推进与 applyAll 清理与 resolveConflict 同款。
+ */
+export function deferConflict() {
+  const info = state.activeConflict
+  if (!info) return
+  const resolve = conflictResolvers.get(info)
+  conflictResolvers.delete(info)
+  state.conflictQueue = state.conflictQueue.filter((c) => c !== info)
+  state.activeConflict = state.conflictQueue[0] ?? null
+  if (!state.activeConflict) state.conflictApplyAll = false
+  resolve?.('defer')
+}
+
+/**
  * 手动打开某目录的冲突处理（行内「处理」按钮）。
  * 【demo/兼容路径】入口由 DirRow 的冲突提示条触发，而该提示条要求
  * status === 'conflict' && conflictFile —— 真实同步状态机从不产生该状态，
@@ -43,7 +60,7 @@ export function openConflictFor(dir: SyncDir) {
   state.activeConflict = info
   conflictResolvers.set(info, (rawChoice) => {
     // 行内打开的冲突在引擎外解决：直接按选择落地。
-    // 'defer' 只可能来自调度器（后台轮），UI 弹窗从不产生 —— 此处忽略即可
+    // 'defer'（弹窗「稍后处理」）无引擎在等：忽略，等价于关闭弹窗
     const choice = typeof rawChoice === 'string' ? rawChoice : rawChoice.choice
     if (choice === 'defer') return
     void applyManualConflict(dir.id, info, choice)

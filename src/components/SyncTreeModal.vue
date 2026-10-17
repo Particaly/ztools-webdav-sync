@@ -194,7 +194,7 @@ const flatRows = computed<FlatRow[]>(() => {
 
     <div class="flex flex-col gap-3">
       <p class="text-[12px] leading-[1.7] text-ink-2">
-        取消勾选的文件夹和文件不会同步 —— 既不上传到云端，也不下载到电脑；重新勾选后恢复同步。改动在下次同步时生效。
+        取消勾选的文件夹和文件不参与同步（不上传到云端，也不下载到电脑），重新勾选后恢复同步。更改将在下次同步时生效。
       </p>
 
       <!-- 扫描中 / 失败 / 不完整 -->
@@ -211,7 +211,7 @@ const flatRows = computed<FlatRow[]>(() => {
         <div class="flex items-start gap-2 rounded-md bg-[var(--amber-bg)] px-3 py-2">
           <AppIcon name="warn" :size="13" class="text-warning-icon shrink-0 mt-[1px]" />
           <p class="text-[11px] leading-[1.7] text-warning-icon">
-            云端文件列表这次没有读完整，暂时不能勾选。请稍后重试；如果一直这样，先在设置里「测试连接」排查。
+            云端文件列表本次未读取完整，暂时无法勾选。请稍后重试；若反复出现，请先在设置中使用「测试连接」排查。
           </p>
         </div>
         <p class="text-[11px] text-ink-3 truncate" :title="(errors[0] && errors[0].message) || ''">
@@ -222,7 +222,7 @@ const flatRows = computed<FlatRow[]>(() => {
       <!-- 勾选树（懒展开：折叠子树不渲染，数万条目只画展开部分） -->
       <template v-else>
         <div class="tree-box">
-          <div v-if="!flatRows.length" class="py-8 text-center text-[12px] text-ink-3">云端还没有文件</div>
+          <div v-if="!flatRows.length" class="py-8 text-center text-[12px] text-ink-3">云端暂无文件</div>
           <div
             v-for="row in flatRows"
             :key="row.node.rel"
@@ -247,7 +247,7 @@ const flatRows = computed<FlatRow[]>(() => {
         </div>
         <p v-if="offCount > 0" class="text-[11px] text-ink-3">已选择不同步 {{ offCount }} 项</p>
         <p v-if="globRuleCount > 0" class="text-[11px] text-ink-3">
-          另有 {{ globRuleCount }} 条手动排除规则在设置里配置，它们仍然生效（树上不展示）。
+          另有 {{ globRuleCount }} 条排除规则在设置中配置，仍然生效（树中不展示）。
         </p>
       </template>
     </div>
@@ -263,7 +263,7 @@ const flatRows = computed<FlatRow[]>(() => {
 .tree-box {
   max-height: 300px;
   overflow: auto;
-  border: 1px solid var(--border-card);
+  border: 1px solid var(--br-card);
   border-radius: 8px;
   padding: 6px 4px;
 }
@@ -277,13 +277,13 @@ const flatRows = computed<FlatRow[]>(() => {
   padding-right: 8px;
 
   &:hover {
-    background: var(--bg-fill-track);
+    background: var(--bg-track);
   }
 
   &.dim {
     .tree-row-name,
     .text-ink-1 {
-      color: var(--text-4);
+      color: var(--text-muted);
     }
   }
 }
@@ -295,7 +295,7 @@ const flatRows = computed<FlatRow[]>(() => {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  color: var(--text-4);
+  color: var(--text-muted);
   background: none;
   border: none;
   cursor: pointer;
@@ -306,7 +306,7 @@ const flatRows = computed<FlatRow[]>(() => {
   width: 13px;
   height: 13px;
   flex-shrink: 0;
-  accent-color: var(--primary);
+  accent-color: var(--blue);
   cursor: pointer;
 }
 

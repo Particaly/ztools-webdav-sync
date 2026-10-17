@@ -80,7 +80,7 @@ export function addServer(): void {
  */
 export function removeServer(id: string): void {
   if (state.servers.length <= 1) {
-    toast.warning('至少保留一台服务器', '可以清空地址与账号来停用这台服务器')
+    toast.warning('至少保留一台服务器', '可以清空地址与账号来停用该服务器')
     return
   }
   const idx = state.servers.findIndex((s) => s.id === id)
@@ -88,7 +88,7 @@ export function removeServer(id: string): void {
   const isFirst = idx === 0
   const used = state.dirs.filter((d) => !isPluginSyncDir(d) && (d.serverId === id || (d.serverId == null && isFirst)))
   if (used.length) {
-    toast.warning('这台服务器正在被使用', `有 ${used.length} 个同步文件夹使用它，请先在这些文件夹的设置里改用其他服务器`)
+    toast.warning('该服务器正在使用中', `有 ${used.length} 个同步文件夹正在使用它，请先在这些文件夹的设置中改用其他服务器`)
     return
   }
   state.servers.splice(idx, 1)

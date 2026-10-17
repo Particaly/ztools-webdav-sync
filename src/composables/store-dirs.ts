@@ -62,12 +62,12 @@ export function cancelSync(id: string) {
   const sched = window.services?.scheduler
   if (sched && !state.demo) {
     sched.cancel(id)
-    toast.info('正在取消同步…', '正在停止，正在传输的文件会被中断')
+    toast.info('正在取消同步…', '正在停止，正在传输的文件将被中断')
     return
   }
   if (cancelRequested.has(id)) return
   cancelRequested.add(id)
-  toast.info('正在取消同步…', '正在停止，正在传输的文件会被中断')
+  toast.info('正在取消同步…', '正在停止，正在传输的文件将被中断')
 }
 
 /**
@@ -270,7 +270,7 @@ export async function syncAll() {
 export async function dryRunDir(dir: SyncDir): Promise<{ ok: boolean; error?: string }> {
   if (!window.services) return { ok: false, error: '浏览器预览模式没有连接服务器的能力，无法预演' }
   if (state.demo) return { ok: false, error: '演示模式没有真实文件，无法预演' }
-  if (!configured.value || dir.status === 'syncing') return { ok: false, error: '这个文件夹正在同步中，请等这一轮结束再试' }
+  if (!configured.value || dir.status === 'syncing') return { ok: false, error: '该文件夹正在同步中，请等待本轮结束后再试' }
   const sched = window.services.scheduler
   try {
     if (sched) {
@@ -416,6 +416,21 @@ export async function refreshPluginRegistryState() {
   if (registrySync && row.pluginSyncInfo && row.pluginSyncInfo.registrySync !== registrySync) {
     row.pluginSyncInfo = { ...row.pluginSyncInfo, registrySync }
   }
+}
+
+/**
+ * 注册表降级提示条的可见性判定（DirRow 渲染共用口径，收口于此以便单测）：只有
+ * 降级态（pending / denied / unavailable）提示；'ok' 表示对账通道健康 —— 自动
+ * 安装已在正常工作，绝不提示。此前 'ok' 在 DirRow 的文案三分支里掉进「缺少内部
+ * API」兜底分支：授权批准后对账转 ok，提示条反而以错误文案重新出现（误报）。
+ * 「不再显示」按关闭时的状态指纹：指纹一致不重复提示，状态变化后重新提示 ——
+ * 含 ok → 再次降级的回归形态（此时指纹是旧降级态，与新状态不同，正常复出）。
+ * @param registrySync 行上的对账状态（undefined = 尚未对账过 / 非插件行，不出条）
+ * @param dismissed 用户上次关闭提示条时记录的状态指纹（空串 / null = 从未关闭）
+ * @returns 是否渲染提示条
+ */
+export function registrySyncStripVisibleFor(registrySync: string | undefined, dismissed: string | null | undefined): boolean {
+  return !!registrySync && registrySync !== 'ok' && (dismissed ?? '') !== registrySync
 }
 
 /**

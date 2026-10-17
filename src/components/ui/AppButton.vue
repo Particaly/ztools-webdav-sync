@@ -122,7 +122,7 @@ const fontSize = computed(() => (typeof props.size === 'number' ? SIZE_MAP.md.fs
 
     &:hover:not(:disabled) {
       background: #f5f7f9;
-      border-color: #c9d0d7;
+      border-color: var(--br-input-hover);
     }
 
     &:active:not(:disabled) {

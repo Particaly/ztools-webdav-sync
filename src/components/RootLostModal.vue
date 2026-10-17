@@ -64,18 +64,18 @@ function confirm() {
     <AppModal
       v-if="dir && open"
       :key="dir.id"
-      title="云端的同步文件夹不见了"
-      :subtitle="`${dir.name} 的同步已暂停，等你决定怎么处理`"
+      title="云端同步文件夹丢失"
+      :subtitle="`${dir.name} 的同步已暂停，请选择处理方式`"
       :width="440"
       @close="open = false"
     >
       <div class="flex flex-col gap-[10px]">
         <div class="flex items-start gap-[8px] rounded-[6px] bg-fill-seg px-[10px] py-[8px]">
           <AppIcon name="cloud" :size="13" class="mt-[2px] shrink-0 text-ink-3" />
-          <span class="font-mono text-[11px] text-ink-2 break-all leading-[1.4]">{{ dir.remotePath }}</span>
+          <span class="font-mono text-[11px] text-ink-2 break-all leading-[1.4] select-text">{{ dir.remotePath }}</span>
         </div>
         <p class="m-0 text-[12px] text-ink-2 leading-[1.55]">
-          云端的这个文件夹已被删除或移走（可能是在网页上操作的）。为防止误删文件，本次同步已停止，
+          云端文件夹已被删除或移动（可能是在网页端操作）。为防止误删文件，本次同步已停止，
           请选择如何处理电脑上的 {{ affectedCount > 0 ? `${affectedCount} 个` : '' }}已同步文件：
         </p>
 
@@ -109,7 +109,7 @@ function confirm() {
 
         <div v-if="choice === 'remove-local' && armed" class="armed-note">
           <AppIcon name="warn" :size="12" class="shrink-0 text-danger" />
-          <span>再点一次「确认删除」。文件会移入系统回收站，还能找回；这个操作下次同步时执行</span>
+          <span>再次点击「确认删除」。文件将移入系统回收站，仍可找回；该操作将在下次同步时执行</span>
         </div>
       </div>
 
@@ -118,8 +118,7 @@ function confirm() {
         <span class="flex-spacer" />
         <AppButton
           size="sm"
-          :class="{ 'danger-btn': choice === 'remove-local' }"
-          :variant="choice === 'remove-local' ? 'secondary' : 'primary'"
+          :variant="choice === 'remove-local' ? 'danger' : 'primary'"
           pad="0 14px"
           @click="confirm"
         >
@@ -145,8 +144,8 @@ function confirm() {
   transition: border-color 0.12s ease, background 0.12s ease;
 
   &:hover {
-    border-color: #c9d2da;
-    background: #fafbfc;
+    border-color: var(--br-input-hover);
+    background: var(--bg-bar);
   }
 
   .opt-ic {
@@ -217,21 +216,10 @@ function confirm() {
   gap: 7px;
   padding: 8px 10px;
   border-radius: 6px;
-  background: var(--red-strip-bg, #fdf0ef);
-  border: 1px solid var(--red-strip-br, #f3cfcb);
+  background: var(--red-strip-bg);
+  border: 1px solid var(--red-strip-br);
   font-size: 11px;
-  color: #b3261e;
+  color: var(--red-deep);
   line-height: 1.45;
-}
-
-/* remove-local 确认按钮的危险色覆盖（AppButton 无 danger 变体，secondary 底 + 覆写） */
-:deep(.danger-btn) {
-  color: #fff !important;
-  background: var(--red, #d93025) !important;
-  border-color: var(--red, #d93025) !important;
-
-  &:hover {
-    background: #c32d23 !important;
-  }
 }
 </style>

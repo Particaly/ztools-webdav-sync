@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import { computed, useAttrs } from 'vue'
+import { computed, ref, useAttrs } from 'vue'
 import AppIcon from '../AppIcon.vue'
 
 /**
  * 通用输入框：带前置图标、等宽字体、小号字体与校验失败态。
- * 未声明的属性（maxlength、@input 等）会透传到内部 <input> 上。
+ * 密码框（type="password"）自带「显示 / 隐藏」切换。未声明的属性
+ *（maxlength、@input 等）会透传到内部 <input> 上。
  */
 const props = withDefaults(
   defineProps<{
     placeholder?: string
-    /** 输入框类型，默认 text（密码框传 password） */
+    /** 输入框类型，默认 text（密码框传 password，自动附带可见切换） */
     type?: string
     /** 前置图标（AppIcon 名称） */
     icon?: string
@@ -25,6 +26,11 @@ const props = withDefaults(
 
 /** 允许 number：数值型偏好（如内容校验上限）经 v-model.number 绑定 */
 const model = defineModel<string | number>({ default: '' })
+
+/** 密码可见切换：仅 type="password" 时出现（应用密码核对位数 / 排错时不必清空重输） */
+const revealed = ref(false)
+const isPassword = computed(() => props.type === 'password')
+const effectiveType = computed(() => (isPassword.value && revealed.value ? 'text' : props.type))
 
 const attrs = useAttrs()
 // class / style 留给外层容器，其余属性透传给 input
@@ -43,11 +49,21 @@ const inputAttrs = computed(() => {
     <input
       v-bind="inputAttrs"
       v-model="model"
-      :type="props.type"
+      :type="effectiveType"
       :spellcheck="false"
       :placeholder="props.placeholder"
       :class="{ mono: props.mono, sm: props.sm }"
     />
+    <button
+      v-if="isPassword"
+      type="button"
+      class="reveal-btn"
+      :title="revealed ? '隐藏密码' : '显示密码'"
+      :aria-label="revealed ? '隐藏密码' : '显示密码'"
+      @click="revealed = !revealed"
+    >
+      <AppIcon name="eye" :size="13" :class="revealed ? 'text-primary' : 'text-ink-4'" />
+    </button>
   </div>
 </template>
 
@@ -65,7 +81,7 @@ const inputAttrs = computed(() => {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 
   &:hover {
-    border-color: #c9d0d7;
+    border-color: var(--br-input-hover);
   }
 
   &:focus-within {
@@ -84,6 +100,22 @@ const inputAttrs = computed(() => {
 
   .input-icon {
     color: var(--text-muted);
+  }
+
+  /* 密码可见切换：右侧无边框小按钮，悬停 / 展示态由图标色区分 */
+  .reveal-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    padding: 0 1px;
+    cursor: pointer;
+    flex-shrink: 0;
+
+    &:hover .text-ink-4 {
+      color: var(--text-2);
+    }
   }
 
   input {

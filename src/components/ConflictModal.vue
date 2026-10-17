@@ -34,14 +34,39 @@ function choose(choice: 'local' | 'remote' | 'both') {
   store.state.conflictApplyAll = applyAll.value
   store.resolveConflict(choice)
 }
+
+/** 冲突所属目录（打开本地文件的入口需要其本地根路径） */
+const dir = computed(() => store.state.dirs.find((d) => d.id === info.value?.dirId) ?? null)
+
+/**
+ * 冲突文件在电脑上的完整路径：本地目录连接远端 rel（rel 恒为正斜杠的远端相对
+ * 形态，拼接时按本地目录的盘符 / 反斜杠特征换用对应分隔符）。
+ */
+const localFilePath = computed(() => {
+  const d = dir.value
+  const rel = info.value?.rel
+  if (!d || !rel || rel === '.') return ''
+  const sep = /^[a-zA-Z]:[\\/]/.test(d.localPath) || d.localPath.includes('\\') ? '\\' : '/'
+  return d.localPath.replace(/[\\/]+$/, '') + sep + rel.split('/').join(sep)
+})
+
+/** 稍后处理：以 defer 结算本轮冲突，登记进待处理中心（两侧文件保持原样） */
+function defer() {
+  store.deferConflict()
+}
+
+/** 在电脑上打开冲突文件（shellOpenPath 对文件同样适用；路径缺失时静默） */
+function openLocalFile() {
+  if (localFilePath.value) store.openLocalFolder(localFilePath.value)
+}
 </script>
 
 <template>
   <Transition name="modal-pop">
     <AppModal
       v-if="info"
-      title="这个文件两边都改过了"
-      subtitle="电脑上和云端的版本都有新的修改，请选择保留哪一个"
+      title="检测到同步冲突"
+      subtitle="本地与云端版本均有新的修改，请选择要保留的版本"
       :width="420"
       :show-close="false"
       :close-on-mask="false"
@@ -52,9 +77,9 @@ function choose(choice: 'local' | 'remote' | 'both') {
       <AppIcon name="warn" :size="16" class="text-warning-icon" />
     </template>
     <template #title-extra>
-      <div class="flex items-center gap-[6px] bg-fill-seg rounded-[5px] px-2 py-[4px] text-ink-2">
+      <div class="flex items-center gap-[6px] bg-fill-seg rounded-[5px] px-2 py-[4px] text-ink-2" :title="info?.rel">
         <AppIcon name="file" :size="12" />
-        <span class="font-mono text-[11px] font-medium text-btn-text">{{ fileName }}</span>
+        <span class="font-mono text-[11px] font-medium text-btn-text select-text">{{ fileName }}</span>
       </div>
     </template>
 
@@ -80,26 +105,58 @@ function choose(choice: 'local' | 'remote' | 'both') {
         <span class="flex-1 py-2 font-mono text-[11px] text-ink-1">{{ fmtSize(info.local.size) }}</span>
         <span class="flex-1 py-2 font-mono text-[11px] text-ink-1">{{ fmtSize(info.remote.size) }}</span>
       </div>
-      <div class="text-[11px] text-ink-4">选「两个都留」，云端的文件会另存为 {{ conflictCopyName }}，电脑上的文件不变</div>
+      <div v-if="localFilePath" class="flex gap-[10px]">
+        <span class="w-[62px] shrink-0" />
+        <span class="flex-1">
+          <button
+            type="button"
+            class="open-link"
+            :title="`${localFilePath}（在资源管理器 / 访达中定位并打开，看清内容再决定）`"
+            @click="openLocalFile"
+          >在电脑上打开此文件</button>
+        </span>
+      </div>
+      <div class="text-[11px] text-ink-4">选择「同时保留」时，云端文件将另存为 {{ conflictCopyName }}，本地文件保持不变</div>
+      <div class="text-[11px] text-ink-4 leading-[1.4]">
+        选择「保留电脑版本 / 保留云端版本」时，未被保留的一侧将被覆盖：电脑上的旧版本会先移入系统回收站；云端没有回收站，被覆盖的云端版本将无法找回。不确定时建议「同时保留」。
+      </div>
       <div v-if="info.hint === 'partial-upload'" class="flex items-start gap-[6px] rounded-[5px] bg-fill-seg px-[10px] py-[6px] text-ink-2 leading-[1.4]">
         <AppIcon name="warn" :size="12" class="mt-[2px] shrink-0 text-warning-icon" />
-        <span>云端的文件比电脑上的小，而且这台电脑有一次没传完的上传记录，云端的可能是上次中断后留下的不完整文件。建议选「保留电脑版本」，会重新完整上传。</span>
+        <span>云端文件小于本地文件，且本机存在一次未完成的上传记录，云端文件可能是上次传输中断留下的不完整文件。建议选择「保留电脑版本」，将重新完整上传。</span>
       </div>
       <div class="text-[11px] text-ink-4 leading-[1.4]">
         两台设备的系统时间可能不一致，修改时间仅供参考，请结合文件大小和内容判断。
       </div>
       <label class="flex items-center gap-[6px] text-[11px] text-ink-2 select-none cursor-pointer">
         <input v-model="applyAll" type="checkbox" class="accent-[var(--blue)] w-[13px] h-[13px] cursor-pointer" />
-        其余的冲突也都这样处理
+        对其余冲突应用相同处理
       </label>
     </div>
 
     <template #footer>
-      <AppButton @click="choose('both')">两个都留</AppButton>
+      <AppButton variant="ghost" title="本轮先跳过这个文件（两侧保持原样），稍后在「待处理中心」里选择" @click="defer">稍后处理</AppButton>
       <span class="flex-spacer" />
+      <AppButton @click="choose('both')">同时保留</AppButton>
       <AppButton @click="choose('remote')">保留云端版本</AppButton>
       <AppButton variant="primary" pad="0 14px" @click="choose('local')">保留电脑版本</AppButton>
     </template>
     </AppModal>
   </Transition>
 </template>
+
+<style scoped lang="scss">
+/* 打开本地冲突文件：文字链形态（与首页帮助链接同款视觉），悬浮提示完整路径 */
+.open-link {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--blue);
+
+  &:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}
+</style>

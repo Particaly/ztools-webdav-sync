@@ -38,7 +38,6 @@ import * as store from './store.mts'
 import { getHostPorts } from './host.mts'
 import { ZTOOLS_PLUGINS_DIR_ID, describeZtoolsPluginsSync } from './ztools-plugins.mts'
 import { resolveDirPrefs } from './types.mts'
-import { reconcilePluginRegistry } from './ztools-registry.mts'
 import { applyNetLimits, netTraffic } from './svc/net.mts'
 import type { ConflictChoice, ConflictInfo, Prefs, RoundDisplay, SchedulerApi, SchedulerEvent, SchedulerSnapshot, SchedulerSlotView, SyncProgress, SyncSummary } from './types.mts'
 // 仅类型导入（编译期擦除，不构成对 services 的运行时依赖 / 循环 require）：
@@ -410,12 +409,12 @@ function summarizeRound(summary: SyncSummary | null | undefined, error: Error | 
   const deleteHeld = sum ? Number(sum.deleteHeld) || 0 : 0
   if (cancelled) return { tone: 'cancelled', title: '已取消同步', errors: [] }
   // 熔断轮：一句人话归因，最后失败原因（技术细节）放 detail
-  if (br) return { tone: 'breaker', title: '服务器一直没有响应，本次同步已暂停，稍后自动重试', detail: String(br.reason || ''), consecutive: br.consecutive, errors }
+  if (br) return { tone: 'breaker', title: '服务器连续无响应，本次同步已暂停，稍后将自动重试', detail: String(br.reason || ''), consecutive: br.consecutive, errors }
   if (error) return { tone: 'error', title: errors[0] || String(error), errors }
   if (deferred > 0 || deleteHeld > 0) {
     const parts: any[] = []
-    if (deferred > 0) parts.push(`${deferred} 个文件等你选择`)
-    if (deleteHeld > 0) parts.push(`${deleteHeld} 项删除等你确认`)
+    if (deferred > 0) parts.push(`${deferred} 个冲突文件待选择`)
+    if (deleteHeld > 0) parts.push(`${deleteHeld} 项删除待确认`)
     return { tone: 'partial', title: `部分完成：${parts.join('、')}`, errors }
   }
   if (errors.length) return { tone: 'error', title: errors[0], errors }
@@ -2028,13 +2027,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         error: error ? error.message || String(error) : null,
         cancelled,
       })
-      // 插件注册表对账（实验功能「无感同步」的第二段）：实体与 manifest 本轮已
-      // 落盘，此刻把 manifest 合并进宿主注册表 / 重写导出 —— 未授权或旧宿主时
-      // 内部降级为 no-op（ztools-registry.mts）。取消轮跳过（半截状态等下一轮）；
-      // fire-and-forget 且模块内串行化，任何异常只进结果状态不影响轮次收尾
-      if (slot.id === ZTOOLS_PLUGINS_DIR_ID && !cancelled) {
-        void reconcilePluginRegistry(slot.dir.localPath).catch(() => {})
-      }
+      // 插件注册表对账已移至 services.syncDirectory 轮末收尾（登记产出折进当轮
+      // 同步记录，见该处注释）—— 本轮取消 / 预演 / 让位的跳过语义由包装层的
+      // cancelled / hints.dryRun 与「让位轮不经过 finally」自然承接
       // 挂起事件（UI 面板入口）+ 系统通知（同批只提醒一次：指纹 = 无 choice 的
       // 逐条类挂起 rel 排序集 + 未决策删除总数；处理后再出现新集合才再提醒）。
       // 触发条件覆盖冲突挂起（deferredConflicts）、删除确认挂起（deleteHeld ——
@@ -2066,9 +2061,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
               const nRootLost = openItems.filter((it) => it.kind === 'root-lost').length
               const nConflict = openItems.filter((it) => it.kind !== 'root-lost').length
               const parts: any[] = []
-              if (nRootLost > 0) parts.push('云端的同步文件夹不见了，需要你确认怎么处理')
-              if (nConflict > 0) parts.push(`${nConflict} 个文件需要你选择保留哪一个`)
-              if (deleteHeldCount > 0) parts.push(`${deleteHeldCount} 项删除等你确认`)
+              if (nRootLost > 0) parts.push('云端同步文件夹丢失，请确认处理方式')
+              if (nConflict > 0) parts.push(`${nConflict} 个冲突文件待选择保留版本`)
+              if (deleteHeldCount > 0) parts.push(`${deleteHeldCount} 项删除待确认`)
               notifyBestEffort(`WebDAV 同步：${parts.join('、')}，点击打开插件处理`)
             }
           })
@@ -2183,7 +2178,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         return { error: new Error('已取消同步'), cancelled: true }
       }
       // 手动轮锁等待超时：一句人话 + 技术原因放 detail
-      const lockTimeout: any = new Error('另一台设备正在同步这个文件夹，等待超时，稍后会重试')
+      const lockTimeout: any = new Error('另一台设备正在同步该文件夹，等待超时，稍后将重试')
       lockTimeout.detail = acq.reason
       return { error: lockTimeout }
     }
@@ -2617,7 +2612,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         notReady.detail = notReadyReason || '配置未加载'
         throw notReady
       }
-      if (!config || !serverConfigured()) throw new Error('还没有设置服务器，请先到「设置」里填写')
+      if (!config || !serverConfigured()) throw new Error('尚未配置服务器，请先在「设置」中填写')
       const op = opts && (opts.op === 'pull' || opts.op === 'push' || opts.op === 'pull-full' || opts.op === 'push-full') ? opts.op : null
       const dryRun = !!(opts && opts.dryRun === true)
       const targets: DirSlot[] = dirId
@@ -2625,10 +2620,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
           ? [slots.get(dirId) as DirSlot]
           : []
         : Array.from(slots.values()).filter((s) => s.dir.enabled !== false)
-      if (dirId && !targets[0]) throw new Error('找不到这个同步文件夹')
-      if (!targets.length) throw new Error(dirId ? '找不到这个同步文件夹' : '没有正在开启的同步文件夹')
+      if (dirId && !targets[0]) throw new Error('找不到该同步文件夹')
+      if (!targets.length) throw new Error(dirId ? '找不到该同步文件夹' : '没有已启用的同步文件夹')
       if ((op || dryRun) && targets.some((s) => s.state === 'queued' || s.state === 'running')) {
-        throw new Error('这个文件夹正在同步中，请等这一轮结束再试')
+        throw new Error('该文件夹正在同步中，请等待本轮结束后再试')
       }
       const results: RoundResolveValue[] = []
       for (const slot of targets) {
@@ -2644,7 +2639,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
           // 抛入口同款错误；批量调用逐目录记错误结果并 continue —— 不因 mid-loop
           // 抛错丢掉已完成目录的结果（perDir 与 results 按下标对齐，语义保持）。
           if ((op || dryRun) && (slot.state === 'queued' || slot.state === 'running')) {
-            if (dirId) throw new Error('这个文件夹正在同步中，请等这一轮结束再试')
+            if (dirId) throw new Error('该文件夹正在同步中，请等待本轮结束后再试')
             results.push({ ok: false, error: new Error('这个文件夹正在同步中，请等这一轮结束再试') })
             continue
           }
@@ -2754,7 +2749,10 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       const resolve = conflictResolvers.get(conflictId)
       if (!resolve) return false
       conflictResolvers.delete(conflictId)
-      resolve(applyToRemaining ? { choice, applyToRemaining: true } : choice)
+      // 'defer'（弹窗「稍后处理」）只以字符串结算 —— 批量应用（applyToRemaining）
+      // 对 defer 无意义，二者互斥
+      if (applyToRemaining && choice !== 'defer') resolve({ choice, applyToRemaining: true })
+      else resolve(choice)
       return true
     },
 

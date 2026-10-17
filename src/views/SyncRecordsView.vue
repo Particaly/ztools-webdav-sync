@@ -5,6 +5,7 @@ import { AppIconButton } from '../components/ui'
 import { useStore, allPendingSignal } from '../composables/store'
 import { fmtBytes, fmtRelTime } from '../composables/format'
 import { decisionActionText, type DecisionHistoryRow } from '../composables/decisions'
+import type { SyncLogEntry } from '../env.d'
 import {
   demoSyncRecords,
   fmtAbsTime,
@@ -14,6 +15,7 @@ import {
   opLineText,
   opText,
   roundBrief,
+  roundNote,
   statusText,
   statusTone,
   triggerText,
@@ -100,15 +102,21 @@ watch(
 // ---------- 简略行 / 详尽视图的渲染辅助 ----------
 
 const TONE_COLOR: Record<string, string> = {
-  good: 'var(--green-dot, #1e9e4a)',
-  warn: '#d97706',
-  bad: 'var(--red, #d93025)',
-  muted: 'var(--text-muted, #9aa4ad)',
+  good: 'var(--green-dot)',
+  warn: 'var(--amber-icon)',
+  bad: 'var(--red)',
+  muted: 'var(--text-muted)',
 }
 
 /** 决策行的动作文案（与待处理中心「最近处理记录」同口径） */
 function decisionText(r: DecisionHistoryRow): string {
   return decisionActionText(r)
+}
+
+/** 简略行触发列的悬浮全文（截断时可见；与展开后元信息行的「触发方式」同口径） */
+function triggerFull(r: SyncLogEntry): string {
+  const op = opText(r.op)
+  return op ? `${triggerText(r.trigger)}（${op}）` : triggerText(r.trigger)
 }
 
 /** groupOps 结果缓存：记录一次载入后 ops 数组不可变（重载时整体换新数组），
@@ -144,7 +152,7 @@ function groupsOf(r: SyncRecordRow) {
            关闭（不再显示）后出现新的挂起会重新提示（div + 内嵌按钮：button 不能嵌套 button） -->
       <div v-if="pendingBarVisible" class="pending-bar" role="button" tabindex="0" @click="goHandlePending" @keydown.enter="goHandlePending">
         <AppIcon name="warn" :size="13" class="text-warning-icon shrink-0" />
-        <span class="flex-1 text-left">有 {{ pendingTotal }} 项待处理事项等你确认，确认前不会改动这些文件</span>
+        <span class="flex-1 text-left">有 {{ pendingTotal }} 项待处理事项，处理前不会改动这些文件</span>
         <span class="pending-act">去处理</span>
         <AppIconButton :size="18" variant="ghost" title="不再显示" class="shrink-0 text-ink-3" @click.stop="dismissPendingBar">
           <AppIcon name="close" :size="10" />
@@ -159,26 +167,26 @@ function groupsOf(r: SyncRecordRow) {
           <span v-if="records.length" class="count">{{ records.length }}</span>
         </div>
         <div v-if="loading" class="text-[11px] text-ink-4 px-[2px]">读取中…</div>
-        <div v-else-if="!records.length" class="text-[11px] text-ink-4 px-[2px]">还没有同步记录，完成一次同步后这里会显示每次的改动明细</div>
+        <div v-else-if="!records.length" class="text-[11px] text-ink-4 px-[2px]">暂无同步记录，完成一次同步后将显示每次的改动明细</div>
         <template v-else>
           <!-- 全部记录一次渲染（不分页）：行级 content-visibility 做渲染层虚拟滚动 -->
           <div class="flex flex-col gap-[4px]">
             <template v-for="(r, i) in records" :key="rowKey(r, i)">
-              <!-- 同步轮：简略行（点击展开详尽） -->
+              <!-- 同步轮：简略行（点击展开详尽）。首行三列定宽对齐（方案名 / 状态 / 触发来源） -->
               <div v-if="r.type === 'round'" class="rec" :class="{ 'rec-open': expandedKeys.has(rowKey(r, i)) }" @click="toggleRow(rowKey(r, i))">
                 <div class="rec-main">
-                  <span class="tone-dot" :style="{ background: TONE_COLOR[statusTone(r)] }" />
+                  <span class="rec-lead"><span class="tone-dot" :style="{ background: TONE_COLOR[statusTone(r)] }" /></span>
                   <span class="min-w-0 flex-1 flex flex-col gap-[2px]">
-                    <span class="flex items-center gap-[6px] min-w-0">
-                      <span class="truncate text-[12px] font-semibold text-ink-1">{{ r.dirName }}</span>
-                      <span class="text-[11px]" :style="{ color: TONE_COLOR[statusTone(r)] }">{{ statusText(r) }}</span>
-                      <span class="text-[11px] text-ink-4 truncate">{{ triggerText(r.trigger) }}<template v-if="opText(r.op)"> · {{ opText(r.op) }}</template></span>
+                    <span class="rec-line">
+                      <span class="truncate text-[12px] font-semibold text-ink-1" :title="r.dirName">{{ r.dirName }}</span>
+                      <span class="truncate text-[11px]" :style="{ color: TONE_COLOR[statusTone(r)] }" :title="statusText(r)">{{ statusText(r) }}</span>
+                      <span class="truncate text-[11px] text-ink-4" :title="triggerFull(r)">{{ triggerText(r.trigger) }}<template v-if="opText(r.op)"> · {{ opText(r.op) }}</template></span>
                     </span>
-                    <span v-if="roundBrief(r).length" class="flex flex-wrap items-center gap-x-[8px] gap-y-[2px]">
+                    <span v-if="roundBrief(r).length || roundNote(r)" class="min-w-0 flex flex-wrap items-center gap-x-[8px] gap-y-[2px]">
                       <span v-for="c in roundBrief(r)" :key="c.label" class="chip">{{ c.label }} {{ c.count }}</span>
-                      <span v-if="r.status === 'error' && r.error" class="text-[11px] text-danger truncate">{{ r.error }}</span>
+                      <span v-if="roundNote(r)" class="min-w-0 truncate text-[11px] text-ink-4" :title="roundNote(r)">{{ roundNote(r) }}</span>
+                      <span v-if="r.status === 'error' && r.error" class="min-w-0 truncate text-[11px] text-danger">{{ r.error }}</span>
                     </span>
-                    <span v-else-if="r.status === 'error' && r.error" class="text-[11px] text-danger truncate">{{ r.error }}</span>
                   </span>
                   <span class="shrink-0 flex items-center gap-[4px]">
                     <span class="text-[10px] text-ink-4 whitespace-nowrap">{{ fmtRelTime(r.at) }}</span>
@@ -187,7 +195,7 @@ function groupsOf(r: SyncRecordRow) {
                 </div>
                 <!-- 详尽视图：线上线下各自做了什么（新增 / 更新 / 删除）、冲突处理与错误；
                      限高内滚 —— 元信息行固定在顶部，数千行明细在内部滚动 -->
-                <div v-if="expandedKeys.has(rowKey(r, i))" class="rec-detail" @click.stop>
+                <div v-if="expandedKeys.has(rowKey(r, i))" class="rec-detail select-text" @click.stop>
                   <div class="meta-row">
                     <span>开始时间 {{ fmtAbsTime(r.at) }}</span>
                     <span>耗时 {{ fmtDuration(r.endAt - r.at) }}</span>
@@ -234,10 +242,12 @@ function groupsOf(r: SyncRecordRow) {
                           <span class="font-mono op-rel">{{ o.rel }}</span>
                         </div>
                       </div>
-                      <div v-if="!r.ops.length" class="note-line">{{ r.status === 'yielded' ? '本次让行，没有做任何改动' : '本次没有文件改动' }}</div>
-                      <div v-if="r.adopted > 0" class="note-line">另有 {{ r.adopted }} 个文件两边内容一致，已自动对齐记录</div>
-                      <div v-if="r.deferredConflicts > 0" class="note-line">{{ r.deferredConflicts }} 个冲突等你处理，处理后会自动同步</div>
-                      <div v-if="r.deleteHeld > 0" class="note-line">{{ r.deleteHeld }} 项删除等你确认，确认前不会删除任何文件</div>
+                      <div v-if="!r.ops.length" class="note-line">{{ r.status === 'yielded' ? '另一设备正在同步，本次未做任何改动' : '本次没有文件改动' }}</div>
+                      <div v-if="r.adopted > 0" class="note-line">另有 {{ r.adopted }} 个文件两侧内容一致，已自动对齐记录</div>
+                      <div v-if="r.registryAdopted?.length" class="note-line" :title="r.registryAdopted.join('、')">从云端安装插件：{{ r.registryAdopted.join('、') }}</div>
+                      <div v-if="r.registryRemoved?.length" class="note-line" :title="r.registryRemoved.join('、')">清理失效插件登记：{{ r.registryRemoved.join('、') }}</div>
+                      <div v-if="r.deferredConflicts > 0" class="note-line">{{ r.deferredConflicts }} 个冲突待处理，处理后自动同步</div>
+                      <div v-if="r.deleteHeld > 0" class="note-line">{{ r.deleteHeld }} 项删除待确认，确认前不会删除任何文件</div>
                       <div v-if="r.errors.length" class="grp grp-err">
                         <div class="grp-title">发生的错误</div>
                         <div v-for="(e, j) in r.errors" :key="`e${j}`" class="op-line"><span class="text-danger">{{ e }}</span></div>
@@ -247,16 +257,20 @@ function groupsOf(r: SyncRecordRow) {
                   </div>
                 </div>
               </div>
-              <!-- 用户决策：单行记录（动作文案与待处理中心「最近处理记录」同口径） -->
+              <!-- 用户决策：单行记录（动作文案与待处理中心「最近处理记录」同口径；
+                   复用同一网格 —— 方案名列与轮次行共用定宽，说明文字与状态列起点对齐） -->
               <div v-else class="rec rec-plain">
                 <div class="rec-main">
-                  <AppIcon name="check-circle" :size="13" bg="var(--green-bg)" class="text-success shrink-0" />
-                  <span class="min-w-0 flex-1 truncate" :title="`${r.dirName} / ${r.rel}`">
-                    <span class="text-ink-2">{{ r.dirName }}</span>
-                    <span class="rec-sep">·</span>
-                    <span class="text-ink-3">{{ r.kind === 'ignore' ? '忽略了这条提醒（再次出现才会询问）' : decisionText(r) }}</span>
-                    <span v-if="r.rel !== '.'" class="rec-sep">·</span>
-                    <span v-if="r.rel !== '.'" class="font-mono text-ink-4">{{ r.rel }}</span>
+                  <span class="rec-lead">
+                    <AppIcon name="check-circle" :size="13" bg="var(--green-bg)" class="text-success" />
+                  </span>
+                  <span class="rec-line min-w-0 flex-1 select-text">
+                    <span class="truncate text-ink-2" :title="r.dirName">{{ r.dirName }}</span>
+                    <span class="rec-desc min-w-0 truncate" :title="`${r.dirName} / ${r.rel}`">
+                      <span class="text-ink-3">{{ r.kind === 'ignore' ? '已忽略该提醒（再次出现时才会询问）' : decisionText(r) }}</span>
+                      <span v-if="r.rel !== '.'" class="rec-sep">·</span>
+                      <span v-if="r.rel !== '.'" class="font-mono text-ink-4">{{ r.rel }}</span>
+                    </span>
                   </span>
                   <span class="shrink-0 text-[10px] text-ink-4 whitespace-nowrap">{{ fmtRelTime(r.at) }}</span>
                 </div>
@@ -276,9 +290,9 @@ function groupsOf(r: SyncRecordRow) {
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  border: 1px solid var(--amber-strip-br, #f0dfb6);
+  border: 1px solid var(--amber-strip-br);
   border-radius: 7px;
-  background: var(--amber-strip-bg, #fdf8ec);
+  background: var(--amber-strip-bg);
   font-size: 12px;
   color: var(--text-1);
   cursor: pointer;
@@ -340,11 +354,11 @@ function groupsOf(r: SyncRecordRow) {
   contain-intrinsic-size: auto 52px;
 
   &:hover {
-    background: #fafbfc;
+    background: var(--bg-bar);
   }
 
   &.rec-open {
-    background: #fafbfc;
+    background: var(--bg-bar);
     cursor: default;
   }
 
@@ -363,6 +377,30 @@ function groupsOf(r: SyncRecordRow) {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* 首行三列（方案名 / 状态 / 触发来源）定宽对齐：前两列固定宽让所有行的列
+   起点落在同一竖线上，超宽截断（悬浮看全文）；触发来源占剩余宽度 */
+.rec-line {
+  display: grid;
+  grid-template-columns: minmax(0, 96px) 48px minmax(0, 1fr);
+  column-gap: 8px;
+  align-items: baseline;
+
+  /* 决策行没有状态列：说明文字从状态列起笔、贯通到行尾 */
+  .rec-desc {
+    grid-column: 2 / -1;
+  }
+}
+
+/* 行首图标槽：状态点（7px）与决策勾（13px）共用 13px 定宽槽居中，
+   两种记录形态的方案名列由此从同一竖线起笔 */
+.rec-lead {
+  width: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .rec-chev {

@@ -1,12 +1,38 @@
 /* eslint-disable */
 // store-connection.ts —— 连接探测域：testConnection /
-// 重新探测 / 功能测试目录确认。探测结论（连通性 / 档位 / 配额）写回 state。
-import { state, suggestRemote, tierLabel, tierHint, type TestResult } from './store-core'
+// 重新探测 / 测试目录自动解析。探测结论（连通性 / 档位 / 配额）写回 state。
+import { state, tierLabel, tierHint, isPluginSyncDir, type TestResult } from './store-core'
 import { toast } from './toast'
-import type { DavCapabilities, DavTier } from '../env.d'
+import type { DavCapabilities, DavTier, SyncDir } from '../env.d'
 
 
 // ---------- 连接 ----------
+
+/**
+ * 解析功能测试的目标远端目录（测试目录配置已移除，每次按当前数据动态推导）：
+ *   1. 当前服务器下「已成功同步」的目录（status='synced'，最近同步的优先）——
+ *      该目录确定存在于云端且刚刚被写入过，是最可靠的实测目标；
+ *   2. 其余已创建的同步目录（同上按最近同步排序）—— 路径经用户认可，只是尚无
+ *      成功同步记录；
+ *   3. 默认云端文件夹（prefs.defaultRemoteDir）—— 添加目录时的缺省位置；
+ *   4. 都没有时返回 ''，调用方提示先添加一个同步目录。
+ * 只看当前活跃服务器的目录（serverId 显式指向，或未写 serverId 且活跃即第一台
+ * —— 与 removeServer / serverOfDir 的归属口径一致）：探测请求发往活跃服务器，
+ * 其他服务器的目录路径对它没有意义。插件同步虚拟行不参与。
+ */
+export function resolveProbeDir(): string {
+  const isFirst = state.servers[0]?.id === state.activeServerId
+  const mine = state.dirs.filter(
+    (d: SyncDir) => !isPluginSyncDir(d) && (d.serverId === state.activeServerId || (d.serverId == null && isFirst))
+  )
+  // 按最近同步时间降序（从未同步的排后面），同分保持列表顺序
+  const byRecency = (a: SyncDir, b: SyncDir) => (b.lastSyncAt ?? 0) - (a.lastSyncAt ?? 0)
+  const synced = mine.filter((d) => d.status === 'synced').sort(byRecency)
+  const rest = mine.filter((d) => d.status !== 'synced').sort(byRecency)
+  const hit = synced[0] ?? rest[0]
+  const p = (hit?.remotePath || state.prefs.defaultRemoteDir || '').trim()
+  return p ? (p.startsWith('/') ? p : '/' + p).replace(/\/+$/, '') || '/' : ''
+}
 
 /** 测试连接结果（附带档位与能力摘要，字段向后兼容） */
 
@@ -34,8 +60,8 @@ export async function testConnection(opts?: { notify?: boolean }): Promise<TestR
   } else {
     state.testing = true
     try {
-      // 附带能力摘要按已选测试目录取（未选择时为基址），档位展示口径与「功能测试」一致
-      result = await window.services.dav.testConnection(state.server, state.prefs.probeRemoteDir || undefined)
+      // 附带能力摘要按解析出的测试目录取（无可用目录时为基址），档位展示口径与「功能测试」一致
+      result = await window.services.dav.testConnection(state.server, resolveProbeDir() || undefined)
     } catch (e) {
       // 网络异常等 preload 抛错同样要给出可见反馈，而不是静默失败
       result = { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -54,7 +80,7 @@ export async function testConnection(opts?: { notify?: boolean }): Promise<TestR
 
   if (notify) {
     if (result.ok) toast.success('连接成功', `服务器响应 ${result.latencyMs ?? 0} 毫秒`)
-    else toast.error('连接失败', result.error || '连不上服务器，请检查地址、用户名和密码')
+    else toast.error('连接失败', result.error || '无法连接服务器，请检查地址、用户名和密码')
   }
   return result
 }
@@ -63,9 +89,9 @@ export async function testConnection(opts?: { notify?: boolean }): Promise<TestR
  * 重新探测服务器能力与档位（设置页「功能测试」入口）。
  * 复用 preload 的 probeCapabilities(cfg, force=true, remotePath)：忽略缓存现场实测，
  * 结果写回 state.capabilities 并以通知反馈档位结论。
- * 探测目标为用户指定的测试目录（prefs.probeRemoteDir）—— WebDAV 服务器不同子树
- * 的写权限可能不同，根目录不一定可写，写权限必须按用户认可的目录实测；尚未选择
- * 测试目录时（首次功能测试）先弹远端目录选择器，确认后自动开始本次测试。
+ * 探测目标由 resolveProbeDir 动态解析（测试目录已无手动配置）：优先已成功同步的
+ * 云端目录 —— 该目录确定存在且写入过，实测口径最贴近真实同步；无任何可用目录
+ * （无同步目录且未设置默认云端文件夹）时提示先添加一个同步目录。
  */
 export async function reprobe(): Promise<void> {
   if (!state.server.serverUrl.trim()) {
@@ -76,13 +102,14 @@ export async function reprobe(): Promise<void> {
     toast.warning('当前环境不可用', '浏览器预览模式没有连接服务器的能力')
     return
   }
-  if (!state.prefs.probeRemoteDir) {
-    state.showProbeDirPicker = true
+  const probeDir = resolveProbeDir()
+  if (!probeDir) {
+    toast.warning('请先添加一个同步目录', '功能测试需要一个云端文件夹实测写权限；添加同步目录（或设置默认云端文件夹）后即可检测')
     return
   }
   state.probing = true
   try {
-    const caps = await window.services.dav.probeCapabilities({ ...state.server }, true, state.prefs.probeRemoteDir)
+    const caps = await window.services.dav.probeCapabilities({ ...state.server }, true, probeDir)
     state.capabilities = caps
     toast.success(`检测完成：${tierLabel(caps.tier)}`, tierHint(caps.tier))
   } catch (e) {
@@ -90,19 +117,4 @@ export async function reprobe(): Promise<void> {
   } finally {
     state.probing = false
   }
-}
-
-/**
- * 确认功能测试目录（首次功能测试的选择与设置页「修改测试目录」共用入口）。
- * 写入 prefs.probeRemoteDir（经 prefs 深度 watch 自动持久化）并立即以新目录执行
- * 一次功能测试 —— 换目录的动机通常是原目录不可写，当场重测直接给出结论；
- * 选择了相同目录时只关闭弹窗，不重复发起探测。
- * @param path 远端目录选择器回传的绝对路径（以 / 开头；容错补齐缺省的起始斜杠）
- */
-export function confirmProbeDir(path: string) {
-  state.showProbeDirPicker = false
-  const p = String(path || '').trim()
-  if (!p || p === state.prefs.probeRemoteDir) return
-  state.prefs.probeRemoteDir = p.startsWith('/') ? p : '/' + p
-  void reprobe()
 }

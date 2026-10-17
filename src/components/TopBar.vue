@@ -16,7 +16,7 @@ const statusText = computed(() =>
         ? '未连接'
         : '未配置'
 )
-/** 暂停以琥珀点覆盖连接状态展示（恢复时机在 title / 下拉里），点击入口转「恢复」 */
+/** 暂停以琥珀点覆盖连接状态展示（恢复时机直接写在状态文案里），点击入口转「恢复」 */
 const dotClass = computed(() => (store.autoSyncPaused.value ? 'paused' : store.connStatus.value))
 </script>
 
@@ -72,7 +72,6 @@ const dotClass = computed(() => (store.autoSyncPaused.value ? 'paused' : store.c
       </template>
       <template #default="{ close }">
         <button type="button" class="menu-item" @click="store.openGuide(); close()">查看配置指南</button>
-        <button type="button" class="menu-item" @click="store.state.route = 'settings'; close()">打开设置</button>
       </template>
     </AppDropdown>
   </header>
@@ -124,20 +123,20 @@ const dotClass = computed(() => (store.autoSyncPaused.value ? 'paused' : store.c
   }
 
   &.disconnected {
-    background: #d97706;
+    background: var(--amber-icon);
     box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.14);
   }
 
   /* 全局暂停：琥珀常亮（与「警告但可控」的语义一致，不用红色） */
   &.paused {
-    background: #d97706;
+    background: var(--amber-icon);
     box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.14);
   }
 }
 
 /* 暂停按钮激活态：图标转琥珀，提示当前处于暂停中 */
 .pause-active {
-  color: #d97706 !important;
+  color: var(--amber-icon) !important;
 }
 
 /* 同步记录入口的待处理角标：图标右上角红点（描白边避免与图标粘连） */
@@ -169,7 +168,7 @@ const dotClass = computed(() => (store.autoSyncPaused.value ? 'paused' : store.c
   transition: background 0.12s ease;
 
   &:hover {
-    background: #f1f3f6;
+    background: var(--bg-seg);
   }
 }
 </style>

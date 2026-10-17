@@ -1,10 +1,11 @@
-/** 字节格式化：B / KB / MB / GB（与设计稿一致的 1 位小数风格） */
+/** 字节格式化：B / KB / MB / GB / TB（1 位小数；NAS / 网盘常见 TB 级总量） */
 export function fmtBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0 B'
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
-  return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`
+  if (n < 1024 * 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`
+  return `${(n / 1024 / 1024 / 1024 / 1024).toFixed(2)} TB`
 }
 
 /**
@@ -31,8 +32,7 @@ function isSameDay(a: Date, b: Date): boolean {
 export function fmtRelTime(ts: number | null | undefined): string {
   if (!ts) return '—'
   const diff = Date.now() - ts
-  if (diff < 30 * 1000) return '刚刚'
-  if (diff < 60 * 1000) return '1 分钟内'
+  if (diff < 60 * 1000) return '刚刚'
   if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} 分钟前`
   const now = new Date()
   const d = new Date(ts)

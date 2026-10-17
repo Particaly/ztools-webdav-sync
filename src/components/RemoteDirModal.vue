@@ -24,7 +24,7 @@ const props = withDefaults(
     initialPath?: string
     /** 弹窗标题 */
     title?: string
-    /** 弹窗副标题：说明本次选择的用途（同步位置 / 功能测试目录等） */
+    /** 弹窗副标题：说明本次选择的用途（同步位置 / 插件云端文件夹等） */
     subtitle?: string
     /** 连接配置（多服务器形态由调用方指定；缺省 = 活跃服务器） */
     server?: import('../env.d').DavConfig | null
@@ -155,13 +155,13 @@ onMounted(() => {
           <span class="text-ink-3">正在读取…</span>
         </div>
         <div v-else-if="error" class="dir-state flex-col items-start gap-[8px]">
-          <span class="inline-flex items-center gap-[6px] text-danger">
+          <span class="inline-flex items-center gap-[6px] text-danger select-text">
             <AppIcon name="warn" :size="13" />
             {{ error }}
           </span>
           <AppButton size="sm" @click="load">重试</AppButton>
         </div>
-        <div v-else-if="!subDirs.length" class="dir-state text-ink-4">这里面没有文件夹了</div>
+        <div v-else-if="!subDirs.length" class="dir-state text-ink-4">没有子文件夹</div>
         <template v-else>
           <button v-for="d in shownDirs" :key="d.path" type="button" class="dir-row" @click="enter(d)">
             <AppIcon name="folder" :size="14" class="text-icon-dark shrink-0" />

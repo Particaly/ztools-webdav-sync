@@ -159,7 +159,7 @@ export async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreH
             // 的根丢失兜底接管 —— 绝不能解读成「远端为空」触发批量删除
             if (/404/.test(String(item.status || ''))) {
               complete = false
-              errors.push({ rel: '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
+              errors.push({ rel: '.', message: '云端文件夹不存在，或没有访问权限（HTTP 404）' })
               return { files, complete, errors, probeResidue, depth: 'infinity', collections, skippedDirs }
             }
             continue
@@ -181,7 +181,7 @@ export async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreH
     } else {
       // 404：与逐目录模式的首请求同语义（根缺失 → incomplete，绝不解读为「远端已删除」）
       complete = false
-      errors.push({ rel: '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
+      errors.push({ rel: '.', message: '云端文件夹不存在，或没有访问权限（HTTP 404）' })
       return { files, complete, errors, probeResidue, depth: 'infinity', collections, skippedDirs }
     }
   }
@@ -208,7 +208,7 @@ export async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreH
     }
     if (r.status === 404) {
       complete = false
-      errors.push({ rel: prefix || '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
+      errors.push({ rel: prefix || '.', message: '云端文件夹不存在，或没有访问权限（HTTP 404）' })
       continue
     }
     if (r.status !== 207) {
@@ -234,7 +234,7 @@ export async function listRemoteSafe(cfg: EngineCfg, remotePath: string, ignoreH
         // 规划出批量 delete-local（仅靠删除阈值兜底）
         if (!prefix && /404/.test(String(item.status || ''))) {
           complete = false
-          errors.push({ rel: '.', message: '云端找不到这个文件夹，或没有访问权限（HTTP 404）' })
+          errors.push({ rel: '.', message: '云端文件夹不存在，或没有访问权限（HTTP 404）' })
         }
         continue // 集合自身
       }
@@ -285,7 +285,7 @@ export async function listDirs(cfg: EngineCfg, remotePath: string): Promise<Arra
     headers: { Depth: '1', 'Content-Type': 'application/xml' },
     body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
   })
-  if (r.status === 404) throw new Error('云端找不到这个文件夹，或没有访问权限')
+  if (r.status === 404) throw new Error('云端文件夹不存在，或没有访问权限')
   const body = r.body ? r.body.toString('utf-8') : ''
   // 个别服务器对成功的 PROPFIND 返回 200 + multistatus 而非 207，一并接受
   if (r.status !== 207 && !(r.status === 200 && /multistatus/i.test(body))) {

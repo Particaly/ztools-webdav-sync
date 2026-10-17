@@ -103,7 +103,7 @@ const {
         'PF1 round 2 skips backed-off file, round succeeds with skip warning',
         pf1s2.errors.length === 0 &&
           pf1s2.uploaded === 0 &&
-          pf1s2.warnings.some((w) => /1 个文件一直同步失败/.test(w) && /bad\.toolarge\.txt/.test(w) && /下次重试/.test(w)),
+          pf1s2.warnings.some((w) => /1 个文件多次同步失败/.test(w) && /bad\.toolarge\.txt/.test(w) && /下次重试/.test(w)),
         JSON.stringify(pf1s2.warnings)
       )
       const f2 = (await services.sync._internals.getFailures(pf1dir))['bad.toolarge.txt']
@@ -1539,7 +1539,7 @@ const {
     pu4warn = pu4b.warnings
     check(
       'PU4 over-limit partial stays a conflict WITH the partial-upload hint',
-      pu4b.conflicts === 1 && pu4b.uploaded === 1 && pu4info != null && pu4info.hint === 'partial-upload' && pu4warn.some((w) => /太大无法自动对比/.test(w)),
+      pu4b.conflicts === 1 && pu4b.uploaded === 1 && pu4info != null && pu4info.hint === 'partial-upload' && pu4warn.some((w) => /过大无法自动比对/.test(w)),
       `hint=${pu4info && pu4info.hint} ${JSON.stringify(pu4warn)}`
     )
     // 注：轮末 WAL 必然截断为空（冲突解决的落地意图了结了开放意图）；「冲突时刻意图
@@ -2062,7 +2062,7 @@ const {
     })
     check(
       'PC1 round 2 reuses pending choice without asking again',
-      pc1Calls === 1 && pc1s2.conflicts === 1 && pc1s2.uploaded === 1 && pc1s2.errors.length === 0 && pc1s2.warnings.some((w) => /按你上次的选择自动处理/.test(w)),
+      pc1Calls === 1 && pc1s2.conflicts === 1 && pc1s2.uploaded === 1 && pc1s2.errors.length === 0 && pc1s2.warnings.some((w) => /已按上次的选择自动处理/.test(w)),
       `calls=${pc1Calls} ${JSON.stringify(pc1s2)}`
     )
     check('PC1 remote f now holds the local version', (await fsp.readFile(path.join(ROOT, 'pc1', 'f-midair.txt'), 'utf-8')) === 'pc1-f-LOCAL-v2')
@@ -2091,7 +2091,7 @@ const {
     } catch (e) {
       pc2err = e
     }
-    check('PC2 unrecognized choice still fails the round as unresolved', !!pc2err && /冲突还没处理/.test(pc2err.message), pc2err && pc2err.message)
+    check('PC2 unrecognized choice still fails the round as unresolved', !!pc2err && /冲突尚未处理/.test(pc2err.message), pc2err && pc2err.message)
     const pc2pend = await services.sync.listPendingConflicts(pc2dir)
     check(
       'PC2 pending registered without choice, both sides intact',
@@ -2118,7 +2118,7 @@ const {
     })
     check(
       'PC2 next round resolves via the set choice without asking',
-      pc2Calls2 === 0 && pc2s2.conflicts === 1 && pc2s2.downloaded === 1 && pc2s2.errors.length === 0 && pc2s2.warnings.some((w) => /按你上次的选择自动处理/.test(w)),
+      pc2Calls2 === 0 && pc2s2.conflicts === 1 && pc2s2.downloaded === 1 && pc2s2.errors.length === 0 && pc2s2.warnings.some((w) => /已按上次的选择自动处理/.test(w)),
       `calls=${pc2Calls2} ${JSON.stringify(pc2s2)}`
     )
     check('PC2 local now holds the remote version', (await fsp.readFile(path.join(PC2_LOCAL, 'a.txt'), 'utf-8')) === 'pc2-a-REMOTE-v2-longer')
@@ -2480,7 +2480,7 @@ const {
       const fc5bfix = await syncP(FC5B_LOCAL, '/b2b2')
       check(
         'FC5b fault-free round uploads 250, skips 60 on permanent-failure backoff, no errors',
-        fc5bfix.errors.length === 0 && fc5bfix.uploaded === 250 && fc5bfix.warnings.some((w) => w.includes('60 个文件一直同步失败')) && fc5bfix.failureClass === undefined,
+        fc5bfix.errors.length === 0 && fc5bfix.uploaded === 250 && fc5bfix.warnings.some((w) => w.includes('60 个文件多次同步失败')) && fc5bfix.failureClass === undefined,
         JSON.stringify({ uploaded: fc5bfix.uploaded, errors: fc5bfix.errors.length, warnings: fc5bfix.warnings })
       )
     } finally {

@@ -64,7 +64,7 @@ import {
   GUIDE_URL,
 } from './store-core'
 import { serverLabel, normalizeServers, setActiveServer, addServer, removeServer, serverOfDir } from './store-servers'
-import { testConnection, reprobe, confirmProbeDir } from './store-connection'
+import { testConnection, reprobe, resolveProbeDir } from './store-connection'
 import {
   dirEnabled,
   dirAutoSyncOn,
@@ -87,7 +87,7 @@ import {
   resetDirOverrides,
   updateDir,
 } from './store-dirs'
-import { resolveConflict, openConflictFor, applyManualConflict } from './store-conflicts'
+import { resolveConflict, deferConflict, openConflictFor, applyManualConflict } from './store-conflicts'
 import {
   applyPendingConflicts,
   autoPromptRootLost,
@@ -116,6 +116,7 @@ export {
   dirIntervalMin,
   dirSyncPrefs,
   dirEngineCfg,
+  registrySyncStripVisibleFor,
 } from './store-dirs'
 export { dirRootLostOpen, dirPendingSignal, allPendingSignal } from './store-pending'
 
@@ -216,7 +217,7 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
     // 部分完成轮（有删除确认 / 冲突挂起）不亮「同步完成」绿幅 —— 有事项在等
     // 用户处理时，行内状态保持低调的「已同步」，把注意力让给黄色待处理提示条
     dir.justCompleted = !(disp && disp.tone === 'partial')
-    if (disp && disp.tone === 'partial') toast.info(disp.title, '回窗口后在文件夹列表统一处理')
+    if (disp && disp.tone === 'partial') toast.info(disp.title, '回到窗口后在文件夹列表中统一处理')
     if (summary?.warnings?.length) {
       toast.warning(summary.warnings[0], summary.warnings.length > 1 ? `另有 ${summary.warnings.length - 1} 条提示` : undefined)
     }
@@ -251,7 +252,7 @@ function applyRoundEnd(ev: Extract<SchedulerEvent, { type: 'round-end' }>) {
 
 /**
  * 调度器转发的冲突（kind=manual 且本机订阅在线）：进弹窗队列，用户选择经
- * scheduler.resolveConflict 回传。'defer' 只可能由调度器兜底产生，弹窗不产生。
+ * scheduler.resolveConflict 回传；「稍后处理」以 'defer' 应答，与转发超时同语义。
  */
 function queueSchedulerConflict(ev: Extract<SchedulerEvent, { type: 'conflict' }>) {
   const info = ev.info
@@ -261,8 +262,7 @@ function queueSchedulerConflict(ev: Extract<SchedulerEvent, { type: 'conflict' }
     const sched = window.services?.scheduler
     if (!sched) return
     if (typeof rawChoice === 'string') {
-      // 'defer' 只可能来自调度器兜底（渲染层已不在），UI 弹窗从不产生 —— 忽略
-      if (rawChoice === 'defer') return
+      // 'defer' 来自弹窗「稍后处理」：交调度器以 defer 结算（挂到待处理中心）
       sched.resolveConflict(ev.conflictId, rawChoice)
       return
     }
@@ -306,7 +306,7 @@ function handleSchedulerEvent(ev: SchedulerEvent) {
     case 'scheduler-error':
       // 调度器自身异常（自举失败 / 心跳缓慢等）：仅 visible 的事件弹提示；
       // 内部机制类（选举 / 心跳 / dbStorage）只写日志，不打扰用户
-      if ((ev as { visible?: boolean }).visible) toast.warning('自动同步出了点问题，稍后会重试', ev.message)
+      if ((ev as { visible?: boolean }).visible) toast.warning('自动同步异常，稍后将自动重试', ev.message)
       else console.info('[webdav-sync] scheduler:', ev.message)
       break
     default:
@@ -323,7 +323,7 @@ function bindScheduler() {
   void sched
     .init()
     .then((snap) => {
-      if (!snap.ready && snap.notReadyReason) toast.warning('自动同步暂时没有开启', snap.notReadyReason)
+      if (!snap.ready && snap.notReadyReason) toast.warning('自动同步暂未启用', snap.notReadyReason)
     })
     .catch(() => {
       /* 握手失败不阻断界面 */
@@ -488,7 +488,7 @@ async function init() {
   if (configured.value) {
     // 先读能力缓存（无网络开销）立即呈现档位；随后的连通性探测会刷新它
     if (window.services) {
-      void window.services.dav.getCachedCapabilities({ ...state.server }, state.prefs.probeRemoteDir || undefined).then((c) => {
+      void window.services.dav.getCachedCapabilities({ ...state.server }, resolveProbeDir() || undefined).then((c) => {
         if (c && !state.capabilities) state.capabilities = c
       })
     }
@@ -543,7 +543,7 @@ function applyDemo(scene: string) {
       conflictFile: null,
       errorMessage: null,
       progress: null,
-      // 演示「云端占用」来源：lastBytesTotal 合计约 2.4 GB（设置页经 cloudBytes 派生展示）
+      // 演示「同步文件大小」（设置页）来源：lastBytesTotal 合计约 2.4 GB（cloudBytes 派生展示）
       lastBytesTotal: Math.round(1.3 * 1024 * 1024 * 1024),
     },
     {
@@ -605,7 +605,7 @@ function applyDemo(scene: string) {
     })
     state.activeConflict = state.conflictQueue[0]
     conflictResolvers.set(state.activeConflict, (rawChoice) => {
-      // 'defer' 只可能来自调度器（后台轮），demo 弹窗从不产生 —— 忽略
+      // 'defer'（弹窗「稍后处理」）：demo 无引擎在等，忽略即可（等价于关闭弹窗）
       const choice = typeof rawChoice === 'string' ? rawChoice : rawChoice.choice
       if (choice === 'defer') return
       void applyManualConflict(dirs[0].id, state.activeConflict!, choice)
@@ -746,7 +746,6 @@ export function useStore() {
     init,
     testConnection,
     reprobe,
-    confirmProbeDir,
     syncDir,
     syncAll,
     cancelSync,
@@ -767,6 +766,7 @@ export function useStore() {
     allPendingSignal,
     mutePendingStrip,
     resolveConflict,
+    deferConflict,
     openConflictFor,
     pendingConflictTotal,
     pendingCenterGroups,

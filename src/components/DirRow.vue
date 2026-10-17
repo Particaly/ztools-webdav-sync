@@ -6,7 +6,7 @@ import PendingConflictsModal from './PendingConflictsModal.vue'
 import SyncTreeModal from './SyncTreeModal.vue'
 import DryRunModal from './DryRunModal.vue'
 import { AppButton, AppDropdown, AppIconButton, AppModal } from './ui'
-import { useStore, dirRootLostOpen, dirPendingSignal, isPluginSyncDir } from '../composables/store'
+import { useStore, dirRootLostOpen, dirPendingSignal, isPluginSyncDir, registrySyncStripVisibleFor } from '../composables/store'
 import { fmtBytes, fmtRelTime, fmtSpeed } from '../composables/format'
 import { syncRoundPercent, syncTaskText } from '../composables/syncProgress'
 import type { SyncDir } from '../env.d'
@@ -64,13 +64,26 @@ const rootLostOpen = computed(() => dirRootLostOpen(props.dir))
 
 /** demo/兼容冲突提示条的会话内关闭（真实同步从不产生该状态，无需持久化） */
 const conflictStripClosed = ref(false)
-/** 插件目录未发现提示条：用户关闭后不再显示（目录出现后提示条本就会消失） */
-const pluginUnavailableVisible = computed(() => isPlugin.value && !pluginAvailable.value && !store.state.prefs.pluginUnavailableDismissed)
+/**
+ * 插件目录未发现提示条：关闭记录当时的提示原因（情境指纹，随 prefs 持久化）——
+ * 同一原因不再提示，原因变化（目录出现过又以别的原因丢失）后重新提示。
+ * 历史遗留的 boolean true 按旧版「永久关闭」语义处理；非 string 的 falsy 值
+ * （'' / undefined / false）均视为从未关闭。哨兵 'unavailable' 兜底原因为空的
+ * 形态，避免「存 '' = 从未关闭」与「关因空原因」两种语义撞车。
+ */
+const pluginUnavailableVisible = computed(() => {
+  if (!isPlugin.value || pluginAvailable.value) return false
+  const dismissed = store.state.prefs.pluginUnavailableDismissed
+  if (typeof dismissed === 'string') return dismissed === '' || dismissed !== (props.dir.pluginSyncInfo?.reason || 'unavailable')
+  return !dismissed
+})
 /** 注册表对账降级状态（undefined = 正常；提示条显隐与关闭标记的情境指纹） */
 const registrySyncState = computed(() => (isPlugin.value && pluginAvailable.value ? props.dir.pluginSyncInfo?.registrySync : undefined))
-/** 注册表降级提示条：状态与关闭时记录的一致则不再显示（状态变化后重新提示） */
-const registrySyncStripVisible = computed(
-  () => !!registrySyncState.value && (store.state.prefs.registrySyncDismissed ?? '') !== registrySyncState.value
+/** 注册表降级提示条：只有降级态（pending / denied / unavailable）出条，'ok' = 对账
+ *  健康（自动安装已在工作）绝不提示 —— 判定与「不再显示」指纹语义收口在
+ *  store-dirs 的 registrySyncStripVisibleFor（单点维护，单测覆盖） */
+const registrySyncStripVisible = computed(() =>
+  registrySyncStripVisibleFor(registrySyncState.value, store.state.prefs.registrySyncDismissed)
 )
 /** 待处理挂起条：关闭时记下待处理信号，出现更新的挂起（信号变大）时重新显示 */
 const pendingStripVisible = computed(
@@ -171,14 +184,34 @@ function onOpenLocalFolder(close: () => void) {
 }
 
 /**
- * 一次性单向同步（「云端补齐本地 / 云端覆盖本地 / 本地补齐云端 / 本地覆盖云端」）：
- * op 经 store.syncDir → 调度器 syncNow 透传给引擎 —— 补齐档把对端内容带过来
- *（恢复本端缺失，保留本端多出与本端改动，双侧都改走冲突流程）；覆盖档以选定侧
- * 为准镜像对侧（缺失恢复 / 不一致覆盖 / 多余删除，删除同样过删除安全闸）。
+ * 一次性单向同步：「补齐」档（云端补齐本地 / 本地补齐云端）不动本端已有内容，
+ * 点击即执行；「覆盖」档（云端覆盖本地 / 本地覆盖云端）以选定侧为准镜像对侧，
+ * 未同步的修改会丢失 —— 先弹确认（两段式 armed，与「移除同步」同款交互语言），
+ * 确认后才经 store.syncDir → 调度器 syncNow 透传给引擎（删除仍过删除安全闸）。
  */
 function onOneWaySync(close: () => void, op: 'pull' | 'push' | 'pull-full' | 'push-full') {
-  void store.syncDir(props.dir, { op })
   close()
+  if (op === 'pull-full' || op === 'push-full') {
+    fullSyncOp.value = op
+    fullArmed.value = false
+    return
+  }
+  void store.syncDir(props.dir, { op })
+}
+
+/** 覆盖档确认弹窗的待执行操作（null = 关闭）；armed 为两段式确认的第二段 */
+const fullSyncOp = ref<'pull-full' | 'push-full' | null>(null)
+const fullArmed = ref(false)
+
+/** 确认覆盖：第一点亮出后果说明（armed），第二点才真正执行 */
+function confirmFullSync() {
+  if (!fullArmed.value) {
+    fullArmed.value = true
+    return
+  }
+  const op = fullSyncOp.value
+  fullSyncOp.value = null
+  if (op) void store.syncDir(props.dir, { op })
 }
 
 function onToggleEnabled(close: () => void) {
@@ -261,7 +294,7 @@ const alertStrips = computed<AlertStrip[]>(() => {
     out.push({
       key: 'conflict',
       tone: 'warn',
-      text: `${d.conflictFile} 这个文件在电脑和云端都被改过，请选择保留哪一个`,
+      text: `${d.conflictFile} 在本地与云端均被修改，请选择保留的版本`,
       actionLabel: '处理',
       onAction: handleConflict,
       dismissible: true,
@@ -275,10 +308,10 @@ const alertStrips = computed<AlertStrip[]>(() => {
       key: 'plugin-unavailable',
       tone: 'warn',
       title: d.pluginSyncInfo?.reason || '',
-      text: d.pluginSyncInfo?.reason || '本机还没有找到 ZTools 插件目录，等 ZTools 创建后会自动开始同步',
+      text: d.pluginSyncInfo?.reason || '未在本机找到 ZTools 插件目录，目录创建后将自动开始同步',
       dismissible: true,
       onDismiss: () => {
-        store.state.prefs.pluginUnavailableDismissed = true
+        store.state.prefs.pluginUnavailableDismissed = props.dir.pluginSyncInfo?.reason || 'unavailable'
       },
     })
   }
@@ -311,7 +344,7 @@ const alertStrips = computed<AlertStrip[]>(() => {
     out.push({
       key: 'root-lost',
       tone: 'error',
-      text: '云端的同步文件夹不见了，同步已暂停，等你确认是重新上传还是删除本地文件',
+      text: '云端同步文件夹丢失，同步已暂停，请选择重新上传或删除本地文件',
       actionLabel: '处理',
       onAction: openRootLost,
     })
@@ -322,8 +355,8 @@ const alertStrips = computed<AlertStrip[]>(() => {
       tone: 'warn',
       text:
         pendingDeleteOpen.value > 0
-          ? `${pendingOpen.value} 项等你处理（其中 ${pendingDeleteOpen.value} 项是删除，你确认前不会删除任何文件）`
-          : `${pendingOpen.value} 个文件两边都被改过，等你选择保留哪个`,
+          ? `${pendingOpen.value} 项待处理（其中 ${pendingDeleteOpen.value} 项为删除操作，确认前不会删除任何文件）`
+          : `${pendingOpen.value} 个文件在本地与云端均被修改，请选择保留的版本`,
       actionLabel: '处理',
       onAction: () => {
         pendingOpenModal.value = true
@@ -353,12 +386,12 @@ function onCancelSync() {
         <div class="dir-title flex items-center gap-[6px]">
           <span class="truncate text-[13px] font-semibold text-ink-1 leading-[1.25]">{{ dir.name }}</span>
           <!-- 插件同步虚拟行：目录由 ZTools 自动发现，标注「自动」并悬浮说明 -->
-          <span v-if="isPlugin" class="auto-badge" title="这个文件夹由 ZTools 自动发现，包含已安装的全部插件，不能修改">自动</span>
+          <span v-if="isPlugin" class="auto-badge" title="该文件夹由 ZTools 自动发现，包含已安装的全部插件，不可修改">自动</span>
         </div>
-        <div class="dir-path font-mono text-[11px] text-ink-2 truncate" :title="isPlugin ? `${dir.localPath}（ZTools 自动发现）` : dir.localPath">{{ dir.localPath }}</div>
+        <div class="dir-path font-mono text-[11px] text-ink-2 truncate select-text" :title="isPlugin ? `${dir.localPath}（ZTools 自动发现）` : dir.localPath">{{ dir.localPath }}</div>
         <div class="dir-path flex items-center gap-[5px]">
-          <AppIcon name="cloud" :size="12" class="text-ink-4" />
-          <span class="font-mono text-[11px] text-ink-3 truncate" :title="isPlugin ? `${dir.remotePath}（按操作系统分开存放，避免互相同步不兼容的插件）` : dir.remotePath">{{ dir.remotePath }}</span>
+          <AppIcon name="cloud" :size="12" class="text-ink-4 shrink-0" />
+          <span class="font-mono text-[11px] text-ink-3 truncate select-text" :title="isPlugin ? `${dir.remotePath}（按操作系统分开存放，避免互相同步不兼容的插件）` : dir.remotePath">{{ dir.remotePath }}</span>
         </div>
       </div>
       <div class="flex items-center gap-[10px] shrink-0 self-center">
@@ -432,7 +465,7 @@ function onCancelSync() {
                   type="button"
                   class="mi"
                   :disabled="!enabled || syncing"
-                  title="把云端多出的内容补到电脑：下载云端新增或有变化的文件，恢复你在电脑上删除的文件。不删除电脑上的任何文件，不覆盖你在电脑上改过的内容（两边都改过的会问你保留哪个）"
+                  title="把云端多出的内容补到电脑：下载云端新增或有变化的文件，恢复在电脑上被删除的文件。不删除电脑上的任何文件，不覆盖电脑上修改过的内容（两侧均修改的文件将弹出询问）"
                   @click="onOneWaySync(close, 'pull')"
                 >
                   <AppIcon name="download" :size="13" class="mi-ic" />
@@ -442,7 +475,7 @@ function onCancelSync() {
                   type="button"
                   class="mi"
                   :disabled="!enabled || syncing"
-                  title="以云端为准，把电脑上的文件夹完全恢复成云端的样子：云端没有的本地文件会被删除，内容与云端不一致的以云端版本覆盖（本地未同步的修改会丢失）。要删除的文件数量偏多时会先请你确认"
+                  title="以云端为准，把电脑上的文件夹完全恢复成云端的样子：云端没有的本地文件会被删除，内容与云端不一致的以云端版本覆盖（本地未同步的修改会丢失）。删除数量超过阈值时会先请求确认"
                   @click="onOneWaySync(close, 'pull-full')"
                 >
                   <AppIcon name="download" :size="13" class="mi-ic" />
@@ -454,7 +487,7 @@ function onCancelSync() {
                   type="button"
                   class="mi"
                   :disabled="!enabled || syncing"
-                  title="把电脑上多出的内容补到云端：上传本地新增或有变化的文件，恢复云端被删除的文件。不删除云端的任何文件，不覆盖云端改过的内容（两边都改过的会问你保留哪个）"
+                  title="把电脑上多出的内容补到云端：上传本地新增或有变化的文件，恢复云端被删除的文件。不删除云端的任何文件，不覆盖云端修改过的内容（两侧均修改的文件将弹出询问）"
                   @click="onOneWaySync(close, 'push')"
                 >
                   <AppIcon name="upload" :size="13" class="mi-ic" />
@@ -464,7 +497,7 @@ function onCancelSync() {
                   type="button"
                   class="mi"
                   :disabled="!enabled || syncing"
-                  title="以电脑为准，把云端文件夹完全恢复成本地的样子：本地没有的云端文件会被删除，内容与本地不一致的以本地版本覆盖（云端未同步的修改会丢失）。要删除的文件数量偏多时会先请你确认"
+                  title="以电脑为准，把云端文件夹完全恢复成本地的样子：本地没有的云端文件会被删除，内容与本地不一致的以本地版本覆盖（云端未同步的修改会丢失）。删除数量超过阈值时会先请求确认"
                   @click="onOneWaySync(close, 'push-full')"
                 >
                   <AppIcon name="upload" :size="13" class="mi-ic" />
@@ -551,8 +584,8 @@ function onCancelSync() {
     >
       <AppIcon name="warn" :size="14" :class="s.tone === 'error' ? 'text-danger shrink-0' : 'text-warning-icon'" />
       <span class="flex-1 min-w-0 flex flex-col gap-[1px]" :title="s.title">
-        <span class="truncate" :class="s.tone === 'error' ? 'text-[11px] text-[#b3261e]' : 'text-[11px] text-warning-deep'">{{ s.text }}</span>
-        <span v-if="s.subText" class="truncate text-[10px] text-[#b3261e] opacity-80">{{ s.subText }}</span>
+        <span class="truncate select-text" :class="s.tone === 'error' ? 'text-[11px] text-danger-deep' : 'text-[11px] text-warning-deep'">{{ s.text }}</span>
+        <span v-if="s.subText" class="truncate text-[10px] text-danger-deep opacity-80 select-text">{{ s.subText }}</span>
       </span>
       <button
         v-if="s.actionLabel"
@@ -592,16 +625,49 @@ function onCancelSync() {
         >
           <div class="flex flex-col gap-[10px]">
             <p class="m-0 text-[12px] text-ink-2 leading-[1.55]">
-              移除后这个文件夹不再自动同步，也不会出现在同步列表里；电脑和云端的文件都不会被删除，之后想继续同步可以重新添加。
+              移除后该文件夹不再自动同步，也不会再出现在同步列表中；电脑与云端的文件均不会被删除，之后可重新添加恢复同步。
             </p>
             <div v-if="removeArmed" class="armed-note">
               <AppIcon name="warn" :size="12" class="shrink-0 text-danger" />
-              <span>再点一次「确认移除」。电脑和云端的文件都不会被删除</span>
+              <span>再次点击「确认移除」。电脑与云端的文件均不会被删除</span>
             </div>
           </div>
           <template #footer>
             <AppButton size="sm" @click="removeOpen = false">取消</AppButton>
             <AppButton size="sm" :variant="removeArmed ? 'danger' : 'primary'" @click="confirmRemove">{{ removeArmed ? '确认移除' : '移除同步' }}</AppButton>
+          </template>
+        </AppModal>
+      </Transition>
+    </Teleport>
+
+    <!-- 覆盖档单向同步确认弹窗（云端覆盖本地 / 本地覆盖云端）：覆盖不可逆，先亮出
+         后果再执行；删除类改动仍由引擎的删除安全闸兜底（阈值挂起 / 回收站） -->
+    <Teleport to="body">
+      <Transition name="modal-pop">
+        <AppModal
+          v-if="fullSyncOp"
+          :title="fullSyncOp === 'pull-full' ? '云端覆盖本地' : '本地覆盖云端'"
+          :subtitle="dir.name"
+          :width="420"
+          @close="fullSyncOp = null"
+        >
+          <div class="flex flex-col gap-[10px]">
+            <p class="m-0 text-[12px] text-ink-2 leading-[1.55]">
+              <template v-if="fullSyncOp === 'pull-full'">
+                将以云端为准，把电脑上的文件夹恢复成云端的样子：云端没有的本地文件会被删除（先移入系统回收站），内容与云端不一致的文件会被云端版本覆盖，电脑上未同步的修改会丢失。
+              </template>
+              <template v-else>
+                将以电脑为准，把云端文件夹恢复成本地的样子：本地没有的云端文件会被删除（删除数量超过阈值时会先请求确认），内容与本地不一致的文件会被本地版本覆盖，云端上未同步的修改会丢失且无法找回。
+              </template>
+            </p>
+            <div v-if="fullArmed" class="armed-note">
+              <AppIcon name="warn" :size="12" class="shrink-0 text-danger" />
+              <span>再次点击「确认覆盖」。被删除的文件可从回收站找回；被覆盖一侧未同步的修改无法恢复</span>
+            </div>
+          </div>
+          <template #footer>
+            <AppButton size="sm" @click="fullSyncOp = null">取消</AppButton>
+            <AppButton size="sm" :variant="fullArmed ? 'danger' : 'primary'" @click="confirmFullSync">{{ fullArmed ? '确认覆盖' : '开始覆盖同步' }}</AppButton>
           </template>
         </AppModal>
       </Transition>
@@ -614,7 +680,7 @@ function onCancelSync() {
   transition: background-color 0.15s ease;
 
   &:hover {
-    background: #fafbfc;
+    background: var(--bg-bar);
   }
 }
 
@@ -810,10 +876,10 @@ function onCancelSync() {
   gap: 7px;
   padding: 8px 10px;
   border-radius: 6px;
-  background: var(--red-strip-bg, #fdf0ef);
-  border: 1px solid var(--red-strip-br, #f3cfcb);
+  background: var(--red-strip-bg);
+  border: 1px solid var(--red-strip-br);
   font-size: 11px;
-  color: #b3261e;
+  color: var(--red-deep);
   line-height: 1.45;
 }
 
@@ -844,7 +910,7 @@ function onCancelSync() {
   }
 
   &:hover:not(:disabled) {
-    background: #f1f3f6;
+    background: var(--bg-seg);
 
     .mi-ic {
       color: var(--text-1);

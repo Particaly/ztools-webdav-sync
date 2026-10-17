@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import RemoteDirModal from '../components/RemoteDirModal.vue'
-import { AppButton, AppIconButton, AppInput, AppSelect, AppSwitch, InfoTip } from '../components/ui'
+import { AppButton, AppIconButton, AppInput, AppModal, AppSelect, AppSwitch, InfoTip } from '../components/ui'
 import { useStore, defaultPrefs, tierLabel, tierHint, serverLabel } from '../composables/store'
 import type { DavServerEntry, ZtoolsPluginsSyncDesc } from '../env.d'
 import { toast } from '../composables/toast'
@@ -34,9 +34,13 @@ function addServer() {
 /**
  * 删除当前服务器：最后一台不可删（改为提示清空）；仍有同步目录使用时明确
  * 拒绝 —— 静默把这些目录改连另一台服务器是危险操作（远端路径不存在会触发
- * 「云端文件夹丢失」保护）。删除的只是配置，不动电脑与云端文件。
+ * 「云端文件夹丢失」保护）。入口先经确认弹窗（删除动作会清掉地址 / 账号等
+ * 配置，误点直接删要重输）。删除的只是配置，不动电脑与云端文件。
  */
+const removeConfirmOpen = ref(false)
+
 function removeActiveServer() {
+  removeConfirmOpen.value = false
   store.removeServer(s.activeServerId)
 }
 
@@ -158,10 +162,10 @@ const capabilityHintTitle = computed(() => {
   return `${c.writeReason}${c.writeRetrySoon ? '，稍后会自动重新检测' : ''}`
 })
 
-/** 云端占用展示：由各目录最近扫描字节（Σ lastBytesTotal）派生，无数据时占位「—」 */
+/** 云端占用展示：由各目录最近扫描字节（Σ lastBytesTotal）派生的估算值，无数据时占位「—」 */
 const cloudUsageText = computed(() => {
   const bytes = store.cloudBytes.value
-  return bytes > 0 ? fmtBytes(bytes) : '—'
+  return bytes > 0 ? `约 ${fmtBytes(bytes)}` : '—'
 })
 
 const lastSyncText = computed(() => fmtRelTime(store.lastSyncAt.value))
@@ -389,30 +393,65 @@ function confirmDefaultDir(path: string) {
   toast.success('默认云端文件夹已更新', p)
 }
 
+// ---------- 高级设置折叠区（证书信任 / 限速 / 代理等服务器网络层配置） ----------
+
+/** 高级设置折叠区展开状态：默认收起 —— 常用路径只留服务器 / 账号 / 默认云端文件夹 */
+const advOpen = ref(false)
+
 /**
- * 打开功能测试目录选择器（与默认云端文件夹的浏览入口同一形态）。
- * 确认选择由 confirmProbeDir 落地：持久化并自动以新目录执行一次功能测试；
- * 未填服务器地址时直接提示，避免必然失败的目录列表请求。
+ * 高级设置中已改为非默认值的项数（收起时的徽标提示，0 = 全部默认不显示）：
+ * 信任开关 / CA 证书 / 上传与下载限速 / 显式请求频率（含 0 = 明确不限） / 代理。
  */
-function browseProbeDir() {
-  if (!s.server.serverUrl.trim()) {
-    toast.warning('请先填写服务器地址', '填写 WebDAV 地址后再选择测试目录')
-    return
-  }
-  s.showProbeDirPicker = true
+const advConfiguredCount = computed(() => {
+  const t = s.server.tls
+  const n = s.server.netOpts
+  let count = 0
+  if (t?.trustServerCertificate === true) count++
+  if (t?.caPem?.trim()) count++
+  if (typeof n?.uploadKBps === 'number' && n.uploadKBps > 0) count++
+  if (typeof n?.downloadKBps === 'number' && n.downloadKBps > 0) count++
+  if (typeof n?.ratePerSec === 'number' && Number.isFinite(n.ratePerSec)) count++
+  if (String(n?.proxyUrl ?? '').trim()) count++
+  return count
+})
+
+// 高级设置展开 / 收起的高度过渡（JS 钩子设定显式 height，与 DirFormModal 同款）
+
+/** 展开动画：高度从 0 过渡到内容实际高度 */
+function onAdvEnter(el: Element) {
+  const h = el as HTMLElement
+  h.style.height = '0'
+  void h.offsetHeight // 强制回流，让起始高度先生效，过渡才能触发
+  h.style.height = `${h.scrollHeight}px`
+}
+
+/** 展开结束：清除显式高度，交还给内容自适应（避免后续内容变化被固定高度截断） */
+function onAdvAfterEnter(el: Element) {
+  ;(el as HTMLElement).style.height = ''
+}
+
+/** 收起动画：先固定为当前内容高度，再过渡到 0 */
+function onAdvLeave(el: Element) {
+  const h = el as HTMLElement
+  h.style.height = `${h.scrollHeight}px`
+  void h.offsetHeight
+  h.style.height = '0'
+}
+
+/** 收起结束：清除显式高度（元素已被 v-show 隐藏） */
+function onAdvAfterLeave(el: Element) {
+  ;(el as HTMLElement).style.height = ''
 }
 
 function restoreDefaults() {
+  // 恢复默认会关闭实验开关（ztoolsPluginSync 回 false）：等价退出插件同步
+  //（电脑与云端文件都不删），点名提示避免「实验行悄悄消失」的困惑
+  const hadPluginSync = s.prefs.ztoolsPluginSync === true
   Object.assign(s.prefs, defaultPrefs())
-}
-
-function save() {
-  store.persist()
-  s.saved = true
-  toast.success('设置已保存', '所有修改均已生效')
-  setTimeout(() => {
-    s.saved = false
-  }, 1600)
+  toast.success(
+    '已恢复默认设置',
+    hadPluginSync ? '全部设置回到默认值；「ZTools 插件同步」实验已关闭（电脑与云端的文件不受影响）' : '全部设置回到默认值'
+  )
 }
 </script>
 
@@ -433,7 +472,7 @@ function save() {
       <span v-if="s.testResult" class="inline-flex min-w-0 max-w-full items-center gap-[5px] text-[11px] text-ink-2" :title="testResultText">
         <AppIcon v-if="s.testResult.ok" name="check-circle" :size="12" bg="var(--green-bg)" class="text-success shrink-0" />
         <AppIcon v-else name="warn" :size="12" class="text-warning-icon shrink-0" />
-        <span class="truncate">{{ testResultText }}</span>
+        <span class="truncate select-text">{{ testResultText }}</span>
       </span>
       <span v-if="capabilityText" class="inline-flex min-w-0 max-w-full items-center gap-[5px] text-[11px] text-ink-2">
         <AppIcon name="check-circle" :size="12" bg="var(--green-bg)" class="text-success shrink-0" />
@@ -474,7 +513,9 @@ function save() {
                     class="flex-1 min-w-0"
                   />
                   <span v-else class="flex-1 min-w-0 truncate text-[12px] text-ink-1">{{ serverOptions[0]?.label || '未命名' }}</span>
-                  <AppButton :disabled="s.servers.length <= 1" title="删除当前服务器" @click="removeActiveServer">删除</AppButton>
+                  <!-- 单台服务器不可删（删除按钮只在该情况下出现；至少保留一台供编辑）。
+                       删除先经确认弹窗（配置清除不可逆，凭据要重输） -->
+                  <AppButton v-if="s.servers.length > 1" title="删除当前服务器" @click="removeConfirmOpen = true">删除</AppButton>
                   <AppButton variant="primary" @click="addServer">添加</AppButton>
                 </div>
               </div>
@@ -507,67 +548,10 @@ function save() {
                   <AppInput v-model="s.server.password" icon="lock" type="password" sm placeholder="应用密码" />
                 </div>
               </div>
-              <!-- 证书信任（仅 https 地址显示）：自签名证书 NAS（群晖 / QNAP 等）的连接
-                   通道。信任开关 = 跳过校验（附安全提示）；CA 导入 = 追加信任自建根（校验照常） -->
-              <div v-if="isHttps" class="flex flex-col gap-[6px]">
-                <div class="pref-row flex items-center gap-3">
-                  <div class="flex items-center gap-[3px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">信任此服务器证书</span>
-                    <InfoTip text="服务器使用自签名证书（群晖、QNAP 等 NAS 常见）导致无法连接时可打开。打开后连接不再校验证书真伪，仅建议用于自己可控的服务器" />
-                  </div>
-                  <span class="flex-spacer" />
-                  <AppSwitch v-model="trustCertModel" />
-                </div>
-                <div v-if="trustCertModel" class="flex items-start gap-[5px]">
-                  <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
-                  <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">已开启信任：连接不再校验服务器证书。若网络中有人假冒服务器，账号密码与文件内容可能被窃取，请仅在可控网络中使用</span>
-                </div>
-                <div class="pref-row flex items-center gap-3">
-                  <div class="flex items-center gap-[3px] min-w-0">
-                    <span class="text-[12px] font-medium text-ink-1">CA 证书</span>
-                    <InfoTip text="自建 CA 签发证书的服务器可导入 CA 根证书（PEM 格式）：照常完整校验证书链，比「信任此服务器证书」更安全" />
-                  </div>
-                  <span class="flex-spacer" />
-                  <template v-if="caImported">
-                    <span class="text-[11px] font-medium text-success-deep shrink-0">已导入</span>
-                    <AppButton @click="removeCa">移除</AppButton>
-                  </template>
-                  <AppButton v-else @click="importCa">导入…</AppButton>
-                </div>
-              </div>
-              <!-- 带宽限速与代理（当前服务器的网络层配置）：限速限的是这台服务器的
-                   传输总量（上传 / 下载各自独立）；代理用于公司内网等直连不可达的场景 -->
-              <div class="flex gap-[10px]">
-                <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
-                  <div class="flex items-center gap-[3px]">
-                    <span class="text-[11px] font-medium text-ink-2">上传限速</span>
-                    <InfoTip text="上传到这台服务器的总带宽上限（KB/s），同一服务器的多个文件夹共享该额度；留空或 0 表示不限制。修改立即生效，正在同步中的文件也会按新限速执行" />
-                  </div>
-                  <AppInput v-model="uploadKBpsInput" sm type="number" placeholder="不限" />
-                </div>
-                <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
-                  <div class="flex items-center gap-[3px]">
-                    <span class="text-[11px] font-medium text-ink-2">下载限速</span>
-                    <InfoTip text="从这台服务器下载的总带宽上限（KB/s），口径同上传限速；修改立即生效" />
-                  </div>
-                  <AppInput v-model="downloadKBpsInput" sm type="number" placeholder="不限" />
-                </div>
-              </div>
-              <div class="flex flex-col gap-[6px]">
-                <div class="flex items-center gap-[3px]">
-                  <span class="text-[11px] font-medium text-ink-2">代理服务器</span>
-                  <InfoTip text="公司内网等无法直连云端时可填 HTTP 代理（如 http://127.0.0.1:7890，可带 user:pass@ 认证）；https 连接经隧道端到端加密，代理看不到内容；留空 = 直连" />
-                </div>
-                <AppInput v-model="proxyUrlInput" icon="globe" mono sm placeholder="留空 = 直连" />
-                <div v-if="proxyInvalid" class="flex items-start gap-[5px]">
-                  <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
-                  <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">代理地址需以 http:// 或 https:// 开头，当前填写不会被使用</span>
-                </div>
-              </div>
               <div class="flex flex-col gap-[6px]">
                 <div class="flex items-center gap-[3px]">
                   <span class="text-[11px] font-medium text-ink-2">默认云端文件夹</span>
-                  <InfoTip text="添加同步目录时自动填入的云端位置；留空则以本地文件夹名作为云端目录名" />
+                  <InfoTip text="添加同步目录时自动填入的云端位置；留空则以本地文件夹名作为云端目录名。功能测试也在该文件夹内实测（优先用已成功同步的目录）" />
                 </div>
                 <div class="flex gap-2">
                   <AppInput
@@ -581,25 +565,102 @@ function save() {
                   <AppButton @click="browseDefaultDir">浏览…</AppButton>
                 </div>
               </div>
-              <!-- 测试目录：功能测试写权限的实测目标（服务器各子树写权限可能不同，
-                   根目录不一定可写），形态与默认云端文件夹一致；留空时首次点击
-                   「功能测试」会先弹目录选择器 -->
+              <!-- 高级设置：证书信任（自签名 NAS）、带宽限速、请求频率限制与代理
+                   等服务器网络层配置 —— 多数用户无需修改，默认收起；徽标提示已改过
+                   默认值的项数。测试目录不再单独配置：功能测试的目标由
+                   resolveProbeDir 按已同步目录 / 默认云端文件夹动态推导 -->
               <div class="flex flex-col gap-[6px]">
                 <div class="flex items-center gap-[3px]">
-                  <span class="text-[11px] font-medium text-ink-2">测试目录</span>
-                  <InfoTip text="功能测试会在该文件夹内实际创建并删除一个临时文件夹来检测服务器能力；WebDAV 服务器不一定所有目录都允许写入，请选择一个可写的文件夹" />
+                  <button type="button" class="adv-header" @click="advOpen = !advOpen">
+                    <AppIcon name="chevron-right" :size="11" class="adv-chev" :class="{ open: advOpen }" />
+                    <span class="text-[12px] font-medium text-ink-1">高级设置</span>
+                    <span v-if="advConfiguredCount" class="adv-badge">已配置 {{ advConfiguredCount }} 项</span>
+                  </button>
+                  <InfoTip text="证书信任（自签名 NAS 的 https 连接）、上传 / 下载限速、请求频率限制与代理服务器。多数用户无需修改" />
                 </div>
-                <div class="flex gap-2">
-                  <AppInput
-                    v-model="s.prefs.probeRemoteDir"
-                    icon="cloud"
-                    mono
-                    sm
-                    class="flex-1 min-w-0"
-                    placeholder="/Sync"
-                  />
-                  <AppButton @click="browseProbeDir">浏览…</AppButton>
-                </div>
+                <!-- 高度过渡：JS 钩子设定显式 height（0 ↔ scrollHeight），展开 / 收起均平滑；
+                     name 用于生成 adv-enter-active / adv-leave-active 类，与底部样式对应 -->
+                <Transition
+                  name="adv"
+                  @enter="onAdvEnter"
+                  @after-enter="onAdvAfterEnter"
+                  @leave="onAdvLeave"
+                  @after-leave="onAdvAfterLeave"
+                >
+                  <div v-show="advOpen" class="flex flex-col gap-[10px]">
+                    <!-- 证书信任（仅 https 地址显示）：自签名证书 NAS（群晖 / QNAP 等）的连接
+                         通道。信任开关 = 跳过校验（附安全提示）；CA 导入 = 追加信任自建根（校验照常） -->
+                    <div v-if="isHttps" class="flex flex-col gap-[6px]">
+                      <div class="pref-row flex items-center gap-3">
+                        <div class="flex items-center gap-[3px] min-w-0">
+                          <span class="text-[12px] font-medium text-ink-1">信任此服务器证书</span>
+                          <InfoTip text="服务器使用自签名证书（群晖、QNAP 等 NAS 常见）导致无法连接时可打开。打开后连接不再校验证书真伪，仅建议用于自己可控的服务器" />
+                        </div>
+                        <span class="flex-spacer" />
+                        <AppSwitch v-model="trustCertModel" />
+                      </div>
+                      <div v-if="trustCertModel" class="flex items-start gap-[5px]">
+                        <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
+                        <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">已开启信任：连接不再校验服务器证书。若网络中有人假冒服务器，账号密码与文件内容可能被窃取，请仅在可控网络中使用</span>
+                      </div>
+                      <div class="pref-row flex items-center gap-3">
+                        <div class="flex items-center gap-[3px] min-w-0">
+                          <span class="text-[12px] font-medium text-ink-1">CA 证书</span>
+                          <InfoTip text="自建 CA 签发证书的服务器可导入 CA 根证书（PEM 格式）：照常完整校验证书链，比「信任此服务器证书」更安全" />
+                        </div>
+                        <span class="flex-spacer" />
+                        <template v-if="caImported">
+                          <span class="text-[11px] font-medium text-success-deep shrink-0">已导入</span>
+                          <AppButton @click="removeCa">移除</AppButton>
+                        </template>
+                        <AppButton v-else @click="importCa">导入…</AppButton>
+                      </div>
+                    </div>
+                    <!-- 带宽限速（当前服务器的网络层配置）：限速限的是这台服务器的
+                         传输总量（上传 / 下载各自独立）；修改立即生效 -->
+                    <div class="flex gap-[10px]">
+                      <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
+                        <div class="flex items-center gap-[3px]">
+                          <span class="text-[11px] font-medium text-ink-2">上传限速</span>
+                          <InfoTip text="上传到这台服务器的总带宽上限（KB/s），同一服务器的多个文件夹共享该额度；留空或 0 表示不限制。修改立即生效，正在同步中的文件也会按新限速执行" />
+                        </div>
+                        <AppInput v-model="uploadKBpsInput" sm type="number" placeholder="不限" />
+                      </div>
+                      <div class="flex-1 min-w-0 flex flex-col gap-[6px]">
+                        <div class="flex items-center gap-[3px]">
+                          <span class="text-[11px] font-medium text-ink-2">下载限速</span>
+                          <InfoTip text="从这台服务器下载的总带宽上限（KB/s），口径同上传限速；修改立即生效" />
+                        </div>
+                        <AppInput v-model="downloadKBpsInput" sm type="number" placeholder="不限" />
+                      </div>
+                    </div>
+                    <!-- 请求限速：server.netOpts.ratePerSec；档案命中时给出默认值提示 -->
+                    <div class="pref-row flex items-center gap-3">
+                      <div class="flex items-center gap-[3px] min-w-0">
+                        <span class="text-[12px] font-medium text-ink-1">请求频率限制</span>
+                        <InfoTip text="每秒向服务器发起的最大请求数，0 表示不限制；检测到坚果云等有频率配额的服务时会自动应用默认限速" />
+                      </div>
+                      <span class="flex-spacer" />
+                      <AppInput v-model="ratePerSecInput" sm type="number" class="!w-[104px]" :placeholder="ratePlaceholder" />
+                    </div>
+                    <div v-if="rateHint" class="flex items-start gap-[5px]">
+                      <AppIcon name="info" :size="11" class="text-ink-4 shrink-0 mt-[2px]" />
+                      <span class="text-[11px] text-ink-4 leading-[1.5]">{{ rateHint }}</span>
+                    </div>
+                    <!-- 代理：公司内网等直连不可达的场景 -->
+                    <div class="flex flex-col gap-[6px]">
+                      <div class="flex items-center gap-[3px]">
+                        <span class="text-[11px] font-medium text-ink-2">代理服务器</span>
+                        <InfoTip text="公司内网等无法直连云端时可填 HTTP 代理（如 http://127.0.0.1:7890，可带 user:pass@ 认证）；https 连接经隧道端到端加密，代理看不到内容；留空 = 直连" />
+                      </div>
+                      <AppInput v-model="proxyUrlInput" icon="globe" mono sm placeholder="留空 = 直连" />
+                      <div v-if="proxyInvalid" class="flex items-start gap-[5px]">
+                        <AppIcon name="warn" :size="11" class="text-warning-icon shrink-0 mt-[2px]" />
+                        <span class="flex-1 min-w-0 text-[11px] text-warning-icon leading-[1.5]">代理地址需以 http:// 或 https:// 开头，当前填写不会被使用</span>
+                      </div>
+                    </div>
+                  </div>
+                </Transition>
               </div>
               <!-- 操作行：两个测试入口右对齐，结果统一在卡片标题右侧展示 -->
               <div class="flex items-center justify-end gap-[10px]">
@@ -680,19 +741,6 @@ function save() {
                 </div>
                 <span class="flex-spacer" />
                 <AppSelect v-model="s.prefs.concurrency" :options="concurrencyOptions" :width="104" />
-              </div>
-              <!-- 请求限速：server.netOpts.ratePerSec；档案命中时给出默认值提示 -->
-              <div class="pref-row flex items-center gap-3">
-                <div class="flex items-center gap-[3px] min-w-0">
-                  <span class="text-[12px] font-medium text-ink-1">请求频率限制</span>
-                  <InfoTip text="每秒向服务器发起的最大请求数，0 表示不限制；检测到坚果云等有频率配额的服务时会自动应用默认限速" />
-                </div>
-                <span class="flex-spacer" />
-                <AppInput v-model="ratePerSecInput" sm type="number" class="!w-[104px]" :placeholder="ratePlaceholder" />
-              </div>
-              <div v-if="rateHint" class="flex items-start gap-[5px]">
-                <AppIcon name="info" :size="11" class="text-ink-4 shrink-0 mt-[2px]" />
-                <span class="text-[11px] text-ink-4 leading-[1.5]">{{ rateHint }}</span>
               </div>
               <!-- 防多设备同时同步（目录租约锁）：说明细节收进气泡 -->
               <div class="pref-row flex items-center gap-3">
@@ -780,15 +828,15 @@ function save() {
             <div class="px-[14px] py-[10px]">
               <div class="flex items-center justify-between py-[4px]">
                 <span class="text-[11px] text-ink-2">同步文件夹</span>
-                <span class="font-mono text-[11px] font-medium text-ink-1">{{ s.dirs.length }} 个</span>
+                <span class="font-mono text-[11px] font-medium text-ink-1 select-text">{{ s.dirs.length }} 个</span>
               </div>
               <div class="flex items-center justify-between py-[4px]">
                 <span class="text-[11px] text-ink-2">上次同步</span>
-                <span class="font-mono text-[11px] font-medium text-ink-1">{{ lastSyncText }}</span>
+                <span class="font-mono text-[11px] font-medium text-ink-1 select-text">{{ lastSyncText }}</span>
               </div>
               <div class="flex items-center justify-between py-[4px]">
-                <span class="text-[11px] text-ink-2">云端占用</span>
-                <span class="font-mono text-[11px] font-medium text-ink-1">{{ cloudUsageText }}</span>
+                <span class="text-[11px] text-ink-2" title="按各同步文件夹最近一次扫描统计的文件总大小（本地侧估算），不是服务器的配额；云端剩余空间在主页服务器卡片展示">同步文件大小</span>
+                <span class="font-mono text-[11px] font-medium text-ink-1 select-text" title="按各同步文件夹最近一次扫描统计的文件总大小（本地侧估算）">{{ cloudUsageText }}</span>
               </div>
             </div>
           </section>
@@ -796,13 +844,13 @@ function save() {
       </div>
     </main>
 
-    <!-- 底部操作 -->
+    <!-- 底部：设置经 v-model 直连 + 深度 watch 自动防抖持久化（无「保存」步骤，
+         修改即生效即落盘），所以只有「恢复默认」一个动作 -->
     <footer class="flex items-center gap-[10px] h-[52px] px-5 bg-fill-bar border-t border-solid border-line-bar shrink-0">
       <AppIcon name="info" :size="13" class="text-ink-4" />
-      <span class="text-[11px] text-ink-2">{{ s.saved ? '设置已保存' : '设置修改后立即生效' }}</span>
+      <span class="text-[11px] text-ink-2">设置修改后立即生效并自动保存</span>
       <span class="flex-spacer" />
       <AppButton @click="restoreDefaults">恢复默认</AppButton>
-      <AppButton variant="primary" strong pad="0 14px" @click="save">保存设置</AppButton>
     </footer>
 
     <!-- 弹窗：远端目录选择（默认 WebDAV 目录的浏览入口） -->
@@ -813,19 +861,6 @@ function save() {
         :initial-path="s.prefs.defaultRemoteDir"
         @pick="confirmDefaultDir"
         @close="showDirPicker = false"
-      />
-    </Transition>
-
-    <!-- 弹窗：功能测试目录选择（首次功能测试的引导 + 「修改测试目录」入口共用；
-         确认后由 confirmProbeDir 持久化并自动以新目录执行一次功能测试） -->
-    <Transition name="modal-pop">
-      <RemoteDirModal
-        v-if="s.showProbeDirPicker"
-        title="选择功能测试目录"
-        subtitle="功能测试会在所选文件夹内创建并删除临时文件来检测服务器能力，请选择一个允许写入的文件夹"
-        :initial-path="s.prefs.probeRemoteDir"
-        @pick="store.confirmProbeDir"
-        @close="s.showProbeDirPicker = false"
       />
     </Transition>
 
@@ -841,6 +876,26 @@ function save() {
         @close="showPluginDirPicker = false"
       />
     </Transition>
+
+    <!-- 弹窗：删除当前服务器的确认（删除只清配置，电脑与云端文件不受影响；
+         「使用中」的拒绝由 store.removeServer 负责，确认后触发时以 toast 提示） -->
+    <Transition name="modal-pop">
+      <AppModal
+        v-if="removeConfirmOpen"
+        title="删除服务器"
+        :subtitle="serverLabel(s.server, s.servers.findIndex((sv) => sv.id === s.activeServerId))"
+        :width="400"
+        @close="removeConfirmOpen = false"
+      >
+        <p class="m-0 text-[12px] text-ink-2 leading-[1.55]">
+          将删除这台服务器的连接配置（地址、账号、密码与限速、代理等设置）。电脑与云端的文件不受影响，之后可重新添加。
+        </p>
+        <template #footer>
+          <AppButton size="sm" @click="removeConfirmOpen = false">取消</AppButton>
+          <AppButton size="sm" variant="danger" @click="removeActiveServer">删除</AppButton>
+        </template>
+      </AppModal>
+    </Transition>
   </div>
 </template>
 
@@ -853,6 +908,52 @@ function save() {
 /* 卡片节标题底部 ⇒ 分隔线：必须用单边 border（Uno 的 border-solid 会把未设宽度的其余三边按 medium 宽度画出） */
 .card-head {
   border-bottom: 1px solid var(--br-bar);
+}
+
+/* 高级设置折叠头：可点击整行展开 / 收起，悬停给底色反馈（与 DirFormModal 同款） */
+.adv-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+
+  &:hover {
+    background: var(--bg-seg);
+  }
+
+  .adv-chev {
+    color: var(--text-muted);
+    transition: transform 0.2s var(--ease-swift);
+
+    &.open {
+      transform: rotate(90deg);
+    }
+  }
+}
+
+/* 高级设置展开 / 收起的高度过渡：
+   时长写在这里供 Vue Transition 识别结束时机，高度值由 JS 钩子设定；
+   仅动画期间 overflow: hidden，动画结束即恢复，避免裁剪下拉浮层 */
+.adv-enter-active,
+.adv-leave-active {
+  overflow: hidden;
+  transition: height 0.28s cubic-bezier(0.33, 0, 0.2, 1);
+}
+
+/* 折叠头右侧徽标：有已改为非默认值的高级项时提示（收起时也可见） */
+.adv-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-badge);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--blue);
 }
 
 /* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌），等宽字体便于编辑 glob */
@@ -875,7 +976,7 @@ function save() {
   }
 
   &:hover {
-    border-color: #c9d0d7;
+    border-color: var(--br-input-hover);
   }
 
   &:focus {

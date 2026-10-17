@@ -89,22 +89,41 @@ export function opText(op: string | undefined): string | null {
   }
 }
 
-/** 轮次结果文案 */
+/**
+ * 轮次结果文案：简略行状态列的短文案（列宽固定、跨行纵向对齐的前提），
+ * partial / yielded 的具体解释由 roundNote 下沉到第二行。
+ */
 export function statusText(r: SyncLogEntry): string {
   switch (r.status) {
     case 'ok':
       return '同步完成'
     case 'partial':
-      return '部分完成，有事项等你处理'
+      return '部分完成'
     case 'error':
       return '同步失败'
     case 'cancelled':
       return '已取消'
     case 'yielded':
-      return '另一台设备正在同步，本次等待'
+      return '已跳过'
     default:
       return r.status
   }
+}
+
+/**
+ * 简略行第二行的补充说明：状态列保持短文案，长解释下沉到这行 ——
+ * partial 列出具体待处理事项（与轮末摘要同口径）、yielded 说明让出原因，
+ * 其余状态没有补充（error 的首条原因由调用方单列红字）。
+ */
+export function roundNote(r: SyncLogEntry): string {
+  if (r.status === 'partial') {
+    const parts: string[] = []
+    if (r.deferredConflicts > 0) parts.push(`${r.deferredConflicts} 个冲突待选择`)
+    if (r.deleteHeld > 0) parts.push(`${r.deleteHeld} 项删除待确认`)
+    return parts.join('、')
+  }
+  if (r.status === 'yielded') return '另一台设备正在同步，本次未做任何改动'
+  return ''
 }
 
 /** 轮次结果的情绪色（行首状态点 / 文案着色用）：good 中性绿、warn 提示黄、bad 错误红、muted 灰 */
@@ -132,12 +151,12 @@ export function opLineText(o: SyncLogOp): string {
   if (o.op === 'download') return `${o.added ? '新增' : '更新'}了电脑文件`
   if (o.op === 'delete-local') return '删除了电脑文件'
   if (o.op === 'delete-remote') return '删除了云端文件'
-  if (o.op === 'rename-remote') return '在云端改名（内容未重传）'
-  if (o.op === 'rename-local') return '在电脑上改名（内容未重新下载）'
+  if (o.op === 'rename-remote') return '在云端重命名（内容未重传）'
+  if (o.op === 'rename-local') return '在电脑上重命名（内容未重新下载）'
   // 冲突条目：一句话写明选择与其落地动作 —— 本身即两侧改动的完整描述
   if (o.choice === 'local') return '冲突：保留电脑版本（已上传覆盖云端）'
   if (o.choice === 'remote') return '冲突：保留云端版本（已下载覆盖本地）'
-  if (o.choice === 'both') return '冲突：两个都保留（云端版本另存为副本）'
+  if (o.choice === 'both') return '冲突：同时保留（云端版本另存为副本）'
   return '冲突处理'
 }
 
@@ -186,7 +205,7 @@ export function fmtDuration(ms: number): string {
 /**
  * 演示场景（?demo=decisions）的同步记录样例：真实日志在磁盘侧（preload），
  * 浏览器预览读不到 —— 预览页面布局用的静态样例，覆盖成功 / 部分完成 / 失败 /
- * 冲突与决策等主要形态，与演示目录的挂起数据同构图。
+ * 让出 / 冲突与决策等主要形态，与演示目录的挂起数据同构图。
  */
 export function demoSyncRecords(): SyncRecordRow[] {
   const at = (minAgo: number) => Date.now() - minAgo * 60000
@@ -284,11 +303,31 @@ export function demoSyncRecords(): SyncRecordRow[] {
     },
     {
       type: 'round',
+      at: at(18),
+      endAt: at(18),
+      trigger: 'interval',
+      status: 'yielded',
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      adopted: 0,
+      deferredConflicts: 0,
+      deleteHeld: 0,
+      bytesUp: 0,
+      bytesDown: 0,
+      totalFiles: 342,
+      ops: [],
+      errors: [],
+      dirName: '归档记录',
+    },
+    {
+      type: 'round',
       at: at(60 * 5),
       endAt: at(60 * 5 - 40),
       trigger: 'backoff',
       status: 'error',
-      error: '连不上服务器，请检查网络后重试',
+      error: '无法连接服务器，请检查网络后重试',
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
@@ -325,6 +364,32 @@ export function demoSyncRecords(): SyncRecordRow[] {
       ],
       errors: [],
       dirName: '设计资源库',
+    },
+    {
+      type: 'round',
+      at: at(46),
+      endAt: at(46),
+      trigger: 'interval',
+      status: 'ok',
+      uploaded: 0,
+      downloaded: 3,
+      deleted: 0,
+      conflicts: 0,
+      adopted: 0,
+      // 轮末注册表对账的登记产出（registryAdopted 详尽视图展示行）
+      registryAdopted: ['剪贴板助手', '颜色拾取器'],
+      deferredConflicts: 0,
+      deleteHeld: 0,
+      bytesUp: 0,
+      bytesDown: 1024 * 180,
+      totalFiles: 9,
+      ops: [
+        { op: 'download', rel: '剪贴板助手/plugin.json', bytes: 480, added: true },
+        { op: 'download', rel: '剪贴板助手/dist/index.js', bytes: 1024 * 96, added: true },
+        { op: 'download', rel: '颜色拾取器-0.2.1-ab12cd34.asar', bytes: 1024 * 84, added: true },
+      ],
+      errors: [],
+      dirName: 'ZTools 插件',
     },
     {
       type: 'decision',
