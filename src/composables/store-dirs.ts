@@ -3,7 +3,7 @@
 // （runSync / syncDir / syncAll / 预演 / 取消）、目录增删改与覆盖、引擎参数组装
 // （dirSyncPrefs / dirEngineCfg）、「ZTools 插件同步」虚拟行的发现与登记表状态。
 import { state, conflictResolvers, cancelRequested, capStr, persist, schedulePersist, uid, baseName, suggestRemote, normalizeRemote, isPluginSyncDir, flushPersist, configured, MAX_LIST_ITEMS } from './store-core'
-import { ZTOOLS_PLUGINS_DIR_ID, resolveDirPrefs } from '../../src-ztools/preload/types.mts'
+import { ZTOOLS_PLUGINS_DIR_ID, pluginSyncExcludePatterns, resolveDirPrefs } from '../../src-ztools/preload/types.mts'
 import type { ConflictChoice, DavConfig, DirOverrides, Prefs, RegistryReconcileResult, SyncDir, SyncLogEntry, SyncMode, SyncSummary, ZtoolsPluginsSyncDesc } from '../env.d'
 import { toast } from './toast'
 import { MIN_INTERVAL_MIN } from './options'
@@ -32,10 +32,23 @@ export function dirIntervalMin(d: SyncDir): number {
  * 未覆盖的项回落全局偏好。优先级合并与畸形值防御统一在 types.mts 的
  * resolveDirPrefs —— 与 preload 调度器 prefsOf 同一函数（前后端单一口径，
  * 「无调度器直调引擎」与「调度器自动轮」两条路径同规则的前提）。
+ * 插件同步虚拟行的覆盖存于 prefs.ztoolsPluginSyncOverrides（「同步设置」弹窗
+ * 落点），excludePatterns 单独组装：全局规则 ∪ 记录级规则（未自定义时记录级取
+ * 内置默认的运行时数据库忽略）—— 与调度器合成 slot 同一组装函数
+ *（types.mts pluginSyncExcludePatterns），两路径同规则。
  * 限速（ratePerSec）不在其中：它属于网络层参数，经 dirEngineCfg 注入 netOpts。
  */
 export function dirSyncPrefs(d: SyncDir) {
-  return resolveDirPrefs(d.overrides, state.prefs)
+  const overrides = isPluginSyncDir(d)
+    ? {
+        ...(state.prefs.ztoolsPluginSyncOverrides ?? {}),
+        excludePatterns: pluginSyncExcludePatterns(
+          (state.prefs.ztoolsPluginSyncOverrides as { excludePatterns?: unknown } | null)?.excludePatterns ?? state.prefs.ztoolsPluginSyncExcludePatterns,
+          state.prefs.excludePatterns
+        ),
+      }
+    : d.overrides
+  return resolveDirPrefs(overrides, state.prefs)
 }
 
 /**
@@ -328,10 +341,17 @@ export async function latestDryRunRecord(dir: SyncDir): Promise<SyncLogEntry | n
 // 本地目录由 preload 自动发现（~/.ztools/plugins，用户不可修改）、远端目录 =
 // 用户可选的云端父目录（prefs.ztoolsPluginSyncRemoteDir，设置页「云端文件夹」）
 // 之后固定跟上 ztools-plugins/<platformKey> 两段。行与普通目录完全同构 —— 调度器
-// slot / 轮末事件 / 冲突与待处理面板经同一 id 通道流转；差异只有三点：
-//   1. 不持久化（persist 与 dirs watch 均过滤；调度器 reload 时按开关现场合成）；
-//   2. 配置不可修改（updateDir / setDirOverrides 对虚拟行 no-op，UI 也不给入口）；
-//   3. 启停走 prefs.ztoolsPluginSyncPaused（setDirEnabled 路由），删除即关开关。
+// slot / 轮末事件 / 冲突与待处理面板经同一 id 通道流转；差异只有四点：
+//   1. 不持久化到 dirs（persist 与 dirs watch 均过滤；调度器 reload 时按开关
+//      现场合成）；
+//   2. 身份字段不可修改（本地目录自动发现 / 远端按平台隔离 / 方式恒双向），
+//      但目录级设置与服务器可改（「同步设置」弹窗）—— 落 prefs 的
+//      ztoolsPluginSyncOverrides / ztoolsPluginSyncServerId（该记录唯一可
+//      持久化的目录级状态，调度器 reload 合成 slot 时按同组 prefs 重建）；
+//   3. 启停走 prefs.ztoolsPluginSyncPaused（setDirEnabled 路由），删除即关开关；
+//   4. 排除规则享有内置默认（运行时数据库三件套，见 types.mts），与全局规则
+//      叠加生效 —— 组装统一走 pluginSyncExcludePatterns（dirSyncPrefs 与调度器
+//      同一函数，两路径同规则）。
 
 /**
  * 维护「ZTools 插件同步」虚拟行：开关关闭时移除；开启时经 preload 的
@@ -357,6 +377,11 @@ export function refreshPluginSyncRow() {
   }
   if (!desc) return
   const enabled = state.prefs.ztoolsPluginSyncPaused !== true
+  // 目录级设置与服务器来自 prefs（「同步设置」弹窗的持久化落点）：行字段与
+  // prefs 始终同源 —— 保存路径（setDirOverrides / updateDir）双写保证即时响应，
+  // 本函数在 init / prefs 变化时重建同一映射
+  const overrides = (state.prefs.ztoolsPluginSyncOverrides as DirOverrides | null) ?? null
+  const serverId = state.prefs.ztoolsPluginSyncServerId || null
   if (idx >= 0) {
     const row = state.dirs[idx]
     row.name = 'ZTools 插件'
@@ -364,6 +389,8 @@ export function refreshPluginSyncRow() {
     row.remotePath = desc.remotePath
     row.mode = 'two-way'
     row.enabled = enabled
+    row.overrides = overrides
+    row.serverId = serverId
     // registrySync 是异步注入字段：重建 desc 时保留上次探测结果，避免提示条闪烁
     row.pluginSyncInfo = { ...desc, registrySync: row.pluginSyncInfo?.registrySync }
     return
@@ -381,6 +408,8 @@ export function refreshPluginSyncRow() {
     errorMessage: null,
     progress: null,
     enabled,
+    overrides,
+    serverId,
     pluginSyncInfo: desc,
   })
   void refreshPluginRegistryState()
@@ -503,27 +532,57 @@ export function setDirEnabled(id: string, enabled: boolean) {
   if (d) d.enabled = enabled
 }
 
-/** 写入目录级设置覆盖（自动同步 / 检查频率 / 冲突处理 / 忽略隐藏 / 并发 / 限速 / 租约锁 / 深度校验 / 排除规则）；虚拟行无目录级设置（no-op） */
+/**
+ * 写入目录级设置覆盖（自动同步 / 检查频率 / 冲突处理 / 忽略隐藏 / 并发 / 限速 /
+ * 租约锁 / 深度校验 / 排除规则）；插件同步虚拟行路由到 prefs.ztoolsPluginSyncOverrides
+ *（该记录唯一可持久化的目录级状态，调度器 reload 合成 slot 时按同组 prefs 重建），
+ * 行字段双写一份保证即时响应（prefs 深 watch 负责防抖落盘）。
+ */
 export function setDirOverrides(id: string, patch: DirOverrides) {
   const d = state.dirs.find((x) => x.id === id)
-  if (d && !isPluginSyncDir(d)) d.overrides = { ...(d.overrides ?? {}), ...patch }
+  if (!d) return
+  if (isPluginSyncDir(d)) {
+    state.prefs.ztoolsPluginSyncOverrides = { ...(state.prefs.ztoolsPluginSyncOverrides ?? {}), ...patch }
+    d.overrides = state.prefs.ztoolsPluginSyncOverrides as DirOverrides
+    return
+  }
+  d.overrides = { ...(d.overrides ?? {}), ...patch }
 }
 
-/** 清除目录级设置覆盖：全部恢复跟随全局偏好；虚拟行 no-op */
+/** 清除目录级设置覆盖：全部恢复跟随全局偏好；插件同步虚拟行路由到 prefs（同步置空行字段） */
 export function resetDirOverrides(id: string) {
   const d = state.dirs.find((x) => x.id === id)
-  if (d && !isPluginSyncDir(d)) d.overrides = null
+  if (!d) return
+  if (isPluginSyncDir(d)) {
+    state.prefs.ztoolsPluginSyncOverrides = null
+    d.overrides = null
+    return
+  }
+  d.overrides = null
 }
 
 /**
  * 修改目录配置（「修改同步目录」弹窗保存入口）：
  * 本地路径变更时目录名跟随更新；overrides 为整体替换（null 表示清除全部覆盖、跟随全局）。
  * 路径 / 方式变化会通过 dirs 的序列化 watch 触发 onDirsChanged，重挂文件监听并持久化。
- * 插件同步虚拟行 no-op —— 本地目录自动发现、远端按平台隔离，均不可修改。
+ * 插件同步虚拟行：身份字段（本地 / 远端 / 方式）不可修改 —— 本地目录自动发现、
+ * 远端按平台隔离、方式恒双向；仅目录级设置（ztoolsPluginSyncOverrides）与服务器
+ *（ztoolsPluginSyncServerId）落 prefs，行字段双写一份保证即时响应。
  */
 export function updateDir(id: string, patch: { localPath?: string; remotePath?: string; mode?: SyncMode; overrides?: DirOverrides | null; serverId?: string | null }) {
   const d = state.dirs.find((x) => x.id === id)
-  if (!d || isPluginSyncDir(d)) return
+  if (!d) return
+  if (isPluginSyncDir(d)) {
+    if (patch.overrides !== undefined) {
+      state.prefs.ztoolsPluginSyncOverrides = patch.overrides
+      d.overrides = patch.overrides
+    }
+    if (patch.serverId !== undefined) {
+      state.prefs.ztoolsPluginSyncServerId = patch.serverId || ''
+      d.serverId = patch.serverId || null
+    }
+    return
+  }
   if (patch.localPath !== undefined) {
     d.localPath = patch.localPath
     d.name = baseName(patch.localPath)

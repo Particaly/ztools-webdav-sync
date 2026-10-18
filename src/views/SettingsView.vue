@@ -345,7 +345,7 @@ const pluginSyncDescLines = computed(() => {
 /** 打开插件同步的云端文件夹选择器（与默认云端文件夹同一形态） */
 function browsePluginSyncDir() {
   if (!s.server.serverUrl.trim()) {
-    toast.warning('请先填写服务器地址', '填写 WebDAV 地址后再选择云端文件夹')
+    toast.warning('请先填写服务器地址', '填写服务器地址后再选择云端文件夹')
     return
   }
   showPluginDirPicker.value = true
@@ -768,7 +768,7 @@ function restoreDefaults() {
                 </div>
                 <textarea
                   v-model="excludeText"
-                  rows="3"
+                  rows="5"
                   spellcheck="false"
                   class="exclude-input font-mono"
                   placeholder="每行一条，如 *.iso&#10;node_modules/"
@@ -816,6 +816,13 @@ function restoreDefaults() {
                   <span class="text-[11px] text-ink-4 leading-[1.5] break-words" :title="pluginSyncDescLines.local">{{ pluginSyncDescLines.local }}</span>
                   <span class="text-[11px] text-ink-4 leading-[1.5] break-words" :title="pluginSyncDescLines.cloud">{{ pluginSyncDescLines.cloud }}</span>
                 </div>
+              </div>
+              <!-- 设置入口指引：排除规则与全部目录级设置在行菜单「同步设置」中调整 -->
+              <div v-if="pluginSyncModel" class="flex items-start gap-[5px]">
+                <AppIcon name="info" :size="11" class="text-ink-4 shrink-0 mt-[2px]" />
+                <span class="text-[11px] text-ink-4 leading-[1.5] break-words"
+                  >插件运行时数据库（*.db 等）默认不同步；检查频率、冲突处理、排除规则、使用服务器等，在同步列表「ZTools 插件」记录的菜单 →「同步设置」中调整</span
+                >
               </div>
             </div>
           </section>
@@ -956,11 +963,12 @@ function restoreDefaults() {
   color: var(--blue);
 }
 
-/* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌），等宽字体便于编辑 glob */
+/* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌），等宽字体便于编辑 glob；
+   与 DirFormModal 同高（默认 5 行），可拖拽纵向调整 */
 .exclude-input {
   width: 100%;
   resize: vertical;
-  min-height: 56px;
+  min-height: 96px;
   padding: 6px 9px;
   border: 1px solid var(--br-input);
   border-radius: 7px;

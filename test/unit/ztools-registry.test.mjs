@@ -256,6 +256,29 @@ test('ZTools 注册表对账单元（ZR1–ZR7，强顺序链）', async () => {
       JSON.stringify({ rE1, rE2, putAfterE1, put: calls.put, notify: calls.notify, names: db.records.map((r) => r.name) })
     )
 
+    // 场景 H 宿主安装触发（asar 过滤的传播通道）：宿主自己安装只写注册表、不经过
+    // 本模块 —— canonical 比盘上 manifest 多出新名字时必须重写投影，否则实体同步
+    // 层（只上传已安装列表指认的 asar）之外的他机永远收不到该插件。断言：无注册表
+    // 写回（changed=false）、仅 manifest 重写；重跑幂等（新增触发消失 → noop）
+    await fsp.mkdir(path.join(pluginsDir, 'newp-1.0.0-y.asar'), { recursive: true })
+    await fsp.writeFile(path.join(pluginsDir, 'newp-1.0.0-y.asar', 'plugin.json'), JSON.stringify({ name: 'newp', title: 'Newp', version: '1.0.0' }))
+    db.records = [...db.records, { name: 'newp', path: path.join(pluginsDir, 'newp-1.0.0-y.asar'), storageKind: 'asar', isDevelopment: false }]
+    const putBeforeH = calls.put
+    const rH = await zr.reconcileCore(pluginsDir, deps)
+    const manifestH = JSON.parse(readManifest())
+    check(
+      'ZR7-H host-side install triggers manifest rewrite via name addition (no registry write)',
+      rH.status === 'ok' && rH.wroteManifest === true && calls.put === putBeforeH &&
+        manifestH.records.map((r) => r.name).join(',') === 'alpha,beta,gamma,newp,theta',
+      JSON.stringify({ rH, names: manifestH.records.map((r) => r.name), put: calls.put })
+    )
+    const rH2 = await zr.reconcileCore(pluginsDir, deps)
+    check(
+      'ZR7-Hb follow-up rerun is noop (addition trigger consumed)',
+      rH2.status === 'noop' && rH2.wroteManifest === false && calls.put === putBeforeH,
+      JSON.stringify(rH2)
+    )
+
     // 场景 F 版本冻结：盘上 manifest 版本更新（99）→ 不采纳不重写（防止旧插件降级覆盖）
     const foreignText = JSON.stringify({ version: 99, records: [{ name: 'future', entity: 'future' }] })
     await fsp.writeFile(path.join(pluginsDir, zr.REGISTRY_MANIFEST_NAME), foreignText)
@@ -417,5 +440,185 @@ test('ZTools 注册表对账权限闸单元（ZR8，强顺序链）', async () =
   assertAtEnd({
     passLine: (passed, total) => `zr-perm-unit: ${passed}/${total} passed`,
     fail: (failed) => '权限闸单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'),
+  })
+})
+
+/**
+ * 同名多版本防御单元（ZR9，独立用例）：历史轮次的孤儿采纳曾把同一插件每个版本
+ * asar 各登记一条（注册表 / manifest 同名多条），未安装 asar 过滤的指认集合
+ *（注册表 ∪ manifest 的 basename 并集）据此把每个旧版本都当成「已安装」放行，
+ * 多版本 asar 照常参与同步。覆盖：孤儿扫描扫描内同名去重（版本最高者胜）、
+ * collapseRegistryDuplicates 折叠裁决（宿主记录 > 孤儿记录 > 版本高者 > 先出现
+ * 者）、reconcileCore 全链路存量收敛（注册表写回 + manifest 重写 + 备份 + 幂等）。
+ */
+test('ZTools 注册表对账同名去重与折叠单元（ZR9，强顺序链）', async () => {
+  const pluginsDir = path.join(TMP, 'plugins-dedup')
+  try {
+    zr.__resetRegistryStateForTest()
+
+    // ZR9a 孤儿扫描扫描内同名去重：同插件 4 个版本 asar 只产出一条（3.0.1 最高
+    // 版本胜）。注入 listEntries 固定枚举顺序 —— 真实 readdir 顺序不保证稳定，
+    // 去重不能依赖「后写的排后面」这类顺序假设
+    const direntOf = (name) => ({ name, isFile: () => true, isDirectory: () => false })
+    const dupEntries = [
+      direntOf('dup-2.5.1-a.asar'),
+      direntOf('dup-3.0.1-d.asar'),
+      direntOf('dup-2.7.2-b.asar'),
+      direntOf('dup-3.0.0-c.asar'),
+    ]
+    const readDupJson = (p) => {
+      const hit = /dup-([\d.]+)-/.exec(p)
+      return { name: 'dup', version: hit ? hit[1] : undefined }
+    }
+    const orphans = zr.scanOrphanEntities(pluginsDir, new Set(), readDupJson, () => dupEntries)
+    check(
+      'ZR9a scanOrphanEntities keeps only the highest version among same-name orphans',
+      orphans.length === 1 && orphans[0].config.version === '3.0.1' && orphans[0].entityPath === path.join(pluginsDir, 'dup-3.0.1-d.asar'),
+      JSON.stringify(orphans)
+    )
+
+    // ZR9a-b 版本缺失 / 同级的确定性兜底：缺版本输给有版本；同级保留先出现者
+    const mixed = zr.scanOrphanEntities(
+      pluginsDir,
+      new Set(),
+      (p) => (p.includes('nv') ? { name: 'dup' } : { name: 'dup', version: '1.2.3' }),
+      () => [direntOf('dup-nv.asar'), direntOf('dup-1.2.3-x.asar')]
+    )
+    check(
+      'ZR9a-b missing version loses to a present one',
+      mixed.length === 1 && mixed[0].config.version === '1.2.3',
+      JSON.stringify(mixed)
+    )
+    const tied = zr.scanOrphanEntities(
+      pluginsDir,
+      new Set(),
+      () => ({ name: 'dup', version: '1.0.0' }),
+      () => [direntOf('dup-1.0.0-x.asar'), direntOf('dup-1.0.0-y.asar')]
+    )
+    check(
+      'ZR9a-c equal versions keep the first seen (deterministic)',
+      tied.length === 1 && tied[0].entityPath === path.join(pluginsDir, 'dup-1.0.0-x.asar'),
+      JSON.stringify(tied)
+    )
+
+    // ZR9b 折叠裁决（纯函数）：宿主记录（installedFrom 非 unknown）优先于孤儿
+    // 记录——哪怕版本更低（宿主记录才是用户实际安装的权威）；全孤儿组取版本最高；
+    // 无名记录原样保位；其余记录不受影响
+    const hostRec = { name: 'dup', version: '2.5.1', installedFrom: 'market' }
+    const u301 = { name: 'dup', version: '3.0.1', installedFrom: 'unknown' }
+    const u300 = { name: 'dup', version: '3.0.0', installedFrom: 'unknown' }
+    const nameless = { title: 'no name field' }
+    const solo = { name: 'solo', version: '1.0.0', installedFrom: 'unknown' }
+    const res = zr.collapseRegistryDuplicates([u301, nameless, hostRec, u300, solo])
+    check(
+      'ZR9b collapse prefers host-written records, then highest version, keeps others in place',
+      res.collapsed === 2 && res.next.length === 3 && res.next[0] === hostRec && res.next[1] === nameless && res.next[2] === solo,
+      JSON.stringify({ collapsed: res.collapsed, next: res.next })
+    )
+    const allUnknown = zr.collapseRegistryDuplicates([u300, { name: 'dup', version: '2.5.1', installedFrom: 'unknown' }, u301])
+    check(
+      'ZR9b-b all-unknown group keeps the highest version',
+      allUnknown.collapsed === 2 && allUnknown.next.length === 1 && allUnknown.next[0] === u301,
+      JSON.stringify(allUnknown)
+    )
+    const noDups = zr.collapseRegistryDuplicates([u301, solo])
+    check(
+      'ZR9b-c no duplicates is a no-op; non-array input degrades to empty',
+      noDups.collapsed === 0 && noDups.next.length === 2 && JSON.stringify(zr.collapseRegistryDuplicates(null)) === JSON.stringify({ next: [], collapsed: 0 }),
+      JSON.stringify(noDups)
+    )
+
+    // ZR9c 对账全链路存量收敛：注册表与 manifest 都带 4 条同名记录（2026-10 实测
+    // 污染形态）→ 一轮对账同时写回收敛后的注册表、重写收敛后的 manifest，写前
+    // 备份旧状态；插件本身仍在（不折进 removed）；重跑幂等
+    const versions = ['2.5.1', '2.7.2', '3.0.0', '3.0.1']
+    for (const v of versions) {
+      const dir = path.join(pluginsDir, `devbox-${v}-h.asar`)
+      await fsp.mkdir(dir, { recursive: true })
+      await fsp.writeFile(path.join(dir, 'plugin.json'), JSON.stringify({ name: 'devbox', title: 'Devbox', version: v }))
+    }
+    const makeDupRecord = (v) => ({
+      name: 'devbox', title: 'Devbox', version: v, path: path.join(pluginsDir, `devbox-${v}-h.asar`),
+      storageKind: 'asar', isDevelopment: false, installedFrom: 'unknown', installedAt: '2026-10-17T16:45:04.110Z',
+    })
+    const dupRecords = versions.map(makeDupRecord)
+    await fsp.writeFile(
+      path.join(pluginsDir, zr.REGISTRY_MANIFEST_NAME),
+      JSON.stringify({ version: 1, records: versions.map((v) => ({ name: 'devbox', entity: `devbox-${v}-h.asar`, version: v, installedFrom: 'unknown' })) })
+    )
+    const calls = { put: 0, notify: 0, backups: [] }
+    const db = { records: [...dupRecords] }
+    const deps = {
+      internal: {
+        dbGet: async () => db.records,
+        dbPut: async (_key, value) => {
+          calls.put++
+          db.records = value
+          return { ok: true }
+        },
+        notifyChanged: async () => {
+          calls.notify++
+        },
+      },
+      backup: (records) => calls.backups.push(records.map((r) => `${r.name}@${r.version}`)),
+    }
+    const readManifestText = () => fs.readFileSync(path.join(pluginsDir, zr.REGISTRY_MANIFEST_NAME), 'utf-8')
+    const devboxIn = (records) => records.filter((r) => r && r.name === 'devbox')
+    const r9 = await zr.reconcileCore(pluginsDir, deps)
+    const manifest9 = JSON.parse(readManifestText())
+    check(
+      'ZR9c reconcile collapses polluted registry and manifest in one round',
+      r9.status === 'ok' && calls.put === 1 && calls.notify === 1 && devboxIn(db.records).length === 1 &&
+        db.records.find((r) => r.name === 'devbox').version === '3.0.1' && r9.removed.length === 0 &&
+        devboxIn(manifest9.records).length === 1 && devboxIn(manifest9.records)[0].entity === 'devbox-3.0.1-h.asar',
+      JSON.stringify({ r9, db: devboxIn(db.records), manifest: devboxIn(manifest9.records) })
+    )
+    check(
+      'ZR9c-b collapse write is backed up with the pre-write polluted state',
+      calls.backups.length === 1 && calls.backups[0].length === 4 && calls.backups[0].join(',') === 'devbox@2.5.1,devbox@2.7.2,devbox@3.0.0,devbox@3.0.1',
+      JSON.stringify(calls.backups)
+    )
+    const manifestText9 = readManifestText()
+    const r9b = await zr.reconcileCore(pluginsDir, deps)
+    check(
+      'ZR9c-c rerun after collapse is a noop (idempotent)',
+      r9b.status === 'noop' && r9b.wroteManifest === false && calls.put === 1 && readManifestText() === manifestText9,
+      JSON.stringify(r9b)
+    )
+
+    // ZR9d 指认侧按名字折叠（readActiveAsarBases 的判定核心）：注册表与 manifest
+    // 双双污染（同名多版本各一条）时，指认集合每个名字只含一个 basename（最高
+    // 版本胜）；目录实体不参与 asar 指认；过滤发生在轮初、写回折叠在轮末且依赖
+    // 权限 —— 指认侧自己折叠才能让第一轮就只认一个版本
+    const regPolluted = [
+      { name: 'devbox', version: '2.5.1', installedFrom: 'unknown', path: 'C:\\p\\devbox-2.5.1-a.asar' },
+      { name: 'devbox', version: '3.0.1', installedFrom: 'unknown', path: 'C:\\p\\devbox-3.0.1-d.asar' },
+      { name: 'devbox', version: '3.0.0', installedFrom: 'unknown', path: 'C:\\p\\devbox-3.0.0-c.asar' },
+      { name: 'tool', version: '1.0.0', installedFrom: 'market', path: 'C:\\p\\tool-1.0.0-x.asar' },
+      { name: 'dirdir', version: '1.0.0', installedFrom: 'npm', path: 'C:\\p\\dirdir' },
+    ]
+    const manPolluted = [
+      { name: 'devbox', version: '2.7.2', installedFrom: 'unknown', entity: 'devbox-2.7.2-b.asar' },
+      { name: 'devbox', version: '3.0.1', installedFrom: 'unknown', entity: 'devbox-3.0.1-d.asar' },
+    ]
+    const bases = zr.pickActiveAsarBases(regPolluted, manPolluted)
+    check(
+      'ZR9d endorsement set collapses to one basename per plugin name',
+      bases.size === 2 && bases.has('devbox-3.0.1-d.asar') && bases.has('tool-1.0.0-x.asar'),
+      JSON.stringify([...bases])
+    )
+    const basesEmpty = zr.pickActiveAsarBases(null, undefined)
+    check(
+      'ZR9d-b nullish sources degrade to an empty endorsement set',
+      basesEmpty.size === 0,
+      JSON.stringify([...basesEmpty])
+    )
+  } finally {
+    await fsp.rm(path.join(TMP, 'plugins-dedup'), { recursive: true, force: true }).catch(() => {})
+  }
+
+  assertAtEnd({
+    passLine: (passed, total) => `zr-dedup-unit: ${passed}/${total} passed`,
+    fail: (failed) => '同名去重与折叠单元测试失败：\n' + failed.map((r) => `  ❌ ${r.name}`).join('\n'),
   })
 })

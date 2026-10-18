@@ -328,6 +328,47 @@ export function manifestVersionOnDisk(text: string | null): number | null {
 // ---------- 纯函数：合并与孤儿扫描 ----------
 
 /**
+ * 尽力而为地比较两个插件版本号新旧（供孤儿同名去重与注册表同名折叠挑选
+ * 「保留哪条」用）：按点分段，每段取前导数字比数值、数值相等再比剩余后缀
+ *（字符串序）；前缀逐段相等时段多者更新（'2.0' < '2.0.1'）。刻意**不是**完整
+ * semver 实现（预发布优先级等不保证）—— 这里只做「同插件多版本里挑一个」的
+ * 尽力而为决策，任何确定性全序都够用。任一版本缺失（null / undefined / 非字符串
+ * / 空串）视为最低；两者都缺失视为相等。
+ * @param a 版本号（plugin.json / 注册表记录的 version 字段，任意形态）
+ * @param b 版本号（同上）
+ * @returns a 更旧返回负数，相等返回 0，a 更新返回正数
+ */
+function comparePluginVersions(a: unknown, b: unknown): number {
+  const sa = typeof a === 'string' ? a.trim() : ''
+  const sb = typeof b === 'string' ? b.trim() : ''
+  if (!sa && !sb) return 0
+  if (!sa) return -1
+  if (!sb) return 1
+  const pa = sa.split('.')
+  const pb = sb.split('.')
+  const n = Math.max(pa.length, pb.length)
+  for (let i = 0; i < n; i++) {
+    const xa = pa[i]
+    const xb = pb[i]
+    if (xa === undefined) return -1
+    if (xb === undefined) return 1
+    const ma = /^\d+/.exec(xa)
+    const mb = /^\d+/.exec(xb)
+    if (ma && mb) {
+      const na = Number(ma[0])
+      const nb = Number(mb[0])
+      if (na !== nb) return na < nb ? -1 : 1
+      const ta = xa.slice(ma[0].length)
+      const tb = xb.slice(mb[0].length)
+      if (ta !== tb) return ta < tb ? -1 : 1
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1
+    }
+  }
+  return 0
+}
+
+/**
  * 合并 manifest 到本机注册表（产出下一版注册表，不落库）：
  *   采纳 —— manifest 里本机没有的记录，实体已在本机落盘的才登记（实体是门槛：
  *   下载未完成 / 删除决策未落地的记录，等实体到位后的下一轮再采纳）；
@@ -372,16 +413,114 @@ export function mergeRegistryWithManifest(
 }
 
 /**
+ * 同名重复记录的保留裁决（collapseRegistryDuplicates 的比较器）：宿主自己写入
+ * 的记录优先于孤儿采纳记录（installedFrom === 'unknown' 是孤儿采纳的指纹，
+ * 原生安装写 npm / market / import 等）—— 宿主记录才是「用户实际安装 / 运行
+ * 哪个版本」的权威；同组内版本号高者优先；版本同级 / 缺失返回 0，由调用方保留
+ * 先出现者（确定性）。无名字段的记录不参与（不会进入本函数）。
+ * @param a 待裁决记录
+ * @param b 在位记录
+ * @returns a 应替代 b 返回正数，否则 0（替代与否只看正负）
+ */
+function collapsePreference(a: any, b: any): number {
+  const aHost = a && a.installedFrom !== 'unknown' ? 1 : 0
+  const bHost = b && b.installedFrom !== 'unknown' ? 1 : 0
+  if (aHost !== bHost) return aHost - bHost
+  return Math.max(0, comparePluginVersions(a && a.version, b && b.version))
+}
+
+/**
+ * 折叠注册表里的同名重复记录（存量收敛，纯函数，不落盘）：已安装列表按插件名
+ * 唯一才是合法形态；历史版本的孤儿采纳曾在同一轮把同一插件的每个版本 asar 各
+ * 登记一条（扫描内去重缺失所致，见 scanOrphanEntities），而这些旧版本的 basename
+ * 全部进了未安装 asar 过滤的指认集合（注册表 ∪ manifest），导致过滤器对它们
+ * 一律放行、多版本照常参与同步。本函数把同名多条记录收敛为一条（保留裁决见
+ * collapsePreference：宿主记录 > 孤儿记录，同组内版本高者优先，平级保留先出现
+ * 者），无名记录原样保留、其余顺序不变。收敛后旧版本的指认即消失，其 asar 由
+ * 过滤器在扫描层排除（本机文件与云端副本均不动）。写回由 reconcileCore 变化
+ * 驱动完成（变化轮写前自动备份，幂等：已收敛的注册表再跑一遍 collapsed=0）。
+ * @param records 注册表记录数组（通常为 mergeRegistryWithManifest 的 next 产出）
+ * @returns next 收敛后的记录数组（输入为非数组时为空数组）；collapsed 被折叠掉
+ *          的记录条数（0 = 无重复，调用方无需写回）
+ */
+export function collapseRegistryDuplicates(records: any[]): { next: any[]; collapsed: number } {
+  const src = Array.isArray(records) ? records : []
+  const next: any[] = []
+  const winnerAt = new Map<string, number>()
+  let collapsed = 0
+  for (const record of src) {
+    const name = typeof record?.name === 'string' ? record.name : ''
+    if (!name) {
+      next.push(record)
+      continue
+    }
+    const at = winnerAt.get(name)
+    if (at === undefined) {
+      winnerAt.set(name, next.length)
+      next.push(record)
+      continue
+    }
+    if (collapsePreference(record, next[at]) > 0) next[at] = record
+    collapsed++
+  }
+  return { next, collapsed }
+}
+
+/**
+ * 计算未安装 asar 过滤的「已安装指认」basename 集合（纯函数，services.mts
+ * readActiveAsarBasenames 的判定核心）：吃两个来源的原始记录数组 —— 本机注册表
+ *（宿主已安装列表的权威，需高级权限；拿不到传空数组）与 manifest 投影（随目录
+ * 同步、无需权限）。只收 basename 以 .asar 结尾的指认（目录实体的 basename 不是
+ * asar 文件名，与按文件过滤无关），并按插件名折叠为一条 —— 与注册表写回的
+ * collapseRegistryDuplicates 同一裁决（宿主写入 > 孤儿采纳，同组内版本高者优先，
+ * 平级先出现者优先；注册表记录排在 manifest 记录之前 = 本机权威优先）。
+ *
+ * 为什么指认侧也要按名字折叠（而不只靠对账写回）：过滤判定发生在**轮初**，折叠
+ * 写回发生在轮末对账、且以高级权限批准为前提 —— 污染形态下（同一插件每个版本
+ * 各一条同名记录，注册表与 manifest 双双存在）若逐条采纳，修复后的第一轮仍会把
+ * 指认里的全部旧版本放行；无权限降级（只读 manifest）时折叠更是永远不执行。
+ * 指认侧自己按名字折叠，才能让任何一轮、任何权限形态下每个插件都只认一个版本。
+ *
+ * @param registryRecords 本机注册表记录数组（可为 null / undefined）
+ * @param manifestRecords manifest 投影记录数组（可为 null / undefined）
+ * @returns 指认的 asar 文件名集合（每个插件名至多一个；空集 = 无任何指认）
+ */
+export function pickActiveAsarBases(registryRecords: any[], manifestRecords: any[]): Set<string> {
+  const candidates: any[] = []
+  const consider = (record: any, source: unknown): void => {
+    const segs = String(source ?? '').split(/[\\/]/)
+    const base = segs[segs.length - 1] || ''
+    if (!base || !/\.asar$/i.test(base)) return
+    const name = typeof record?.name === 'string' ? record.name : ''
+    if (!name) return
+    candidates.push({ name, version: record.version, installedFrom: record.installedFrom, __base: base })
+  }
+  for (const r of registryRecords || []) consider(r, r && r.path)
+  for (const m of manifestRecords || []) consider(m, m && m.entity)
+  const out = new Set<string>()
+  for (const winner of collapseRegistryDuplicates(candidates).next) out.add(winner.__base)
+  return out
+}
+
+/**
  * 孤儿实体扫描：pluginsDir 顶层「有 plugin.json 但不在注册表里」的实体（目录
  * 插件与 *.asar 文件，点开头条目与 manifest 自身跳过）。覆盖两类来源：本功能
  * 启用前的历史同步孤儿，与「他机用户选择保留、实体经同步恢复但注册记录已不在
  * manifest 中」的实体。asar 内 plugin.json 的读取依赖 Electron 对 fs 的 asar
  * 补丁（preload 内生效）；纯 node / 读取失败一律跳过该实体（不登记半截记录）。
+ *
+ * 同名多版本只产出一条（版本号最高者，见 comparePluginVersions）：宿主升级
+ * 不清旧版，目录里同一插件的每个历史版本 asar 各有一份同名 plugin.json —— 若
+ * 逐实体登记，注册表会出现同名多条记录，未安装 asar 过滤的指认集合（注册表 ∪
+ * manifest 的 basename 并集）会把每个旧版本都当成「已安装」放行（2026-10 实测
+ * 污染形态：devbox ×4 / fileshare ×4）。去重必须在**扫描循环内**完成：调用方的
+ * knownNames.add 发生在扫描结果返回之后，防不住同一轮内的同名实体。
  * @param pluginsDir 插件实体目录绝对路径
  * @param knownNames 已登记的插件名集合（命中即跳过）
  * @param readJsonSafe JSON 文件读取（缺省 fs.readFileSync + JSON.parse）
  * @param listEntries 顶层条目列举（缺省 fs.readdirSync withFileTypes；测试注入）
- * @returns 可采纳的孤儿实体列表（plugin.json 解析结果 + 实体绝对路径 / 形态）
+ * @returns 可采纳的孤儿实体列表（plugin.json 解析结果 + 实体绝对路径 / 形态；
+ *          每个插件名至多一条，顺序 = 各名字首次出现序）
  */
 export function scanOrphanEntities(
   pluginsDir: string,
@@ -395,7 +534,7 @@ export function scanOrphanEntities(
   } catch {
     return []
   }
-  const out: Array<{ config: any; entityPath: string; asar: boolean }> = []
+  const bestByName = new Map<string, { config: any; entityPath: string; asar: boolean }>()
   for (const entry of entries) {
     if (!entry.name || entry.name.startsWith('.')) continue
     if (entry.name === REGISTRY_MANIFEST_NAME) continue
@@ -407,9 +546,11 @@ export function scanOrphanEntities(
     if (!config || typeof config !== 'object') continue
     if (typeof config.name !== 'string' || !config.name) continue
     if (knownNames.has(config.name)) continue
-    out.push({ config, entityPath, asar })
+    const candidate = { config, entityPath, asar }
+    const prev = bestByName.get(config.name)
+    if (!prev || comparePluginVersions(candidate.config.version, prev.config.version) > 0) bestByName.set(config.name, candidate)
   }
-  return out
+  return [...bestByName.values()]
 }
 
 /**
@@ -514,9 +655,10 @@ export interface RegistryReconcileDeps {
 }
 
 /**
- * 对账核心：读注册表 → 读 manifest → 合并（采纳 + 两轮幽灵核验）→ 孤儿采纳 →
- * 必要时备份并写回注册表 + 通知宿主刷新 → 必要时重写 manifest。任何一步失败
- * 都收敛为 error 结果，不抛出（调度器轮末 fire-and-forget 调用）。
+ * 对账核心：读注册表 → 读 manifest → 合并（采纳 + 两轮幽灵核验）→ 同名重复
+ * 折叠 → 孤儿采纳 → 必要时备份并写回注册表 + 通知宿主刷新 → 必要时重写
+ * manifest。任何一步失败都收敛为 error 结果，不抛出（调度器轮末 fire-and-forget
+ * 调用）。
  *
  * 幽灵核验推进：实体缺位的本机记录首轮标记（ghostMarks）、下一轮仍缺位才移除；
  * 期间实体回归即撤销标记。manifest 版本高于本插件认识范围时冻结 manifest 维护
@@ -600,6 +742,14 @@ export async function reconcileCore(pluginsDir: string, deps: RegistryReconcileD
       else ghostMarks.add(name)
     }
     const merged = mergeRegistryWithManifest(local, manifest, pluginsDir, exists, dropNames)
+    // 4.5 同名重复折叠（存量收敛）：历史轮次的孤儿采纳可能已在注册表里留下同名
+    //     多版本记录（去重修复前的污染形态，如同一插件 4 个版本各一条）；折叠后
+    //     旧版本的 basename 才会退出未安装 asar 过滤的指认集合（注册表 ∪ manifest）。
+    //     折叠条数折进 changed（变化驱动写回，写前自动备份）；插件本身仍在，
+    //     不折进 removed（removed 语义是「插件被移除」）。幂等：已收敛的注册表
+    //     再跑一遍 collapsed=0，不产生写回。
+    const dedup = collapseRegistryDuplicates(merged.next)
+    merged.next = dedup.next
     for (const name of dropNames) ghostMarks.delete(name)
     result.removed = merged.removed
 
@@ -616,7 +766,7 @@ export async function reconcileCore(pluginsDir: string, deps: RegistryReconcileD
     // 6. 注册表有变化：备份 → 写回 → 通知宿主刷新。通知走 internal:notify-plugins-changed
     //    （宿主未提供该通道时静默跳过）—— 登记仍
     //    生效，列表延迟到宿主下一次触发或重启才刷新
-    const changed = merged.added.length > 0 || merged.removed.length > 0
+    const changed = merged.added.length > 0 || merged.removed.length > 0 || dedup.collapsed > 0
     if (changed) {
       try {
         deps.backup?.(local)
@@ -627,14 +777,28 @@ export async function reconcileCore(pluginsDir: string, deps: RegistryReconcileD
       await deps.internal.notifyChanged()
     }
 
-    // 7. manifest 维护：仅在本轮注册表有变化，或盘上 manifest 缺失 / 损坏时重写
-    //    （变化驱动写 —— 决策窗口期两侧按差异轮流改写会无限对传，见文件头约束）；
-    //    盘上是更高版本格式（foreignVersion）时冻结，绝不降级覆盖。重写内容 =
-    //    本机注册表投影 + 盘上「实体尚未落盘」的在途记录（实体没到 → 没采纳，
-    //    但记录是他机的真实意图，重写时保留，等实体到位后的下一轮自然采纳）。
-    //    孤儿采纳虽然不动本机已有记录，但改变了注册表整体，同样算 changed。
+    // 7. manifest 维护：本轮注册表有变化、盘上 manifest 缺失 / 损坏、或 canonical
+    //    比盘上**多出新名字**（新增触发）时重写；盘上是更高版本格式
+    //    （foreignVersion）时冻结，绝不降级覆盖。重写内容 = 本机注册表投影 +
+    //    盘上「实体尚未落盘」的在途记录（实体没到 → 没采纳，但记录是他机的真实
+    //    意图，重写时保留，等实体到位后的下一轮自然采纳）。孤儿采纳虽然不动本机
+    //    已有记录，但改变了注册表整体，同样算 changed。
+    //    「新增触发」的动机（asar 过滤的传播通道）：实体同步层只上传已安装列表
+    //    指认的 asar（见 ztools-plugins.mts pickUninstalledAsarRels），他机采纳
+    //    新插件的唯一依据是 manifest 里的记录 —— 而宿主自己安装 / 升级只写注册表，
+    //    不经过本模块；若 manifest 只按 changed 重写，本机新装插件永远进不了
+    //    投影，他机（过滤后不再盲下载）就永远收不到该实体。故 canonical 比盘上
+    //    多出新名字即重写。刻意为「只增」：删除仍严格变化驱动 —— 差异删除
+    //    （A 删 B 留）期间两侧 canonical 互有独占记录，无条件对齐会无限对传
+    //    （文件头约束）；新增是单调的（记录要么在要么不在，双侧各自补齐即收敛），
+    //    无此风险。同名字段 / 实体路径变化（升级形态）不触发：实体同步层对已
+    //    登记名字本就不盲传（新旧行为一致），不为此放宽对写条件。
     if (!foreignVersion) {
       const canonical = buildManifest(merged.next, pluginsDir, exists)
+      // 新增触发判定（在途记录并入**之前**算）：盘上没有、本机投影有的名字才是
+      // 「本机比盘上多」；在途记录是盘上内容的回填，不构成新增依据
+      const diskNames = new Set((manifest ? manifest.records : []).map((r: any) => r?.name).filter(Boolean))
+      const canonicalHasNewName = canonical.records.some((r: any) => r && r.name && !diskNames.has(r.name))
       if (manifest) {
         const canonicalNames = new Set(canonical.records.map((r) => r.name))
         for (const mr of manifest.records) {
@@ -645,7 +809,7 @@ export async function reconcileCore(pluginsDir: string, deps: RegistryReconcileD
         canonical.records.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
       }
       const canonicalText = serializeManifest(canonical)
-      const needsRewrite = (changed || text == null || manifest == null) && canonicalText !== (text ?? null)
+      const needsRewrite = (changed || text == null || manifest == null || canonicalHasNewName) && canonicalText !== (text ?? null)
       if (needsRewrite) {
         deps.writeManifestText ? deps.writeManifestText(pluginsDir, canonicalText) : writeManifestFile(pluginsDir, canonicalText)
         result.wroteManifest = true

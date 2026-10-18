@@ -299,6 +299,31 @@ export interface Prefs {
    */
   ztoolsPluginSyncRemoteDir?: string
   /**
+   * 【实验：ZTools 插件同步】记录级排除规则（三态；组装口径见
+   * pluginSyncExcludePatterns）：null / undefined / 非数组 = 未自定义 → 生效
+   * 内置默认（PLUGIN_SYNC_DEFAULT_EXCLUDES，忽略运行时数据库文件）；数组
+   * （含空数组）= 用户显式配置 → 整体替换默认。无论何态，全局 excludePatterns
+   * 都继续叠加生效。设置页「ZTools 插件同步」卡片内的排除规则编辑器读写本字段。
+   */
+  ztoolsPluginSyncExcludePatterns?: string[] | null
+  /**
+   * 【实验：ZTools 插件同步】记录的目录级设置覆盖（「同步设置」弹窗写入；
+   * null / 非对象 = 全部跟随全局）。可覆盖项与普通目录一致（autoSync /
+   * intervalMin / conflictStrategy / ignoreHidden / concurrency / ratePerSec /
+   * leaseLock / deepVerify / excludePatterns），excludePatterns 享有
+   * PLUGIN_SYNC_DEFAULT_EXCLUDES 的三态默认（组装见 pluginSyncExcludePatterns）。
+   * 虚拟行不持久化，本字段是该记录唯一可持久化的目录级状态 —— 渲染层
+   * setDirOverrides / updateDir 对虚拟行路由到这里，调度器 loadConfig 合成
+   * slot 时展开进 overrides。
+   */
+  ztoolsPluginSyncOverrides?: ZtoolsPluginSyncOverridesInput | null
+  /**
+   * 【实验：ZTools 插件同步】该记录使用的服务器（servers 成员 id；'' / 缺省 =
+   * 跟随第一台，与普通目录 serverId 缺省同口径）。虚拟行不持久化，经本字段
+   * 落盘；调度器合成 slot 时填入 serverId，解析失配回落第一台（serverEntryOf）。
+   */
+  ztoolsPluginSyncServerId?: string
+  /**
    * 全局暂停自动同步（顶栏一键暂停）：epoch ms 到期时刻。约定：> 0 且在未来 =
    * 暂停至该时刻；-1 = 一直暂停（只能手动恢复）；0 / 缺省 / 已过期 = 未暂停。
    * 暂停期间不排自动轮（interval / backoff / follow-up / startup 均不触发）、
@@ -351,6 +376,41 @@ export interface Prefs {
 export const ZTOOLS_PLUGINS_DIR_ID = 'ztools-plugins'
 
 /**
+ * 「ZTools 插件同步」记录的内置默认排除规则：忽略插件运行时生成的数据库文件
+ *（*.db 与 SQLite 边车 *.db-wal / *.db-shm）。这类文件是机器本地运行时状态
+ *（如 Everything 的全盘搜索索引：体积大、持续变脏、索引的是本机盘符，跨设备
+ * 同步毫无意义），由各电脑各自维护。刻意不进 excludes.mts 的内置垃圾链 ——
+ * 那条链对所有同步目录生效且用户不可关闭，而 .db 在普通文件夹同步场景可能是
+ * 用户业务数据、在插件目录也可能是插件自带的种子数据文件；本默认值只作用于
+ * 插件同步这一条虚拟记录，且用户可改（三态见 ztoolsPluginSyncExcludePatterns）。
+ */
+export const PLUGIN_SYNC_DEFAULT_EXCLUDES = ['*.db', '*.db-wal', '*.db-shm']
+
+/**
+ * 「ZTools 插件同步」记录生效的排除规则（前后端单一口径的纯函数）：全局规则
+ *（prefs.excludePatterns）∪ 记录级规则（prefs.ztoolsPluginSyncExcludePatterns，
+ * 未自定义时取 PLUGIN_SYNC_DEFAULT_EXCLUDES），去重保序。返回值整体替换语义地
+ * 填进目录 overrides.excludePatterns（resolveDirPrefs 对数组字段是整体替换，
+ * 并集在此先算好）—— 两条消费路径必须同函数组装：调度器 loadConfig 合成 slot
+ *（自动轮）与渲染层 dirSyncPrefs（手动同步直调引擎）。
+ * @param custom prefs.ztoolsPluginSyncExcludePatterns 原始值：null / undefined /
+ *   非数组（畸形）= 未自定义 → 取内置默认；数组（含空数组）= 用户显式配置 →
+ *   整体生效（空数组 = 明确不要任何记录级规则）
+ * @param globalPatterns prefs.excludePatterns 原始值（允许缺字段 / 畸形，按空处理）
+ * @returns 该记录生效的完整排除规则数组（永不为 null —— 合成 slot 的 overrides
+ *   恒带此字段，其余同步参数仍回落全局）
+ */
+export function pluginSyncExcludePatterns(custom: unknown, globalPatterns: unknown): string[] {
+  const extra = Array.isArray(custom)
+    ? custom.filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+    : PLUGIN_SYNC_DEFAULT_EXCLUDES
+  const g = Array.isArray(globalPatterns) ? globalPatterns.filter((x): x is string => typeof x === 'string' && x.trim() !== '') : []
+  const out: string[] = []
+  for (const p of [...g, ...extra]) if (!out.includes(p)) out.push(p)
+  return out
+}
+
+/**
  * 目录级覆盖形参的读取形态（resolveDirPrefs 的 overrides 形参）：只声明与
  * 同步参数相关的字段，值一律 unknown —— 畸形值防御统一在 resolveDirPrefs
  * 内做。渲染层 DirOverrides（env.d.ts，另有 autoSync 等无关字段）与调度器侧
@@ -364,6 +424,19 @@ export interface DirPrefsOverridesInput {
   leaseLock?: unknown
   excludePatterns?: unknown
   excludeRels?: unknown
+}
+
+/**
+ * 「ZTools 插件同步」记录级覆盖（prefs.ztoolsPluginSyncOverrides）的存储形态：
+ * 在 DirPrefsOverridesInput（resolveDirPrefs 消费的引擎字段）之上补齐调度层 /
+ * UI 层字段（autoSync / intervalMin / ratePerSec）—— 调度器 loadConfig 原样
+ * 展开进合成 slot 的 overrides，autoSyncOf / intervalMsOf / cfgOf 经 o.X != null
+ * 守卫消费；值一律 unknown，畸形防御在 resolveDirPrefs 与各读取点的既有口径。
+ */
+export interface ZtoolsPluginSyncOverridesInput extends DirPrefsOverridesInput {
+  autoSync?: unknown
+  intervalMin?: unknown
+  ratePerSec?: unknown
 }
 
 /**

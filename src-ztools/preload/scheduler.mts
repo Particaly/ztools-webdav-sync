@@ -37,7 +37,7 @@ import nodeTimers from 'node:timers'
 import * as store from './store.mts'
 import { getHostPorts } from './host.mts'
 import { ZTOOLS_PLUGINS_DIR_ID, describeZtoolsPluginsSync } from './ztools-plugins.mts'
-import { resolveDirPrefs } from './types.mts'
+import { pluginSyncExcludePatterns, resolveDirPrefs } from './types.mts'
 import { applyNetLimits, netTraffic } from './svc/net.mts'
 import type { ConflictChoice, ConflictInfo, Prefs, RoundDisplay, SchedulerApi, SchedulerEvent, SchedulerSnapshot, SchedulerSlotView, SyncProgress, SyncSummary } from './types.mts'
 // 仅类型导入（编译期擦除，不构成对 services 的运行时依赖 / 循环 require）：
@@ -873,14 +873,27 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     // 同样不持久化）：每次 reload 现场合成，配置权威仍是 prefs 开关。
     if (prefs.ztoolsPluginSync === true) {
       const desc = describeZtoolsPluginsSync(typeof prefs.ztoolsPluginSyncRemoteDir === 'string' ? prefs.ztoolsPluginSyncRemoteDir : '')
+      // 记录级目录覆盖（「同步设置」弹窗写入 prefs.ztoolsPluginSyncOverrides；
+      // null / 非对象 = 跟随全局）：原样展开进 overrides，excludePatterns 除外 ——
+      // 它单独组装（全局规则 ∪ 记录级规则，未自定义时记录级取内置默认的运行时
+      // 数据库忽略，历史独立字段 ztoolsPluginSyncExcludePatterns 仍兼容读取），
+      // 整体替换语义填入（并集已在组装函数内算好）。其余字段缺省时调度器各读取
+      // 点的 o.X != null 守卫使其回落全局，与无覆盖同效。渲染层手动同步
+      //（dirSyncPrefs）用同一函数组装，两路径同规则。
+      const po = prefs.ztoolsPluginSyncOverrides && typeof prefs.ztoolsPluginSyncOverrides === 'object' ? prefs.ztoolsPluginSyncOverrides : {}
       dirs.push({
         id: ZTOOLS_PLUGINS_DIR_ID,
         localPath: desc.pluginsDir,
         remotePath: desc.remotePath,
         mode: 'two-way',
         enabled: prefs.ztoolsPluginSyncPaused !== true,
-        overrides: null,
-        serverId: null,
+        overrides: {
+          ...po,
+          excludePatterns: pluginSyncExcludePatterns(po.excludePatterns ?? prefs.ztoolsPluginSyncExcludePatterns, prefs.excludePatterns),
+        },
+        // 记录使用的服务器（prefs.ztoolsPluginSyncServerId；'' / 缺省 = null 跟随
+        // 第一台）。解析失配回落第一台，与普通目录同一口径（serverEntryOf）。
+        serverId: typeof prefs.ztoolsPluginSyncServerId === 'string' && prefs.ztoolsPluginSyncServerId ? prefs.ztoolsPluginSyncServerId : null,
         serverUrl: null,
       })
     }

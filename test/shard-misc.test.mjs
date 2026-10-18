@@ -2647,6 +2647,114 @@ const {
     }
   })
 
+  // ============================================================
+  // ZA：插件同步只同步已安装列表（授权闸 + 未安装 asar 过滤）
+  // 判定只认注册表 / manifest 指认（ztools-plugins.mts pickUninstalledAsarRels）：
+  // 指认为空（无 manifest、宿主无 internal 通道）→ 授权闸把整轮跳过（零计数 +
+  // permissionWait 标记，远端零请求，不建根不上传）；manifest 指认落地后 →
+  // 只同步列表内的 asar，列表外的文件不再参与（云端历史遗留不产生删除决策），
+  // 下一轮收敛 no-op（无乒乒）。
+  // ============================================================
+
+  await section('ZA：插件同步只同步已安装列表', async () => {
+    const L = path.join(os.tmpdir(), `wdsync-e2e-za-${Date.now()}`)
+    await fsp.mkdir(L, { recursive: true })
+    for (const n of ['keep-1.0.0-aaaaaaaa.asar', 'old-0.9.0-bbbbbbbb.asar', 'extra.asar']) {
+      await fsp.writeFile(path.join(L, n), `za-${n}`)
+    }
+    // id 用插件同步固定 id（types.mts ZTOOLS_PLUGINS_DIR_ID 的字面量契约，ZP1 单测钉死）：
+    // 引擎只对该 id 启用授权闸与过滤路径，其余目录不受影响
+    const d = { id: 'ztools-plugins', localPath: L, remotePath: '/za-plugins', mode: 'two-way' }
+    const remoteDir = path.join(ROOT, 'za-plugins')
+    // 轮1：无 manifest、无 internal 权限 → 指认为空 → 授权闸整轮跳过：
+    // 零计数成功（无 warning，不触发任何传输 / 远端建根）
+    const r1 = await services.sync.syncDirectory(cfg, d, SP, {})
+    check(
+      'ZA1 指认为空时整轮跳过（permissionWait，零传输零远端写入）',
+      r1.uploaded === 0 && r1.downloaded === 0 && r1.deleted === 0 && r1.permissionWait === true && !(await fsp.stat(remoteDir).catch(() => null)),
+      JSON.stringify({ u: r1.uploaded, d: r1.downloaded, dl: r1.deleted, pw: r1.permissionWait })
+    )
+    // 轮间「授权到位」：写 manifest（指认 keep + 新装的 newp）、本地新增 newp ——
+    // old / extra 不在指认里，从下一轮起脱离同步宇宙
+    await fsp.writeFile(
+      path.join(L, 'ztools-plugins.registry.json'),
+      JSON.stringify({
+        version: 1,
+        records: [
+          { name: 'keep', entity: 'keep-1.0.0-aaaaaaaa.asar' },
+          { name: 'newp', entity: 'newp-2.0.0-cccccccc.asar' },
+        ],
+      })
+    )
+    await fsp.writeFile(path.join(L, 'newp-2.0.0-cccccccc.asar'), 'za-newp')
+    // 轮2：指认 = { keep, newp } → 只上传 newp 与 keep 与 manifest 本体；old / extra 不动
+    const r2 = await services.sync.syncDirectory(cfg, d, SP, {})
+    check(
+      'ZA2 指认后只同步列表内的 asar（keep + newp + manifest 本体）',
+      r2.uploaded === 3 && r2.downloaded === 0 && r2.deleted === 0 && !r2.permissionWait,
+      JSON.stringify({ u: r2.uploaded, d: r2.downloaded, dl: r2.deleted })
+    )
+    // 轮3：收敛 no-op —— 被过滤条目不入基线不参与规划，无删除决策无重传（无乒乒）
+    const r3 = await services.sync.syncDirectory(cfg, d, SP, {})
+    check('ZA3 过滤后收敛 no-op（无乒乒）', isNoop(r3), JSON.stringify({ u: r3.uploaded, d: r3.downloaded, dl: r3.deleted, c: r3.conflicts }))
+    // 两侧现状：本机文件全部原样（过滤 ≠ 删除）；云端只有指认内的实体与 manifest
+    const localNames = (await fsp.readdir(L)).sort()
+    const remoteNames = (await fsp.readdir(remoteDir)).sort()
+    check(
+      'ZA4 本机文件原样、云端只含列表内实体',
+      JSON.stringify(localNames) ===
+        JSON.stringify(['extra.asar', 'keep-1.0.0-aaaaaaaa.asar', 'newp-2.0.0-cccccccc.asar', 'old-0.9.0-bbbbbbbb.asar', 'ztools-plugins.registry.json']) &&
+        JSON.stringify(remoteNames) === JSON.stringify(['keep-1.0.0-aaaaaaaa.asar', 'newp-2.0.0-cccccccc.asar', 'ztools-plugins.registry.json']),
+      JSON.stringify({ local: localNames, remote: remoteNames })
+    )
+    await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
+    await fsp.rm(remoteDir, { recursive: true, force: true }).catch(() => {})
+  })
+
+  // ============================================================
+  // ZA2：同名多版本指认折叠（历史污染形态的免疫）
+  // 历史孤儿采纳曾把同一插件每个版本 asar 各登记一条同名记录（注册表 / manifest
+  // 双双污染），指认集合据此放行全部旧版本。指认侧按名字折叠（pickActiveAsarBases，
+  // 与轮末写回折叠同一裁决）后：任何一轮、任何权限形态下每个插件只认一个版本
+  //（最高版本胜）—— 过滤判定在轮初、写回折叠在轮末且依赖权限，指认侧必须自洽。
+  // ============================================================
+
+  await section('ZA2：同名多版本指认折叠', async () => {
+    const L = path.join(os.tmpdir(), `wdsync-e2e-za2-${Date.now()}`)
+    await fsp.mkdir(L, { recursive: true })
+    for (const n of ['dup-2.5.1-aaaaaaaa.asar', 'dup-2.7.2-bbbbbbbb.asar', 'dup-3.0.1-cccccccc.asar']) {
+      await fsp.writeFile(path.join(L, n), `za2-${n}`)
+    }
+    // 盘上 manifest 即污染形态：同名 3 条各指认一个版本（2026-10 实测形状）
+    await fsp.writeFile(
+      path.join(L, 'ztools-plugins.registry.json'),
+      JSON.stringify({
+        version: 1,
+        records: [
+          { name: 'dup', entity: 'dup-2.5.1-aaaaaaaa.asar', version: '2.5.1', installedFrom: 'unknown' },
+          { name: 'dup', entity: 'dup-2.7.2-bbbbbbbb.asar', version: '2.7.2', installedFrom: 'unknown' },
+          { name: 'dup', entity: 'dup-3.0.1-cccccccc.asar', version: '3.0.1', installedFrom: 'unknown' },
+        ],
+      })
+    )
+    const d = { id: 'ztools-plugins', localPath: L, remotePath: '/za2-plugins', mode: 'two-way' }
+    const remoteDir = path.join(ROOT, 'za2-plugins')
+    // 轮1：指认折叠后只认 3.0.1 → 上传 = 最高版实体 + manifest 本体；旧版不参与
+    const r1 = await services.sync.syncDirectory(cfg, d, SP, {})
+    const remoteNames = (await fsp.readdir(remoteDir)).sort()
+    check(
+      'ZA2-1 污染指认每名只上传一个版本（最高版）+ manifest 本体',
+      r1.uploaded === 2 && r1.downloaded === 0 && r1.deleted === 0 && !r1.permissionWait &&
+        JSON.stringify(remoteNames) === JSON.stringify(['dup-3.0.1-cccccccc.asar', 'ztools-plugins.registry.json']),
+      JSON.stringify({ u: r1.uploaded, remote: remoteNames })
+    )
+    // 轮2：被过滤版本不入基线 → 收敛 no-op（无乒乒、无删除决策）
+    const r2 = await services.sync.syncDirectory(cfg, d, SP, {})
+    check('ZA2-2 收敛 no-op（无乒乒）', isNoop(r2), JSON.stringify({ u: r2.uploaded, d: r2.downloaded, dl: r2.deleted, c: r2.conflicts }))
+    await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
+    await fsp.rm(remoteDir, { recursive: true, force: true }).catch(() => {})
+  })
+
 afterAll(async () => {
   await teardownShard({ ROOT, LOCAL, server })
 })

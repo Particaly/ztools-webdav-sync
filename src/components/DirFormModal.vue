@@ -3,9 +3,10 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import RemoteDirModal from './RemoteDirModal.vue'
 import { AppButton, AppInput, AppModal, AppSegmented, AppSelect, AppSwitch, InfoTip } from './ui'
-import { useStore, suggestRemote, serverLabel } from '../composables/store'
+import { useStore, suggestRemote, serverLabel, isPluginSyncDir } from '../composables/store'
 import { concurrencyOptions, intervalOptions, strategyOptions } from '../composables/options'
 import { toast } from '../composables/toast'
+import { PLUGIN_SYNC_DEFAULT_EXCLUDES } from '../../src-ztools/preload/types.mts'
 import type { DirOverrides, Prefs, SyncDir, SyncMode } from '../env.d'
 
 /**
@@ -15,6 +16,8 @@ import type { DirOverrides, Prefs, SyncDir, SyncMode } from '../env.d'
  * 冲突处理 / 忽略隐藏文件 / 并发传输数 / 请求频率限制 / 多设备互斥同步 /
  * 深度校验 / 排除规则）：未开启覆盖时各项只读展示全局当前值，开启后可单独
  * 编辑并随保存整体写入目录级覆盖（关闭覆盖 = 整体恢复跟随全局，不做逐字段回退）。
+ * 插件同步虚拟行（isPluginDir）为第三形态：身份字段只读展示（自动发现 /
+ * 平台隔离 / 恒双向），保存只提交目录级设置与服务器（updateDir 落 prefs）。
  * 所有值先暂存在本地 ref，点击主按钮才提交；关闭（取消 / 遮罩 / 右上角）即丢弃未保存修改。
  * 通过 Teleport 挂到 body：DirRow 位于 relative 列表容器内，
  * 直接渲染会让 AppModal 的 absolute 遮罩被限制在列表卡片里。
@@ -27,6 +30,14 @@ const prefs = store.state.prefs
 
 /** 修改模式（传入 dir）/ 创建模式（不传 dir） */
 const isEdit = computed(() => !!props.dir)
+
+/**
+ * 插件同步虚拟行的设置模式：身份字段（本地目录自动发现 / 云端按平台隔离 /
+ * 方式恒双向）只读展示，可改的只有高级设置覆盖与（多服务器时的）使用服务器。
+ * 覆盖经 updateDir 落 prefs.ztoolsPluginSyncOverrides —— 虚拟行不持久化，
+ * prefs 是该记录目录级状态的唯一持久化落点。
+ */
+const isPluginDir = computed(() => !!props.dir && isPluginSyncDir(props.dir))
 
 // ---------- 表单暂存值 ----------
 
@@ -91,8 +102,10 @@ const formServer = computed(() => store.state.servers.find((sv) => sv.id === ser
 /** 每次打开时按当前模式初始化表单：创建取全局默认，修改取目录当前生效值（覆盖 ?? 全局） */
 function initForm() {
   const o = props.dir?.overrides
-  overrideOn.value =
-    !!o && OVERRIDE_KEYS.some((k) => (o as Record<string, unknown>)[k] !== undefined)
+  // 插件同步记录默认「单独设置」：该记录恒有记录级排除规则（未自定义时取内置
+  // 默认的运行时数据库三件套），设置天然是记录级的 —— 打开弹窗即呈现可编辑的
+  // 当前生效值，而不是只读预览全局；用户仍可手动关掉（回「跟随全局 + 内置默认」）
+  overrideOn.value = isPluginDir.value ? true : !!o && OVERRIDE_KEYS.some((k) => (o as Record<string, unknown>)[k] !== undefined)
   if (props.dir) {
     localPath.value = props.dir.localPath
     remotePath.value = props.dir.remotePath
@@ -105,7 +118,9 @@ function initForm() {
     mode.value = 'two-way'
     serverId.value = store.state.activeServerId
   }
-  // 各项展示值：有目录级覆盖取覆盖值，否则展示全局当前值（未开启覆盖时为只读预览）
+  // 各项展示值：有目录级覆盖取覆盖值，否则展示全局当前值（未开启覆盖时为只读预览）。
+  // 排除规则的回落值分两种：普通目录展示全局规则；插件同步记录展示内置默认
+  //（运行时数据库三件套）—— 它的生效规则 = 全局 ∪ 记录级，未自定义时记录级取默认
   autoSync.value = (overrideOn.value ? o?.autoSync : undefined) ?? prefs.autoSync
   conflictStrategy.value = (overrideOn.value ? o?.conflictStrategy : undefined) ?? prefs.conflictStrategy
   ignoreHidden.value = (overrideOn.value ? o?.ignoreHidden : undefined) ?? prefs.ignoreHidden
@@ -115,7 +130,8 @@ function initForm() {
   ratePerSec.value = typeof rateVal === 'number' && Number.isFinite(rateVal) ? String(rateVal) : ''
   leaseLock.value = (overrideOn.value ? o?.leaseLock : undefined) ?? prefs.leaseLock !== false
   deepVerify.value = (overrideOn.value ? o?.deepVerify : undefined) ?? prefs.deepVerify === true
-  excludeText.value = ((overrideOn.value ? o?.excludePatterns : undefined) ?? prefs.excludePatterns ?? []).join('\n')
+  excludeText.value =
+    ((overrideOn.value ? o?.excludePatterns : undefined) ?? (isPluginDir.value ? PLUGIN_SYNC_DEFAULT_EXCLUDES : prefs.excludePatterns) ?? []).join('\n')
   advancedOpen.value = false
   localError.value = ''
 }
@@ -125,7 +141,7 @@ watch(open, (v) => v && initForm(), { immediate: true })
 
 // ---------- 标题与文案 ----------
 
-const title = computed(() => (isEdit.value ? '修改同步文件夹' : '添加同步文件夹'))
+const title = computed(() => (isPluginDir.value ? '插件同步设置' : isEdit.value ? '修改同步文件夹' : '添加同步文件夹'))
 const subtitle = computed(() => (isEdit.value ? props.dir!.name : '让电脑上的文件夹和云端文件夹保持一致'))
 const submitText = computed(() => (isEdit.value ? '保存修改' : '添加文件夹'))
 
@@ -146,6 +162,25 @@ const remoteHint = computed(() => {
   }
   return ''
 })
+
+/** 覆盖开关的说明（按目录形态分文案）：插件同步记录点出「默认单独设置」与排除规则的默认语义 */
+const overrideTip = computed(() =>
+  isPluginDir.value
+    ? '插件同步默认单独设置（它恒有记录级排除规则：默认忽略 *.db 等运行时数据库文件，与全局「排除规则」叠加生效）。关闭后其余选项跟随「设置」里的全局选项，排除规则回到内置默认'
+    : '开启后，以下选项仅对此文件夹生效；关闭时全部跟随「设置」里的全局选项'
+)
+
+/** 排除规则说明（按目录形态分文案）：插件同步记录强调「额外规则 + 内置默认」语义 */
+const excludeTip = computed(() =>
+  isPluginDir.value
+    ? '插件同步的额外排除规则，与全局「排除规则」叠加生效。默认忽略 *.db / *.db-wal / *.db-shm —— 插件运行时生成的数据库文件（如 Everything 的搜索索引）由各电脑各自维护，跨设备同步没有意义；清空即不再忽略任何文件'
+    : '每行一条通配规则（glob），匹配的文件或目录不参与同步，如 *.iso、node_modules/；内置的系统临时文件规则始终生效'
+)
+
+/** 排除规则占位（真实换行经绑定进入 placeholder 属性）：插件同步默认规则直接可见 */
+const excludePlaceholder = computed(() =>
+  isPluginDir.value ? '每行一条，如 node_modules/\n默认已忽略 *.db、*.db-wal、*.db-shm' : '每行一条，如 *.iso\nnode_modules/'
+)
 
 // ---------- 高级设置展开 / 收起的高度过渡（JS 钩子设定显式 height，兼容性优于 grid 0fr 插值） ----------
 
@@ -221,6 +256,14 @@ function close() {
 }
 
 function submit() {
+  // 插件同步虚拟行：身份字段（本地 / 云端 / 方式）不可变，跳过路径校验与重叠
+  // 检查（路径自记录创建起固定，若有嵌套冲突在对应普通目录的保存路径已拦截）；
+  // 只提交目录级设置与服务器，经 updateDir 落 prefs
+  if (isPluginDir.value) {
+    store.updateDir(props.dir!.id, { overrides: currentOverrides(), serverId: serverId.value || null })
+    close()
+    return
+  }
   const local = localPath.value.trim()
   if (!local) {
     localError.value = '请选择要同步的电脑文件夹'
@@ -286,8 +329,31 @@ function browseRemote() {
         </template>
 
         <div class="flex flex-col gap-[14px]">
+          <!-- 插件同步虚拟行：身份字段由 ZTools 自动发现 / 按平台隔离 / 恒双向，
+               只读展示 —— 可改的只有下方高级设置与（多服务器时的）使用服务器 -->
+          <template v-if="isPluginDir">
+            <div class="flex flex-col gap-[6px]">
+              <div class="flex items-center gap-[6px]">
+                <span class="text-[12px] font-medium text-btn-text">电脑上的文件夹</span>
+                <InfoTip text="ZTools 的插件目录由宿主自动发现，不能修改" />
+              </div>
+              <div class="font-mono text-[11px] text-ink-2 break-all select-text">{{ localPath }}</div>
+            </div>
+            <div class="flex flex-col gap-[6px]">
+              <div class="flex items-center gap-[6px]">
+                <span class="text-[12px] font-medium text-btn-text">云端文件夹</span>
+                <InfoTip text="按操作系统分文件夹存放（互不相通）；云端父目录在「设置 → 实验」中调整" />
+              </div>
+              <div class="font-mono text-[11px] text-ink-2 break-all select-text">{{ remotePath }}</div>
+            </div>
+            <div class="flex flex-col gap-[6px]">
+              <span class="text-[12px] font-medium text-btn-text">同步方式</span>
+              <div class="text-[11px] text-ink-4">双向同步（固定）：插件与云端互为镜像，其他设备安装过的插件会自动下载</div>
+            </div>
+          </template>
+
           <!-- 电脑上的文件夹 -->
-          <div class="flex flex-col gap-[6px]">
+          <div v-if="!isPluginDir" class="flex flex-col gap-[6px]">
             <div class="flex items-center gap-[6px]">
               <span class="text-[12px] font-medium text-btn-text">电脑上的文件夹</span>
               <span class="text-danger font-medium">*</span>
@@ -310,7 +376,7 @@ function browseRemote() {
           </div>
 
           <!-- 云端文件夹 -->
-          <div class="flex flex-col gap-[6px]">
+          <div v-if="!isPluginDir" class="flex flex-col gap-[6px]">
             <span class="text-[12px] font-medium text-btn-text">云端文件夹</span>
             <div class="flex gap-2">
               <AppInput v-model="remotePath" icon="cloud" mono class="flex-1 min-w-0" :invalid="!!remoteError" placeholder="/Projects" @update:model-value="remoteError = ''" />
@@ -329,7 +395,7 @@ function browseRemote() {
           </div>
 
           <!-- 同步方式 -->
-          <div class="flex flex-col gap-[6px]">
+          <div v-if="!isPluginDir" class="flex flex-col gap-[6px]">
             <span class="text-[12px] font-medium text-btn-text">同步方式</span>
             <AppSegmented v-model="mode" :options="modeOptions" />
             <div class="text-[11px] text-ink-4">{{ remoteHint }}</div>
@@ -355,11 +421,12 @@ function browseRemote() {
               @after-leave="onAdvAfterLeave"
             >
               <div v-show="advancedOpen" class="flex flex-col gap-[6px]">
-                <!-- 「单独设置这个文件夹」开关：位于首行，说明同时涵盖开 / 关两种状态 -->
+                <!-- 「单独设置这个文件夹」开关：位于首行，说明同时涵盖开 / 关两种状态；
+                     插件同步记录默认开启（恒有记录级排除规则，见 initForm 与 overrideTip） -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px] min-w-0">
                     <span class="text-[12px] font-medium text-ink-1">单独设置这个文件夹</span>
-                    <InfoTip text="开启后，以下选项仅对此文件夹生效；关闭时全部跟随「设置」里的全局选项" />
+                    <InfoTip :text="overrideTip" />
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="overrideOn" />
@@ -443,19 +510,20 @@ function browseRemote() {
                   <span class="flex-spacer" />
                   <AppSwitch v-model="deepVerify" :disabled="!overrideOn" />
                 </div>
-                <!-- 排除规则：逐行 glob；内置 OS 垃圾规则不可关闭 -->
+                <!-- 排除规则：逐行 glob；内置 OS 垃圾规则不可关闭。插件同步记录为
+                     「额外规则」语义（与全局叠加，默认忽略运行时数据库），文案与占位分形态 -->
                 <div class="flex flex-col gap-[6px] pt-[4px] pb-[5px]">
                   <div class="flex items-center gap-[3px]">
                     <span class="text-[12px] font-medium text-ink-1">排除规则</span>
-                    <InfoTip text="每行一条通配规则（glob），匹配的文件或目录不参与同步，如 *.iso、node_modules/；内置的系统临时文件规则始终生效" />
+                    <InfoTip :text="excludeTip" />
                   </div>
                   <textarea
                     v-model="excludeText"
-                    rows="2"
+                    rows="5"
                     spellcheck="false"
                     class="exclude-input font-mono"
                     :disabled="!overrideOn"
-                    placeholder="每行一条，如 *.iso&#10;node_modules/"
+                    :placeholder="excludePlaceholder"
                   />
                 </div>
               </div>
@@ -548,11 +616,12 @@ function browseRemote() {
   }
 }
 
-/* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌同款），等宽字体便于编辑 glob */
+/* 排除规则 textarea：与 AppInput 小号形态同视觉（设计令牌同款），等宽字体便于编辑 glob；
+   默认 5 行（插件同步的内置默认规则正好 3 行，留改动余量），仍可拖拽纵向调整 */
 .exclude-input {
   width: 100%;
   resize: vertical;
-  min-height: 48px;
+  min-height: 96px;
   padding: 6px 9px;
   border: 1px solid var(--br-input);
   border-radius: 7px;

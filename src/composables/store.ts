@@ -391,6 +391,13 @@ function normalizeLegacyIntervals(): void {
       changed = true
     }
   }
+  // 插件同步虚拟行的覆盖存于 prefs（行由 refreshPluginSyncRow 现场合成，不在
+  // 上方 dirs 循环的时序内）：记录级 intervalMin 同样归一，口径与目录级一致
+  const poInterval = state.prefs.ztoolsPluginSyncOverrides?.intervalMin
+  if (poInterval != null && Number(poInterval) < MIN_INTERVAL_MIN) {
+    state.prefs.ztoolsPluginSyncOverrides = { ...(state.prefs.ztoolsPluginSyncOverrides ?? {}), intervalMin: MIN_INTERVAL_MIN }
+    changed = true
+  }
   // 立即 persist（不防抖）：归一结果必须在下方 bindScheduler 握手之前落盘 ——
   // 调度器 loadConfig 只读 dbStorage，读到旧值会把已移除档位当有效配置执行
   if (changed) persist()
@@ -471,14 +478,15 @@ async function init() {
       schedulePersist()
     }
   )
-  // 【实验：ZTools 插件同步】开关 / 行级暂停 / 云端父目录变化 → 维护虚拟行
+  // 【实验：ZTools 插件同步】开关 / 行级暂停 / 云端父目录 / 目录级设置 / 服务器
+  // 变化 → 维护虚拟行
   //（增删 / 刷新 enabled 与发现结果，远端路径随父目录即时跟随）。行变化不直接
   // 持久化（虚拟行被 persist 过滤），但 prefs 本身的变化经上方 prefs 深 watch
   // 落盘并触发调度器 reload —— 调度器按同一组 prefs 合成 / 移除同 id 的 slot，
   // 两侧自然对齐
   watch(
     () =>
-      `${state.prefs.ztoolsPluginSync ? 1 : 0}~${state.prefs.ztoolsPluginSyncPaused ? 1 : 0}~${state.prefs.ztoolsPluginSyncRemoteDir ?? ''}`,
+      `${state.prefs.ztoolsPluginSync ? 1 : 0}~${state.prefs.ztoolsPluginSyncPaused ? 1 : 0}~${state.prefs.ztoolsPluginSyncRemoteDir ?? ''}~${JSON.stringify(state.prefs.ztoolsPluginSyncOverrides ?? null)}~${state.prefs.ztoolsPluginSyncServerId ?? ''}`,
     () => {
       refreshPluginSyncRow()
     }

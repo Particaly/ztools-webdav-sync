@@ -134,3 +134,57 @@ export function describeZtoolsPluginsSync(remoteBase?: string): ZtoolsPluginsSyn
   if (!available) desc.reason = reason
   return desc
 }
+
+// ---------- 未安装 asar 过滤（只同步已安装列表里的插件） ----------
+//
+// ZTools 安装 / 升级插件后，旧版本的 asar 会长期留在插件目录（宿主升级不清
+// 旧版，随时间大量累积，单个可达数十 MB）；同步它们只消耗云端配额与传输时间，
+// 没有跨设备价值 —— ZTools 运行哪些文件由**已安装列表**（注册表）指认，而不是
+// 「目录里有过哪些文件」。本节是插件同步 slot 的 asar 过滤判定口径（引擎在
+// services.mts 扫描层动态排除）：
+//   - 判定只认已安装列表：注册表（宿主 internal:db-get，需用户在宿主设置页
+//     授权高级权限；对账流程 ztools-registry.mts 每轮自动申请）∪ manifest 投影
+//     （ztools-plugins.registry.json，随目录同步流转、无需权限即可读）。二者
+//     并集为空 = 本机拿不到任何指认（权限未批准 / 旧宿主）→ 引擎授权闸
+//     （services.mts syncDirectory）把该轮次整体跳过，一条文件都不传 —— 宁可
+//     暂停同步，绝不同步未过滤的全量；不做文件名 / 版本号猜测。
+//   - 不在列表里的顶层 asar 一律过滤：旧版本、同版本的其他构建、未登记的手放
+//     文件统同一揽。真实新装插件的可见性由注册表写入时序决定（宿主安装即写
+//     注册表；孤儿实体由轮末对账采纳）—— 最坏一轮滞后自愈，绝不永久挡住。
+//   - 过滤只发生在扫描内存表：本机文件、云端文件、基线条目都不删不改 —— 云端
+//     历史遗留的旧版本从此不再参与同步（不产生任何删除决策）。
+// 纯函数域：只吃 rel 与指认集合，不接触文件系统；指认由引擎读取后注入。
+
+/**
+ * 计算插件目录顶层「未安装 asar」的精确 rel 集合（纯函数）：指认集合非空时，
+ * basename 不在已安装列表里的顶层 asar 全部返回（引擎据此在扫描层排除）；指认
+ * 集合为空（注册表与 manifest 都不可得）返回空集 —— 该形态的轮次已被授权闸
+ * （services.mts syncDirectory）整体跳过，此处空集只是闸门与过滤两次读取之间
+ * 指认被清空的防御形态。含子路径的 rel 不参与判定（插件实体是目录内文件而非
+ * 独立插件，目录插件内部自带的 asar 与此无关）。指认集合按 basename 归一后
+ * 比对（注册表 path 是绝对路径、manifest entity 是相对路径，归一本函数内完成，
+ * 调用方无需预处理）。
+ * @param asarRels 顶层 asar 的 rel 列表（本地与远端扫描表的并集；'/' 分隔）
+ * @param installedEntities 已安装列表指认的实体（注册表 path 绝对路径 /
+ *        manifest entity 相对路径混排均可，按最后一段比对）
+ * @returns 过滤目标 rel 集合（可直接作扫描层排除的精确匹配集）；空集 = 不过滤
+ */
+export function pickUninstalledAsarRels(asarRels: Iterable<string>, installedEntities: ReadonlySet<string>): Set<string> {
+  const stale = new Set<string>()
+  const bases = new Set<string>()
+  for (const e of installedEntities || []) {
+    const segs = String(e ?? '').split(/[\\/]/)
+    const base = segs[segs.length - 1] || ''
+    if (base) bases.add(base)
+  }
+  if (bases.size === 0) return stale
+  for (const rel of asarRels || []) {
+    const s = String(rel || '')
+    if (!s || s.includes('/')) continue
+    const segs = s.split('/')
+    const base = segs[segs.length - 1] || ''
+    if (!base || bases.has(base)) continue
+    stale.add(s)
+  }
+  return stale
+}

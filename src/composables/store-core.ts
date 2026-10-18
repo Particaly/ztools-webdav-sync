@@ -70,6 +70,13 @@ export function defaultPrefs(): Prefs {
     globalPauseUntil: 0,
     // 云端存储位置的父目录（'' = 默认云端根；实际同步根 = <该目录>/ztools-plugins/<平台>）
     ztoolsPluginSyncRemoteDir: '',
+    // 插件同步记录的额外排除规则（历史形态，已由 ztoolsPluginSyncOverrides.
+    // excludePatterns 接管；保留读取兼容 —— 调度器组装时作为回落值）
+    ztoolsPluginSyncExcludePatterns: null,
+    // 插件同步记录的目录级设置覆盖（「同步设置」弹窗写入；null = 全部跟随全局）
+    ztoolsPluginSyncOverrides: null,
+    // 插件同步记录使用的服务器（'' = 跟随第一台，与普通目录 serverId 缺省同口径）
+    ztoolsPluginSyncServerId: '',
     // 持久黄色警告的「不再显示」标记（字段语义见 types.mts Prefs 注释）：
     // 情境指纹类关闭后条件变化会重新提示，时间戳类有新挂起会重新提示
     insecureHttpDismissedFor: '',

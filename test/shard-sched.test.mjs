@@ -1451,6 +1451,12 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
       await fsp.mkdir(path.join(PLUGINS, 'plugin-a'), { recursive: true })
       await fsp.writeFile(path.join(PLUGINS, 'plugin-a', 'plugin.json'), '{"name":"plugin-a"}')
       await fsp.writeFile(path.join(PLUGINS, 'demo-b-0.1.0-ab12cd34.asar'), 'fake-asar-body')
+      // 已安装列表投影（授权闸要求指认可得，轮次才会执行——见 syncDirectory 授权闸）：
+      // manifest 本身是目录内的普通文件，参与同步（计入各轮上行数）
+      await fsp.writeFile(
+        path.join(PLUGINS, 'ztools-plugins.registry.json'),
+        JSON.stringify({ version: 1, records: [{ name: 'plugin-a', entity: 'plugin-a' }, { name: 'demo-b', entity: 'demo-b-0.1.0-ab12cd34.asar' }] })
+      )
       process.env.ZTOOLS_DATA_ROOT = ZT_ROOT
 
       // ① 公共 describe 入口：id 契约 + 自动发现 + 平台隔离远端
@@ -1499,8 +1505,8 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
       const r11 = await sc11Sched.syncNow('ztools-plugins')
       const remoteBase11 = path.join(ROOT, 'ztools-plugins', platformKey)
       check(
-        'SC11 plugin round uploads dir plugin + asar artifact to platform-isolated remote',
-        r11.ok === true && r11.summary && r11.summary.uploaded === 2 && fs.existsSync(path.join(remoteBase11, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11, 'demo-b-0.1.0-ab12cd34.asar')),
+        'SC11 plugin round uploads dir plugin + asar artifact + manifest to platform-isolated remote',
+        r11.ok === true && r11.summary && r11.summary.uploaded === 3 && fs.existsSync(path.join(remoteBase11, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11, 'demo-b-0.1.0-ab12cd34.asar')),
         JSON.stringify(r11.ok ? r11.summary : r11.error)
       )
 
@@ -1512,8 +1518,50 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
       const remoteBase11b = path.join(ROOT, 'sc11-custom', 'ztools-plugins', platformKey)
       check(
         'SC11 custom cloud folder composes <chosen>/ztools-plugins/<platform> and re-uploads there',
-        r11b.ok === true && r11b.summary && r11b.summary.uploaded === 2 && fs.existsSync(path.join(remoteBase11b, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11b, 'demo-b-0.1.0-ab12cd34.asar')),
+        r11b.ok === true && r11b.summary && r11b.summary.uploaded === 3 && fs.existsSync(path.join(remoteBase11b, 'plugin-a', 'plugin.json')) && fs.existsSync(path.join(remoteBase11b, 'demo-b-0.1.0-ab12cd34.asar')),
         JSON.stringify(r11b.ok ? r11b.summary : r11b.error)
+      )
+
+      // ④d 记录级排除规则（types.mts PLUGIN_SYNC_DEFAULT_EXCLUDES，经合成 slot 的
+      // overrides.excludePatterns 生效）：插件运行时数据库（*.db 与 SQLite 边车
+      // *.db-wal）默认不上行；记录级自定义后默认整体让位，全局 excludePatterns 仍
+      // 叠加生效（iso 由全局挡下、log 由记录级挡下）。已排除的既有文件只「本轮
+      // 不可见」，不删除不传播（基线残留语义）
+      await fsp.writeFile(path.join(PLUGINS, 'Everything.db'), 'fake-index-body')
+      await fsp.writeFile(path.join(PLUGINS, 'Everything.db-wal'), 'fake-wal-body')
+      const r11e = await sc11Sched.syncNow('ztools-plugins')
+      check(
+        'SC11 default excludes keep runtime db files (*.db / *.db-wal) out of the plugin round',
+        r11e.ok === true && r11e.summary && r11e.summary.uploaded === 0 && !fs.existsSync(path.join(remoteBase11b, 'Everything.db')) && !fs.existsSync(path.join(remoteBase11b, 'Everything.db-wal')),
+        JSON.stringify(r11e.ok ? r11e.summary : r11e.error)
+      )
+      // 自定义记录级规则（只挡 log）+ 全局规则（挡 iso）：db / db-wal 恢复上行
+      //（自定义整体替换默认），log 与 iso 各被一套规则挡下（并集语义）
+      await fsp.writeFile(path.join(PLUGINS, 'notes.log'), 'log')
+      await fsp.writeFile(path.join(PLUGINS, 'readme.iso'), 'iso')
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: true, autoSync: true, ztoolsPluginSyncRemoteDir: '/sc11-custom', ztoolsPluginSyncExcludePatterns: ['notes.log'], excludePatterns: ['*.iso'] })
+      await sc11Sched.reload()
+      const r11f = await sc11Sched.syncNow('ztools-plugins')
+      check(
+        'SC11 custom record-level rules replace the defaults while global rules still union in',
+        r11f.ok === true && r11f.summary && r11f.summary.uploaded === 2 && fs.existsSync(path.join(remoteBase11b, 'Everything.db')) && fs.existsSync(path.join(remoteBase11b, 'Everything.db-wal')) && !fs.existsSync(path.join(remoteBase11b, 'notes.log')) && !fs.existsSync(path.join(remoteBase11b, 'readme.iso')),
+        JSON.stringify(r11f.ok ? r11f.summary : r11f.error)
+      )
+
+      // ④e 记录级设置覆盖（prefs.ztoolsPluginSyncOverrides，「同步设置」弹窗落点）：
+      // intervalMin 等同步参数经合成 slot 的 overrides 生效（autoSyncOf / intervalMsOf
+      // 的 o.X != null 守卫优先于全局）。排程观测需全新 slot（reload 保留既有 slot 的
+      // 排程状态），先关开关移除 slot 再开 —— 与 ③b 同型，预订点应取覆盖值 30min
+      //（setSCConfig 缺省全局 intervalMin=15，走全局则是 ~15min）
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: false })
+      await sc11Sched.reload()
+      setSCConfig([{ id: 'ud1', localPath: ud11, remotePath: '/sc11-ud1', mode: 'two-way' }], { ztoolsPluginSync: true, autoSync: true, ztoolsPluginSyncRemoteDir: '/sc11-custom', ztoolsPluginSyncOverrides: { intervalMin: 30 } })
+      await sc11Sched.reload()
+      const plugOv11 = sc11Sched.getSnapshot().slots.find((s) => s.id === 'ztools-plugins')
+      check(
+        'SC11 record-level overrides drive the synthesized slot schedule (intervalMin 30 wins over global 15)',
+        plugOv11 && plugOv11.state === 'scheduled' && plugOv11.nextDueKind === 'interval' && plugOv11.nextDueAt != null && plugOv11.nextDueAt - Date.now() > 29 * 60000,
+        JSON.stringify(plugOv11 ? { state: plugOv11.state, kind: plugOv11.nextDueKind, dueInMin: plugOv11.nextDueAt == null ? null : Math.round((plugOv11.nextDueAt - Date.now()) / 60000) } : null)
       )
 
       // ④c 登记产出折进当轮同步记录：注入 internal 端口桩（空注册表 + fullAccess，

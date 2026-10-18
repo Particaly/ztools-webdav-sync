@@ -24,8 +24,8 @@ import * as storage from './store.mts'
 import { createScheduler, sweepSchedulerTimers } from './scheduler.mts'
 import type { SchedulerFacade } from './scheduler.mts'
 import { getHostPorts, setHostPorts, HOST_TRASH_MISSING_MESSAGE } from './host.mts'
-import { describeZtoolsPluginsSync } from './ztools-plugins.mts'
-import { getRegistryReconcileState, reconcilePluginRegistry } from './ztools-registry.mts'
+import { describeZtoolsPluginsSync, pickUninstalledAsarRels } from './ztools-plugins.mts'
+import { getRegistryReconcileState, parseManifest, pickActiveAsarBases, reconcilePluginRegistry, REGISTRY_MANIFEST_NAME, ZTOOLS_REGISTRY_KEY } from './ztools-registry.mts'
 import type {
   DavCapabilities,
   DeleteBatch,
@@ -972,6 +972,42 @@ async function syncDirectory(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, ha
   let roundSummary: any = null
   let roundError: any = null
   try {
+    // 【实验：ZTools 插件同步】授权闸（「只同步已安装列表」的前置）：已安装列表
+    // 指认不可得（高级权限未批准 / 旧宿主 / 注册表与 manifest 双双不可读）时，
+    // 本槽位**整轮跳过** —— 没有权威列表就不做任何上传 / 下载 / 删除（宁可不
+    // 同步，绝不同步未过滤的全量）。跳过是零计数的干净成功：刻意不带 warning
+    //（成功轮的 warnings 逐轮弹 toast，授权等待期每个 interval 轮都会刷屏），
+    // 「为什么没同步」由两处承载 —— ① 行内注册表提示条（轮末对账的 pending /
+    // denied 状态，既有通道）；② 本轮末照常执行的对账本身：syncDirectory 的
+    // finally 对插件槽位非取消、非预演的轮次都会跑 reconcilePluginRegistry，
+    // 权限缺失时它自动提交 / 维持高级权限申请，批准后下一轮自动开始同步。
+    // 15s 兜底超时防宿主 IPC 病理性挂起拖死轮次（超时按列表不可得处理，安全
+    // 方向）；预演轮同样受闸 —— 预演必须如实反映「授权前什么都不传」的现实。
+    if (dir && dir.id === ZTOOLS_PLUGINS_DIR_ID) {
+      const installed = await Promise.race([readActiveAsarBasenames(dir.localPath), sleep(15000).then(() => new Set<string>())])
+      if (!installed || installed.size === 0) {
+        roundSummary = {
+          uploaded: 0,
+          downloaded: 0,
+          deleted: 0,
+          conflicts: 0,
+          deferredConflicts: 0,
+          adopted: 0,
+          bytesUp: 0,
+          bytesDown: 0,
+          totalFiles: 0,
+          tier: 'B',
+          warnings: [],
+          errors: [],
+          errorsDropped: 0,
+          /** 已安装列表不可得（等待高级权限授权）：本轮整体跳过，未做任何传输 */
+          permissionWait: true,
+          ...(handlers && handlers.hints && handlers.hints.dryRun === true ? { dryRun: true } : {}),
+        }
+        logNote('插件同步：已安装列表不可得（等待高级权限授权），本轮跳过；批准后自动开始')
+        return roundSummary
+      }
+    }
     roundSummary = await runSyncRound(cfg, dir, prefs, handlers)
     return roundSummary
   } catch (e: any) {
@@ -2407,6 +2443,23 @@ async function scanBothSides(ctx: RoundContext): Promise<void> {
   //    在两侧扫描层统一生效（compileSyncExcludes：glob + 精确路径，含祖先目录命中）。
   //    本地扫描带节流进度回调（phase='scan' 的 filesDone 递增事件）。
   ctx.excludeMatcher = compileSyncExcludes(ctx.prefs.excludePatterns, ctx.prefs.excludeRels)
+  // 【实验：ZTools 插件同步】未安装 asar 过滤（只同步已安装列表；判定口径见
+  // ztools-plugins.mts pickUninstalledAsarRels）：ZTools 运行哪些文件由已安装
+  // 列表（注册表 ∪ manifest 指认）说了算，目录里累积的旧版本 / 未登记 asar 不
+  // 再参与同步 —— 本地不上传、云端不下载、基线残留不参与规划（规划层的
+  // excludeMatcher 跳过与用户排除同语义：「本轮不可见」≠「两侧已删」）。指认
+  // 集合需要现读注册表 / manifest（见 readActiveAsarBasenames），而匹配器在扫描
+  // 期间就被两侧消费，因此用两段式：第一段在这里以空集包装匹配器（扫描期间恒
+  // 放行，行为与无过滤一致）；第二段在扫描完成后回填精确 rel 集合并裁剪两侧
+  // 扫描表（见下方回填点 —— 位于任何规划消费之前）。两侧同规则的安全不变量由
+  // 「同一份回填集合」保证。高级权限未授权（指认为空）时本轮不过滤，授权后
+  // 自动生效。
+  let staleAsar: Set<string> | null = null
+  if (ctx.dir.id === ZTOOLS_PLUGINS_DIR_ID) {
+    staleAsar = new Set()
+    const userMatcher = ctx.excludeMatcher
+    ctx.excludeMatcher = (rel: string) => staleAsar!.has(rel) || (!!userMatcher && userMatcher(rel))
+  }
   const capsPromise = getSyncCapabilities(ctx.cfg, ctx.dir.remotePath)
   // 本地脏路径快速核对：仅 watch 来源 hints、脏集非空
   // 且不超 DIRTY_SCAN_MAX、基线可信（loadedOk —— 合成依赖基线，快照损坏时必须
@@ -2467,6 +2520,32 @@ async function scanBothSides(ctx: RoundContext): Promise<void> {
   ctx.localScan = localScan
   ctx.caps = caps
   ctx.remoteScan = remoteScan
+  // 【实验：ZTools 插件同步】未安装 asar 过滤第二段（匹配器包装见上方）：判定
+  // 输入 = 两侧顶层 asar 的并集 + 已安装列表指认（readActiveAsarBasenames：注册表
+  // ∪ manifest）。指认为空的轮次已在 syncDirectory 授权闸整体跳过，正常到此指认
+  // 必非空；这里的空集分支只是闸门判定与过滤判定之间指认被清空的防御形态
+  //（按不过滤处理，下一轮授权闸接管）。裁剪只发生在扫描内存表上 —— 本机文件、
+  // 云端文件、基线条目都不删不改；云端历史遗留的旧版本只是从此不再参与同步
+  //（规划层跳过基线残留，不产生任何删除决策）。
+  if (staleAsar) {
+    const installed = await readActiveAsarBasenames(ctx.dir.localPath)
+    const asarRels: string[] = []
+    for (const rel of ctx.localScan.files.keys()) {
+      if (!rel.includes('/') && /\.asar$/i.test(rel)) asarRels.push(rel)
+    }
+    for (const rel of ctx.remoteScan.files.keys()) {
+      if (!rel.includes('/') && /\.asar$/i.test(rel)) asarRels.push(rel)
+    }
+    for (const rel of pickUninstalledAsarRels(asarRels, installed)) staleAsar.add(rel)
+    if (staleAsar.size > 0) {
+      for (const rel of staleAsar) {
+        await maybeYield() // 数百过滤条目的裁剪循环分片让出（与既有循环同规格）
+        ctx.localScan.files.delete(rel)
+        ctx.remoteScan.files.delete(rel)
+      }
+      logNote(`插件同步：按已安装列表过滤 ${staleAsar.size} 个未安装 / 旧版本的 asar（本机与云端文件均不受影响）`)
+    }
+  }
   // 扫描形态信息字段（引擎侧观测，渲染层不依赖；见 types.mts SyncSummary.scan）：
   // local = 'dirty'（基线合成 + 脏路径核对的快速形态，仅 watch 轮）| 'full'（全量
   // walk）；dirtyPaths 为本轮 watch hints 携带的脏路径数（回落全量的轮次也保留
@@ -2540,6 +2619,45 @@ async function scanBothSides(ctx: RoundContext): Promise<void> {
     }
   }
 
+}
+/**
+ * 读取「已安装列表指认的 asar 实体」文件名集合（basename，插件同步未安装 asar
+ * 过滤的指认来源，见 scanBothSides 与 pickUninstalledAsarRels）。两个来源尽力
+ * 而为、各自独立降级：
+ *   - 本机注册表（internal:db-get）：宿主已安装列表的权威；需要用户在宿主设置
+ *     页授权高级权限 —— 未授权 / 旧宿主 / 任何失败 → 跳过（直接调用不会触发
+ *     授权申请，申请是注册表对账 reconcileCore 的专职，每轮自动提交）；
+ *   - manifest 投影文件（随目录同步的普通文件，无需权限即可读）：本机注册表
+ *     之外再并上他机安装记录（含实体尚未落盘的在途记录，正是「该下载哪个文件」
+ *     的指认）；缺失 / 损坏 → 跳过。
+ * 两来源交给 pickActiveAsarBases 做**按插件名的折叠裁决**（每名至多一个 basename，
+ * 与轮末对账写回的 collapseRegistryDuplicates 同一裁决）：历史污染形态下同一
+ * 插件可能有多个版本的记录，而过滤判定发生在轮初、折叠写回在轮末且以权限批准
+ * 为前提 —— 指认侧自己折叠才能保证任何一轮只认一个版本。绝不上抛：并集为空 =
+ * 本机拿不到任何指认，授权闸（syncDirectory）据此整轮跳过插件同步，绝不做
+ * 文件名 / 版本号猜测。
+ * @param pluginsDir 插件实体目录绝对路径（manifest 所在处）
+ * @returns 指认的 asar 文件名集合（可能为空集）
+ */
+async function readActiveAsarBasenames(pluginsDir: string): Promise<Set<string>> {
+  const registryRecords: any[] = []
+  try {
+    const internal = getHostPorts().internal
+    if (internal) {
+      const records = await internal.dbGet(ZTOOLS_REGISTRY_KEY)
+      if (Array.isArray(records)) registryRecords.push(...records)
+    }
+  } catch {
+    /* 未授权 / 旧宿主：退 manifest 投影 */
+  }
+  let manifestRecords: any[] = []
+  try {
+    const m = parseManifest(fs.readFileSync(path.join(pluginsDir, REGISTRY_MANIFEST_NAME), 'utf-8'))
+    if (m) manifestRecords = m.records
+  } catch {
+    /* manifest 缺失 / 损坏：按无投影处理 */
+  }
+  return pickActiveAsarBases(registryRecords, manifestRecords)
 }
 /** 阶段 3 / 3.2 / 3.3：扫描完整性闸门（I1）→ 探测残留清理 → etag 跳过子树合成与 scan-cache 收割。 */
 async function applyScanGates(ctx: RoundContext): Promise<void> {

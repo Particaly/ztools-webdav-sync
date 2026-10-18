@@ -16,8 +16,10 @@ const store = useStore()
 
 /**
  * 【实验：ZTools 插件同步】虚拟行：本地目录由 ZTools 自动发现（不可修改）、
- * 远端目录按平台隔离。菜单与提示条据此特化 —— 「同步设置」不出现（无配置可
- * 改），「移除同步」换成「关闭插件同步」（等价于关掉设置里的实验开关）。
+ * 远端目录按平台隔离。菜单与提示条据此特化 —— 「选择性同步」不出现（插件
+ * 目录体量大且按子树勾选语义不适配），「移除同步」换成「关闭插件同步」
+ *（等价于关掉设置里的实验开关）；「同步设置」可用：身份字段只读展示，
+ * 目录级设置覆盖与服务器可改（落 prefs，见 store-dirs 虚拟行节注释）。
  */
 const isPlugin = computed(() => isPluginSyncDir(props.dir))
 /** 插件目录是否可用（自动发现结果；缺失时行内提示条说明，等待 ZTools 创建） */
@@ -523,8 +525,9 @@ function onCancelSync() {
                 <AppIcon :name="enabled ? 'pause' : 'play'" :size="13" class="mi-ic" />
                 <span>{{ enabled ? '暂停同步' : '恢复同步' }}</span>
               </button>
-              <!-- 插件同步虚拟行没有可修改的文件夹设置（目录自动发现 / 远端按平台隔离），不给「同步设置」入口 -->
-              <button v-if="!isPlugin" type="button" class="mi" @click="onOpenSettings(close)">
+              <!-- 同步设置（插件同步虚拟行同样可用）：身份字段在弹窗内只读展示，
+                   可改目录级设置覆盖与服务器（落 prefs，调度器 reload 合成 slot） -->
+              <button type="button" class="mi" @click="onOpenSettings(close)">
                 <AppIcon name="gear" :size="13" class="mi-ic" />
                 <span>同步设置</span>
               </button>
