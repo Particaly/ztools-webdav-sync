@@ -37,6 +37,8 @@ export type {
   PendingChoice,
   PendingListItem,
   PendingRecord,
+  PluginRunningPromptInfo,
+  PluginRunningPromptItem,
   Prefs,
   RegistryReconcileResult,
   RoundDisplay,
@@ -70,6 +72,11 @@ export type { ServicesPublic as Services } from '../src-ztools/preload/services.
 export interface DirOverrides {
   /** 是否自动同步：关闭后该目录只手动同步（「立即同步」仍可用），不排自动轮、不挂 watcher */
   autoSync?: boolean
+  /**
+   * 是否监听文件变化：本地变更经 fs watcher 即时触发同步，不等下一个轮询点。
+   * 关闭 = 只按检查频率定时对账；自动同步整体关闭时本项无效果（不挂 watcher）
+   */
+  watchFiles?: boolean
   /** 自动同步轮询间隔（分钟） */
   intervalMin?: number
   conflictStrategy?: Prefs['conflictStrategy']

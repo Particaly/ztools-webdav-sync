@@ -698,6 +698,15 @@ function restoreDefaults() {
                 <span class="flex-spacer" />
                 <AppSwitch v-model="s.prefs.autoSync" />
               </div>
+              <!-- 监听文件变化：watcher 即时触发的独立开关（全局默认，目录可单独覆盖） -->
+              <div class="pref-row flex items-center gap-3">
+                <div class="flex items-center gap-[3px] min-w-0">
+                  <span class="text-[12px] font-medium text-ink-1">监听文件变化</span>
+                  <InfoTip text="本地文件一有改动立即同步，不必等下一次检查；关闭后仅按「检查频率」定时检查云端与本地。各文件夹可在其「高级设置」里单独开关" />
+                </div>
+                <span class="flex-spacer" />
+                <AppSwitch v-model="s.prefs.watchFiles" />
+              </div>
               <div class="pref-row flex items-center gap-3">
                 <div class="flex items-center gap-[3px] min-w-0">
                   <span class="text-[12px] font-medium text-ink-1">检查频率</span>

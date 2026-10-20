@@ -1345,6 +1345,164 @@ const {
     }
   })
 
+  // ============================================================
+  // ZP 系列：插件注册表投影（ztools-plugins.registry.json）的冲突自动裁决。
+  // 该文件是机器生成的可再生投影（每轮由本机注册表现算重建），「保留哪份」对
+  // 用户没有决策价值：冲突由程序固定按 remote（云端优先）自动处理、不弹窗；
+  // 本机独有记录由轮末对账重新投影回 manifest，1-2 轮两侧收敛为并集。本节经
+  // services.host.setHostPorts 注入假 internal 端口驱动轮末对账（门面与引擎
+  // 同一模块图，源码 / built 双轨都对齐）；storageRoot=null 时 store 仍走
+  // freshStore 的 setRootForTest override（override 优先于端口），状态不受扰。
+  // ============================================================
+
+  await section('ZP：注册表投影冲突自动处理', async () => {
+    await setProfile(null)
+    await freshStore('zp')
+    const ZP_LOCAL = await tmpLocal('zp')
+    const ZP_RP = '/zp'
+    const MANIFEST = 'ztools-plugins.registry.json'
+    const zpManifest = () => path.join(ZP_LOCAL, MANIFEST)
+    const remoteManifest = () => path.join(ROOT, 'zp', MANIFEST)
+    const ZP_DIR = () => ({ id: 'ztools-plugins', localPath: ZP_LOCAL, remotePath: ZP_RP, mode: 'two-way' })
+    const syncZp = (prefs, handlers) => services.sync.syncDirectory(cfg, ZP_DIR(), prefs || SP, handlers || {})
+    /** 读一侧 manifest 的记录名列表（排序后逗号串；不可读为 null） */
+    const readNames = async (p) => {
+      try {
+        return JSON.parse(await fsp.readFile(p, 'utf-8')).records.map((r) => r.name).sort().join(',')
+      } catch {
+        return null
+      }
+    }
+    /** 写一侧 manifest（records 形如 ['alpha-1.0.asar', …]，name 取实体名去 .asar 后缀） */
+    const writeManifest = async (abs, entities) => {
+      await fsp.writeFile(
+        abs,
+        JSON.stringify({ version: 1, records: entities.map((entity) => ({ name: entity.replace(/\.asar$/, ''), entity, version: '1.0.0' })) })
+      )
+    }
+    /** 造一条宿主注册表记录（path 指向本机实体，模拟宿主已安装该插件） */
+    const registryRecord = (entity) => ({
+      name: entity.replace(/\.asar$/, ''),
+      path: path.join(ZP_LOCAL, entity),
+      version: '1.0.0',
+      installedFrom: 'market',
+      installedAt: new Date().toISOString(),
+    })
+    const ZP_DB = {}
+    let zpCalls = 0
+    try {
+      // 注入假宿主端口：internal 内存注册表驱动对账；storageRoot=null（对账备份
+      // no-op，store 走 override）；plugins / permissions=null（预检与权限闸降级，
+      // 对账直连 internal）；trash 委托既有 window.ztools mock。
+      services.host.setHostPorts({
+        storageRoot: () => null,
+        trashItem: (p) => global.window.ztools.shellTrashItem(p),
+        notify: () => {},
+        config: null,
+        lifecycle: null,
+        plugins: null,
+        permissions: null,
+        internal: {
+          dbGet: async (k) => (k in ZP_DB ? ZP_DB[k] : []),
+          dbPut: async (k, v) => {
+            ZP_DB[k] = v
+          },
+          notifyChanged: async () => {},
+        },
+      })
+
+      // 基线：两侧同构 manifest（alpha）+ 同内容 alpha asar → 一轮无基线收敛建基线
+      await fsp.mkdir(path.join(ROOT, 'zp'), { recursive: true })
+      await writeManifest(zpManifest(), ['alpha-1.0.asar'])
+      await writeManifest(remoteManifest(), ['alpha-1.0.asar'])
+      await fsp.writeFile(path.join(ZP_LOCAL, 'alpha-1.0.asar'), 'alpha-body')
+      await fsp.writeFile(path.join(ROOT, 'zp', 'alpha-1.0.asar'), 'alpha-body')
+      const zpS1 = await syncZp()
+      check(
+        'ZP seed round adopts identical manifests and asar on both sides',
+        zpS1.conflicts === 0 && zpS1.adopted >= 2,
+        JSON.stringify({ conflicts: zpS1.conflicts, adopted: zpS1.adopted })
+      )
+
+      // 分歧：本地装 beta（manifest + 实体 + 假注册表登记），云端装 gamma ——
+      // manifest 两侧各改一处 → 真冲突。探针若被调到即失败（故意返回 local 放大差异）
+      await writeManifest(zpManifest(), ['alpha-1.0.asar', 'beta-1.0.asar'])
+      await fsp.writeFile(path.join(ZP_LOCAL, 'beta-1.0.asar'), 'beta-body')
+      ZP_DB.plugins = [registryRecord('beta-1.0.asar')]
+      await writeManifest(remoteManifest(), ['alpha-1.0.asar', 'gamma-1.0.asar'])
+      await fsp.writeFile(path.join(ROOT, 'zp', 'gamma-1.0.asar'), 'gamma-body')
+      const zpS2 = await syncZp(undefined, {
+        onConflict: async () => {
+          zpCalls++
+          return 'local'
+        },
+      })
+      // names 断言的是「同一轮轮末对账已重写回的并集」（对账在 syncDirectory
+      // 的 finally 内完成，读盘时重写已落地）；「确实走了自动裁决」由
+      // conflicts===1 + downloaded===1（远端胜出）+ calls===0（零弹窗）共同判定
+      const zpNames2 = await readNames(zpManifest())
+      check(
+        'ZP manifest conflict auto-resolves remote without any popup',
+        zpS2.conflicts === 1 && zpCalls === 0 && zpS2.downloaded === 1 && zpNames2 === 'alpha-1.0,beta-1.0,gamma-1.0',
+        JSON.stringify({ conflicts: zpS2.conflicts, calls: zpCalls, downloaded: zpS2.downloaded, names: zpNames2 })
+      )
+      const zpPending2 = await services.sync.listPendingConflicts(ZP_DIR())
+      check('ZP auto-resolved conflict leaves no pending record', Array.isArray(zpPending2) && zpPending2.length === 0, JSON.stringify(zpPending2))
+
+      // 收敛：轮末对账把本机注册表投影（beta）∪ 盘上在途记录（gamma）重写为并集
+      // 并上传；gamma asar 随指认扩大自然到达；再一轮 no-op（无对传）
+      const zpS3 = await syncZp()
+      const zpLocal3 = await readNames(zpManifest())
+      const zpRemote3 = await readNames(remoteManifest())
+      check(
+        'ZP round-end reconcile restores the local-only record and uploads the union',
+        zpS3.conflicts === 0 && zpS3.uploaded === 1 && zpLocal3 === 'alpha-1.0,beta-1.0,gamma-1.0' && zpRemote3 === 'alpha-1.0,beta-1.0,gamma-1.0',
+        JSON.stringify({ up: zpS3.uploaded, down: zpS3.downloaded, local: zpLocal3, remote: zpRemote3 })
+      )
+      const zpS4 = await syncZp()
+      check('ZP settled round is a no-op (no manifest ping-pong)', isNoop(zpS4), JSON.stringify(zpS4))
+
+      // 固定策略回归：目录级 conflictStrategy='local' 时 manifest 冲突仍自动 remote
+      //（用户的目录级策略面向用户文件，作用到本文件会让两侧都保本地、无限对传）。
+      // 判别器：云端版（含 omega）胜出 = 走了自动裁决；本地版（含 delta）胜出 = 泄漏。
+      await writeManifest(zpManifest(), ['alpha-1.0.asar', 'beta-1.0.asar', 'gamma-1.0.asar', 'delta-1.0.asar'])
+      await fsp.writeFile(path.join(ZP_LOCAL, 'delta-1.0.asar'), 'delta-body')
+      ZP_DB.plugins.push(registryRecord('delta-1.0.asar'))
+      await writeManifest(remoteManifest(), ['alpha-1.0.asar', 'beta-1.0.asar', 'gamma-1.0.asar', 'omega-1.0.asar'])
+      await fsp.writeFile(path.join(ROOT, 'zp', 'omega-1.0.asar'), 'omega-body')
+      const zpS5 = await syncZp({ ...SP, conflictStrategy: 'local' }, {
+        onConflict: async () => {
+          zpCalls++
+          return 'local'
+        },
+      })
+      // 判别器同上：downloaded===1（云端版落地；固定 local 会改为上传）+ calls===0；
+      // names 是本轮对账重写后的并集（delta 已被重新投影回去）
+      const zpNames5 = await readNames(zpManifest())
+      check(
+        'ZP fixed local strategy still auto-resolves the manifest remote (anti ping-pong)',
+        zpS5.conflicts === 1 && zpCalls === 0 && zpS5.downloaded === 1 && zpNames5 === 'alpha-1.0,beta-1.0,delta-1.0,gamma-1.0,omega-1.0',
+        JSON.stringify({ conflicts: zpS5.conflicts, calls: zpCalls, downloaded: zpS5.downloaded, names: zpNames5 })
+      )
+      // 本机 delta 由对账重新投影回并集并上传，两侧最终一致且无对传
+      const zpS6 = await syncZp()
+      const zpLocal6 = await readNames(zpManifest())
+      const zpRemote6 = await readNames(remoteManifest())
+      const zpS7 = await syncZp()
+      check(
+        'ZP union re-converges on both sides and the next round is a no-op',
+        zpS6.uploaded === 1 && zpLocal6 === 'alpha-1.0,beta-1.0,delta-1.0,gamma-1.0,omega-1.0' && zpRemote6 === zpLocal6 && isNoop(zpS7),
+        JSON.stringify({ up: zpS6.uploaded, local: zpLocal6, remote: zpRemote6, s7: zpS7 })
+      )
+    } finally {
+      services.host.setHostPorts(null) // 双保险：异常路径也不把注入泄漏给后续节
+      await switchDevice(STORAGE_MAIN)
+      await fsp.rm(ZP_LOCAL, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'zp'), { recursive: true, force: true }).catch(() => {})
+      await setProfile(null)
+    }
+  })
+
   // B4：进度事件节流 —— 逐文件 tick 不再全量外发（同相位 ≥150ms 节流），
   // 但每相位首事件与终态事件必然送达：注入式用例（plan 首事件窗口）依赖前者，
   // 最终计数依赖后者。用 30 个小文件的上传轮观测。
@@ -2432,6 +2590,23 @@ const {
     const d = { id: 'fn2', localPath: L, remotePath: '/fn2', mode: 'two-way' }
     const badNames = ['a<b.txt', 'colon:name.txt', 'quote"s.txt', 'CON.txt', 'NUL.bin', 'pipe|x.txt', 'trail. ', 'tail ', `L${'x'.repeat(249)}.txt`]
     const goodNames = ['café.txt', 'a b.txt', 'ok.txt']
+    // win32：这些非法名在 NTFS 上无法经普通路径创建（Win32 路径解析直接拒绝，
+    // 测试自身的 writeFile 即 ENOENT，引擎侧任何 API 同样打不开）—— 轮级 e2e
+    // 场景只能在允许此类名字的本机（POSIX）成立。Windows 本机改用预检纯函数的
+    // 全语料直检覆盖同一判定面（checkWindowsRel 即上传 / 下载前置检查的同一实现），
+    // 轮级行为（错误收场 / 失败退避表 / 退避跳过 / 重命名恢复）由 POSIX 分支覆盖。
+    if (process.platform === 'win32') {
+      const checkRel = services.sync._internals.checkWindowsRel
+      check(
+        'FN2[win32] 预检纯函数拦截全部非法名（字符 / 保留名 / 尾空格点 / 超长），合法名放行',
+        badNames.every((n) => !!checkRel(n, L)) && goodNames.every((n) => checkRel(n, L) == null),
+        JSON.stringify(badNames.map((n) => [n, checkRel(n, L)]))
+      )
+      const conWhy = String(checkRel('CON.txt', L))
+      check('FN2[win32] 错误归因指向 Windows（保留名点名）', conWhy.includes('Windows') && conWhy.includes('CON'), conWhy)
+      await fsp.rm(L, { recursive: true, force: true }).catch(() => {})
+      return
+    }
     for (const n of badNames) await fsp.writeFile(path.join(L, n), 'bad')
     for (const n of goodNames) await fsp.writeFile(path.join(L, n), 'good')
     let s1 = null

@@ -12,8 +12,8 @@ import type { DirOverrides, Prefs, SyncDir, SyncMode } from '../env.d'
 /**
  * 同步目录「创建 / 修改」共用弹窗：传入 dir 为修改模式，不传为创建模式，仅标题不同。
  * 基础字段：本地目录 / WebDAV 目录 / 同步方式；「高级设置」默认收起，
- * 内含「单独设置这个文件夹」开关与全部可覆盖项（是否自动同步 / 检查频率 /
- * 冲突处理 / 忽略隐藏文件 / 并发传输数 / 请求频率限制 / 多设备互斥同步 /
+ * 内含「单独设置这个文件夹」开关与全部可覆盖项（是否自动同步 / 监听文件变化 /
+ * 检查频率 / 冲突处理 / 忽略隐藏文件 / 并发传输数 / 请求频率限制 / 多设备互斥同步 /
  * 深度校验 / 排除规则）：未开启覆盖时各项只读展示全局当前值，开启后可单独
  * 编辑并随保存整体写入目录级覆盖（关闭覆盖 = 整体恢复跟随全局，不做逐字段回退）。
  * 插件同步虚拟行（isPluginDir）为第三形态：身份字段只读展示（自动发现 /
@@ -46,6 +46,7 @@ const isPluginDir = computed(() => !!props.dir && isPluginSyncDir(props.dir))
  * 使「只用树做过勾选」的目录在表单里如实显示「已单独设置」状态 */
 const OVERRIDE_KEYS = [
   'autoSync',
+  'watchFiles',
   'intervalMin',
   'conflictStrategy',
   'ignoreHidden',
@@ -71,6 +72,7 @@ const advancedOpen = ref(false)
 const overrideOn = ref(false)
 // 打开时由 initForm 按覆盖值 ?? 全局当前值重设；此处初值仅占位
 const autoSync = ref(true)
+const watchFiles = ref(true)
 const conflictStrategy = ref<Prefs['conflictStrategy']>('ask')
 const ignoreHidden = ref(true)
 const intervalMin = ref(60)
@@ -122,6 +124,7 @@ function initForm() {
   // 排除规则的回落值分两种：普通目录展示全局规则；插件同步记录展示内置默认
   //（运行时数据库三件套）—— 它的生效规则 = 全局 ∪ 记录级，未自定义时记录级取默认
   autoSync.value = (overrideOn.value ? o?.autoSync : undefined) ?? prefs.autoSync
+  watchFiles.value = (overrideOn.value ? o?.watchFiles : undefined) ?? prefs.watchFiles !== false
   conflictStrategy.value = (overrideOn.value ? o?.conflictStrategy : undefined) ?? prefs.conflictStrategy
   ignoreHidden.value = (overrideOn.value ? o?.ignoreHidden : undefined) ?? prefs.ignoreHidden
   intervalMin.value = (overrideOn.value ? o?.intervalMin : undefined) ?? prefs.intervalMin
@@ -230,6 +233,7 @@ function currentOverrides(): DirOverrides | null {
   if (!overrideOn.value) return null
   const out: DirOverrides = {
     autoSync: autoSync.value,
+    watchFiles: watchFiles.value,
     intervalMin: intervalMin.value,
     conflictStrategy: conflictStrategy.value,
     ignoreHidden: ignoreHidden.value,
@@ -439,6 +443,16 @@ function browseRemote() {
                   </div>
                   <span class="flex-spacer" />
                   <AppSwitch v-model="autoSync" :disabled="!overrideOn" />
+                </div>
+                <!-- 监听文件变化：目录级即时触发开关；自动同步关掉时 watcher 不会挂载，
+                     本项随之无效（禁用置灰提示依赖关系） -->
+                <div class="flex items-center gap-3 pt-[4px] pb-[5px]">
+                  <div class="flex items-center gap-[3px] min-w-0">
+                    <span class="text-[12px] font-medium text-ink-1">监听文件变化</span>
+                    <InfoTip text="该文件夹的本地文件一有改动立即同步，不必等下一次检查；关闭后仅按检查频率定时对账。自动同步关闭时本项不生效" />
+                  </div>
+                  <span class="flex-spacer" />
+                  <AppSwitch v-model="watchFiles" :disabled="!overrideOn || !autoSync" />
                 </div>
                 <!-- 检查频率（同步频率）：自动同步的轮询间隔 -->
                 <div class="flex items-center gap-3 pt-[4px] pb-[5px]">

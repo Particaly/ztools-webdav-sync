@@ -64,6 +64,20 @@ export const REQUIRED_INTERNAL_CHANNELS = [
 export const REGISTRY_PERMISSION_REQUEST_REASON =
   '同步完成后把从云端回来的插件登记进 ZTools 已安装列表：读取与更新插件注册表，并通知界面即时刷新'
 
+/**
+ * 运行时插件管理通道清单（运行中插件预检的授权需求：查询运行列表 + 卸载插件）。
+ * 刻意**不在** REQUIRED_INTERNAL_CHANNELS 里 —— 注册表对账的授权门槛保持三通道
+ * 不变，已批准旧通道的用户不因新通道缺失而卡在对账 pending（向后兼容）；本清单
+ * 只用于渐进式补申请（见 reconcileCore 步骤 1.5），缺失时预检整体降级（不做
+ * 预检，锁定文件按既有失败路径处理）。卸载走 internal:delete-plugin（宿主流程
+ * 含停止实例 / 移除注册记录 / 直接删除实体文件，不经回收站），无需 kill 通道。
+ */
+export const RUNTIME_PLUGIN_CHANNELS = ['internal:get-running-plugins', 'internal:delete-plugin'] as const
+
+/** 运行时通道补申请附带的用途说明（设置页「高级权限」审批界面展示，限 500 字） */
+export const RUNTIME_PLUGIN_PERMISSION_REQUEST_REASON =
+  '同步前检测正在运行的插件，并在征得同意后卸载它们（保留插件数据），以便安全完成插件文件的更新与安装'
+
 /** 首写注册表前的备份保留份数（pluginData/registry-backups 下滚动清理） */
 const BACKUP_KEEP = 5
 
@@ -706,6 +720,15 @@ export async function reconcileCore(pluginsDir: string, deps: RegistryReconcileD
           return result
         }
         // request 返回 granted（提交瞬间已齐备 / 宿主兜底判定）：落闸继续对账
+      }
+
+      // 1.5 运行时插件管理通道的渐进式补申请：注册表三通道已齐备（走到这里）
+      //     但运行时通道缺失时补一次申请（宿主对同插件申请做通道并集）。刻意
+      //     不返回 pending —— 预检通道的审批不阻塞注册表对账；批准后预检自动
+      //     生效，被驳回后不再重复提交（缺失集被已有待审申请覆盖时静默跳过）。
+      const rtMissing = RUNTIME_PLUGIN_CHANNELS.filter((c) => !granted.includes(c))
+      if (rtMissing.length > 0 && !rtMissing.every((c) => pendingList.includes(c))) {
+        await permPort.request(rtMissing, RUNTIME_PLUGIN_PERMISSION_REQUEST_REASON).catch(() => null)
       }
     }
 

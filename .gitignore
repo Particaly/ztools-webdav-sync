@@ -8,6 +8,9 @@ test/.dav-root*/
 src-ztools/dist/
 src-ztools/preload/dist/
 
+# 离线安装包产物（npm run pack 生成）
+release/
+
 # 一次性压测 / profiling 在仓库根留下的点前缀工作目录（如 .throttle-bench）：
 # 运行工件而非源码，host-load-check 的 asar 内容检查会拒绝它们进入打包产物
 .throttle-bench*/

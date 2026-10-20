@@ -9,7 +9,7 @@
 //   * 派生 computed 与全局暂停。
 // 依赖图叶子（仅依赖 vue / toast / options / types）；域模块与组合层单向依赖本文件。
 import { computed, reactive, ref, watch } from 'vue'
-import type { ConflictChoice, ConflictInfo, DavCapabilities, DavConfig, DavServerEntry, DavTier, DirOverrides, DirStatus, Prefs, SyncDir, SyncLogEntry, SyncMode } from '../env.d'
+import type { ConflictChoice, ConflictInfo, DavCapabilities, DavConfig, DavServerEntry, DavTier, DirOverrides, DirStatus, PluginRunningPromptItem, Prefs, SyncDir, SyncLogEntry, SyncMode } from '../env.d'
 
 export type TestResult = {
   ok: boolean
@@ -47,6 +47,8 @@ export function isPluginSyncDir(d: SyncDir): boolean {
 export function defaultPrefs(): Prefs {
   return {
     autoSync: true,
+    // 监听文件变化：本地变更经 fs watcher 即时触发同步（不等轮询点）；目录级可单独关
+    watchFiles: true,
     // 检查频率默认 1 小时（选项里最常用的中低频档；用户显式选过的值不受影响）
     intervalMin: 60,
     conflictStrategy: 'ask',
@@ -169,6 +171,15 @@ export const state = reactive({
   /** 冲突弹窗「对本轮剩余冲突都这样处理」勾选：置位后本轮后续冲突不再弹窗 */
   conflictApplyAll: false,
   /**
+   * 「运行中插件需要更新」弹窗队列（plugin-running 事件驱动，与冲突队列同形态）：
+   * 引擎传输前预检发现本轮要覆盖 / 删除的文件属于正在运行的插件 —— 弹窗询问
+   * 「卸载插件并继续（保留数据）」或「本轮跳过」；应答经 pluginPromptResolvers
+   * 回传调度器。
+   */
+  pluginPromptQueue: [] as Array<{ promptId: string; dirId: string; items: PluginRunningPromptItem[] }>,
+  /** 当前展示的运行中插件询问（队列头；null = 无） */
+  activePluginPrompt: null as { promptId: string; dirId: string; items: PluginRunningPromptItem[] } | null,
+  /**
    * 远端根丢失决策弹窗的目标目录 id（null = 关闭）。自动触发统一经 autoPromptRootLost
    *（pending-conflicts 事件、冷启动 / 回窗口 / 轮末兜底刷新等任一数据到手路径），
    * 另有 DirRow 提示条 / 待处理面板 / 待处理中心的「去处理」直达入口；
@@ -199,6 +210,9 @@ export const state = reactive({
 
 /** 冲突解决器的等待表：onConflict 回调据此挂起直到用户选择 */
 export const conflictResolvers = new Map<ConflictInfo, (c: ConflictChoice) => void>()
+
+/** 运行中插件询问的等待表：promptId → 用户选择（plugin-running 弹窗应答回传调度器） */
+export const pluginPromptResolvers = new Map<string, (c: 'uninstall' | 'skip') => void>()
 
 // ---------- 持久化 ----------
 

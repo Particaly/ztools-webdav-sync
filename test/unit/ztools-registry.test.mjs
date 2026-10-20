@@ -330,6 +330,13 @@ test('ZTools 注册表对账权限闸单元（ZR8，强顺序链）', async () =
       CH.length === 3 && CH.includes('internal:db-get') && CH.includes('internal:db-put') && CH.includes('internal:notify-plugins-changed'),
       JSON.stringify(CH)
     )
+    // 运行时通道与注册表门槛刻意分离（向后兼容：已批准旧三通道的用户不因新通道
+    // 卡在对账 pending）
+    check(
+      'ZR8-0b runtime plugin channels are outside the registry gate',
+      zr.RUNTIME_PLUGIN_CHANNELS.length === 2 && zr.RUNTIME_PLUGIN_CHANNELS.every((c) => !CH.includes(c)),
+      JSON.stringify(zr.RUNTIME_PLUGIN_CHANNELS)
+    )
 
     const calls = { put: 0, notify: 0, gets: 0, requests: [] }
     const makeDb = (records) => ({ records, denied: false })
@@ -401,13 +408,17 @@ test('ZTools 注册表对账权限闸单元（ZR8，强顺序链）', async () =
       JSON.stringify({ r, requests: calls.requests })
     )
 
-    // ZR8e 按通道授权齐备（无 fullAccess）：直通对账（授权实时生效的验收路径）
+    // ZR8e 按通道授权齐备（无 fullAccess）：直通对账（授权实时生效的验收路径）。
+    // 运行时插件管理通道（运行中插件预检）刻意不在注册表门槛内：缺失时补一次
+    // 渐进式申请（不阻塞对账、不返回 pending）—— 申请即发生，对账照常 ok。
     calls.requests.length = 0
     r = await zr.reconcileCore(pluginsDir, { ...depsBase(), permissions: makePerms({ value: { fullAccess: false, granted: [...CH] }, pending: [] }, () => ({ success: false })) })
     check(
-      'ZR8e all channels granted proceeds like full access',
-      r.status === 'ok' && r.wroteManifest === true && calls.requests.length === 0 && calls.gets > 0,
-      JSON.stringify({ r, requests: calls.requests.length })
+      'ZR8e all channels granted proceeds like full access (runtime channels get one best-effort request)',
+      r.status === 'ok' && r.wroteManifest === true && calls.requests.length === 1 &&
+        JSON.stringify(calls.requests[0].apis) === JSON.stringify([...zr.RUNTIME_PLUGIN_CHANNELS]) &&
+        calls.requests[0].reason === zr.RUNTIME_PLUGIN_PERMISSION_REQUEST_REASON && calls.gets > 0,
+      JSON.stringify({ r, requests: calls.requests })
     )
 
     // ZR8f 申请接口失败（success=false）：按 pending 记录原因（申请未入队列 →
@@ -425,10 +436,24 @@ test('ZTools 注册表对账权限闸单元（ZR8，强顺序链）', async () =
     r = await zr.reconcileCore(pluginsDir, { ...depsBase(), permissions: makePerms({ value: { fullAccess: false, granted: [], pending: [] } }, () => ({ success: true, status: 'pending' })) })
     check('ZR8f-b failed submission is resubmitted on the next round', r.status === 'pending' && calls.requests.length === 2, JSON.stringify({ r, requests: calls.requests.length }))
 
-    // ZR8g 批准后（授权到位）：下一轮对账自动通过（申请通道不再被调用）
+    // ZR8g 批准后（授权到位）：下一轮对账自动通过（注册表通道不再被申请；
+    // 运行时通道仍未授权 → 渐进式申请继续补提，对账本身不受影响）
     calls.requests.length = 0
     r = await zr.reconcileCore(pluginsDir, { ...depsBase(), permissions: makePerms({ value: { fullAccess: false, granted: [...CH] }, pending: [] }, () => ({ success: false })) })
-    check('ZR8g next round after approval passes the gate automatically', r.status === 'ok' && calls.requests.length === 0, JSON.stringify(r))
+    check(
+      'ZR8g next round after approval passes the gate automatically (only the runtime-channel request remains)',
+      r.status === 'ok' && calls.requests.length === 1 && JSON.stringify(calls.requests[0].apis) === JSON.stringify([...zr.RUNTIME_PLUGIN_CHANNELS]),
+      JSON.stringify({ r, requests: calls.requests })
+    )
+
+    // ZR8i 运行时通道已被待审申请覆盖 / 已授权：不再重复提交（与注册表通道同款
+    // 并集去重 —— 驳回后待审态消失才会重新出现在审批队列）。前一轮已把 manifest
+    // 写齐，本轮无变化 → noop（无请求即达标）。
+    calls.requests.length = 0
+    r = await zr.reconcileCore(pluginsDir, { ...depsBase(), permissions: makePerms({ value: { fullAccess: false, granted: [...CH, ...zr.RUNTIME_PLUGIN_CHANNELS] }, pending: [] }, () => ({ success: false })) })
+    check('ZR8i runtime channels granted: reconciliation proceeds with zero requests', (r.status === 'ok' || r.status === 'noop') && calls.requests.length === 0, JSON.stringify({ r, requests: calls.requests.length }))
+    r = await zr.reconcileCore(pluginsDir, { ...depsBase(), permissions: makePerms({ value: { fullAccess: false, granted: [...CH], pending: [...zr.RUNTIME_PLUGIN_CHANNELS] } }, () => ({ success: false })) })
+    check('ZR8i-b runtime channels pending-covered: no resubmit', (r.status === 'ok' || r.status === 'noop') && calls.requests.length === 0, JSON.stringify({ r, requests: calls.requests.length }))
 
     // ZR8h 旧宿主（无权限查询通道）：回退直接探测 —— dbGet 正常即直通
     r = await zr.reconcileCore(pluginsDir, { ...depsBase() })

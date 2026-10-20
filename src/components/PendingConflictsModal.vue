@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton, AppModal } from './ui'
 import { useStore, dirRootLostOpen } from '../composables/store'
-import { fmtRelTime, fmtBytes, relBaseName } from '../composables/format'
+import { fmtRelTime, fmtBytes, relBaseName, joinLocalPath } from '../composables/format'
 import type { DeleteScope, SyncDir } from '../env.d'
 
 /**
@@ -221,6 +221,16 @@ function ignore(rel: string) {
   void store.ignorePendingConflict(props.dir, rel)
 }
 
+/**
+ * 在访达 / 资源管理器中定位记录对应的本地文件（打开所在文件夹并选中）：记录只带
+ * 远端 rel，本地完整路径按目录根换算（joinLocalPath）；仅冲突逐条记录提供本入口
+ *（删除树 / 根丢失是目录级决策，rel 不对应单个文件）。
+ */
+function revealLocalFile(rel: string) {
+  const p = props.dir.localPath ? joinLocalPath(props.dir.localPath, rel) : ''
+  if (p && rel !== '.') store.revealLocalFile(p)
+}
+
 const subtitle = computed(() => {
   const parts: string[] = []
   if (openConflictItems.value.length) parts.push(`${openConflictItems.value.length} 个文件待选择保留的版本`)
@@ -317,8 +327,10 @@ const subtitle = computed(() => {
         </button>
       </template>
 
-      <!-- 冲突：逐条三选一（数据侧限长 200，渲染侧分批） -->
-      <div v-for="it in items.slice(0, conflictShown)" :key="it.rel" class="item">
+      <!-- 冲突：逐条三选一（数据侧限长 200，渲染侧分批）。未决策行文件名 / 元信息
+           独占一行，五个操作按钮独立成行（choiceLabel 较长，与文件名挤一行会把
+           元信息挤成竖排）；已决策行只有定位 / 重新选择，维持单行紧凑形态 -->
+      <div v-for="it in items.slice(0, conflictShown)" :key="it.rel" class="item" :class="{ 'item-col': !it.choice || rework.has(it.rel) }">
         <div class="min-w-0 flex-1 flex flex-col gap-[2px]">
           <span class="font-mono text-[12px] text-ink-1 truncate select-text" :title="it.rel">{{ it.rel }}</span>
           <span class="text-[11px] text-ink-4">{{
@@ -327,10 +339,16 @@ const subtitle = computed(() => {
               : `发现于 ${fmtRelTime(it.createdAt)}`
           }}</span>
         </div>
-        <div v-if="!it.choice || rework.has(it.rel)" class="flex items-center gap-[6px] shrink-0">
+        <div v-if="!it.choice || rework.has(it.rel)" class="conflict-actions">
           <button type="button" class="act" @click="applyOne(it.rel, 'local')">保留电脑版本</button>
           <button type="button" class="act" @click="applyOne(it.rel, 'remote')">保留云端版本</button>
           <button type="button" class="act" @click="applyOne(it.rel, 'both')">同时保留</button>
+          <button
+            type="button"
+            class="act"
+            title="在访达 / 资源管理器中打开所在文件夹并选中该文件"
+            @click="revealLocalFile(it.rel)"
+          >定位</button>
           <button
             type="button"
             class="act muted"
@@ -339,11 +357,17 @@ const subtitle = computed(() => {
           >忽略</button>
         </div>
         <!-- 已选择但尚未执行（记录仍在 = 引擎未消费，消费成功即清除）：可反悔改选；
-             同步中锁定 —— 本轮已按该决策执行，改选来不及 -->
+             同步中锁定 —— 本轮已按该决策执行，改选来不及。定位只读，不随同步锁定 -->
         <div v-else class="flex items-center gap-[6px] shrink-0">
           <span class="shrink-0 inline-flex items-center gap-[4px] text-[11px] text-success">
             <AppIcon name="check-circle" :size="12" bg="var(--green-bg)" />
           </span>
+          <button
+            type="button"
+            class="act"
+            title="在访达 / 资源管理器中打开所在文件夹并选中该文件"
+            @click="revealLocalFile(it.rel)"
+          >定位</button>
           <button v-if="!syncing" type="button" class="act rework-act" @click="toggleRework(it.rel)">重新选择</button>
         </div>
       </div>
@@ -382,6 +406,21 @@ const subtitle = computed(() => {
   padding: 8px 10px;
   border: 1px solid var(--br-divider);
   border-radius: 7px;
+}
+
+/* 未决策冲突行：内容纵排（文件名 / 元信息一行 + 操作按钮一行）；
+   .conflict-actions 贴右对齐，与底部「统一处理」按钮的走向一致 */
+.item-col {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.conflict-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 /* 根丢失决策入口条：与错误条同色系（红）以区别于逐条记录 */

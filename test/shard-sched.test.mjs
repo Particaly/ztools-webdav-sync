@@ -1921,6 +1921,114 @@ const mountScZtools = () => mountFakeDbStorage(SC_DB)
     }
   })
 
+  // ============================================================
+  // SC14：监听文件变化开关（全局 prefs.watchFiles + 目录级 overrides.watchFiles）。
+  //   watcher 是自动触发的执行通道之一：开关只影响挂载（rebuildWatchers 的
+  //   watchOf 门控），interval 预订与手动 syncNow 一律不受影响 —— 与
+  //   autoSync=false（清预订 + 摘 watcher，见 SC12）的语义分野即本节主断言。
+  //   假时钟只注入不推进（tick 冻结）：interval 轮永不发射，观察面只剩 watcher
+  //   触发与手动 syncNow，断言零干扰。
+  //   ① 默认（全局开）：自动同步目录挂 watcher；
+  //   ② 全局关：watcher 摘除、文件变化不再触发轮，interval 预订保留；
+  //   ③ 目录级 true 覆盖全局 false：该目录 watcher 挂回；未覆盖目录跟随全局不挂；
+  //   ④ 目录级 false（全局开）：watcher 摘除，手动 syncNow 仍可用；
+  //   ⑤ 覆盖清除：watcher 挂回。
+  // ============================================================
+  await section('SC14：监听文件变化开关（全局 + 目录级覆盖）', async () => {
+    mountScZtools()
+    await freshStore('sc14')
+    const clock = makeFakeClock()
+    const SC14_LOCAL = await tmpLocal('sc14')
+    const SC14_LOCAL2 = await tmpLocal('sc14b')
+    await fsp.writeFile(path.join(SC14_LOCAL, 'a.txt'), 'sc14-a')
+
+    // 记录型引擎包装：watcher 注册 / 摘除记账（watchOf 门控的观测面）；轮体委托真实引擎
+    const watchRegs = []
+    const watchStops = []
+    const sched = createTestSched({
+      engine: {
+        syncDirectory: services.sync.syncDirectory,
+        watchDir: (id, lp, cb) => {
+          watchRegs.push(id)
+          return services.fsx.watchDir(id, lp, cb)
+        },
+        stopWatch: (id) => {
+          watchStops.push(id)
+          return services.fsx.stopWatch(id)
+        },
+        stopAllWatch: services.fsx.stopAllWatch,
+        listPendingConflicts: services.sync.listPendingConflicts,
+      },
+      now: clock.now,
+      timers: clock.timers,
+    })
+    const events = []
+    sched.subscribe((ev) => events.push(ev))
+    const roundEnds = () => events.filter((e) => e.type === 'round-end')
+    const watcherId = `${sched.instanceId}:d1`
+    const watcherId2 = `${sched.instanceId}:d2`
+    const regCount = (id) => watchRegs.filter((x) => x === id).length
+    const dir1 = (o) => ({ id: 'd1', localPath: SC14_LOCAL, remotePath: '/sc14', mode: 'two-way', ...(o ? { overrides: o } : {}) })
+    const dir2 = { id: 'd2', localPath: SC14_LOCAL2, remotePath: '/sc14b', mode: 'two-way' }
+    setSCConfig([dir1()], { autoSync: true, intervalMin: 1 })
+    try {
+      await sched.init()
+      const elected = await waitReal(() => sched.getSnapshot().leader.isLeader === true, 8000)
+      check('SC14 leader elected for watch-toggle tests', elected, '')
+
+      // ① 全局默认开：自动同步目录挂 watcher
+      const ok1 = await waitReal(() => regCount(watcherId) >= 1, 5000)
+      check('SC14 watcher registered by default (global watching on)', ok1, JSON.stringify({ watchRegs, watchStops }))
+
+      // ② 全局关：watcher 摘除、文件变化不触发轮；interval 预订保留（与 autoSync=false 的分野）
+      setSCConfig([dir1()], { autoSync: true, intervalMin: 1, watchFiles: false })
+      await sched.reload()
+      const stopped1 = await waitReal(() => watchStops.includes(watcherId), 5000)
+      const slotOff = sched.getSnapshot().slots.find((x) => x.id === 'd1')
+      check(
+        'SC14 global watchFiles=false stops the watcher but keeps the interval booking',
+        stopped1 && slotOff && slotOff.state === 'scheduled' && slotOff.nextDueKind === 'interval' && slotOff.nextDueAt != null,
+        JSON.stringify({ watchStops, slot: slotOff && { state: slotOff.state, kind: slotOff.nextDueKind } })
+      )
+      const roundsBefore = roundEnds().length
+      await fsp.writeFile(path.join(SC14_LOCAL, 'b.txt'), 'sc14-b')
+      await sleep(2600) // 引擎 watcher 去抖 1.5s：若未摘除，此处必然出现 watch 轮
+      check('SC14 no round fires after file change with watching off', roundEnds().length === roundsBefore, `rounds=${roundEnds().length}/${roundsBefore}`)
+
+      // ③ 目录级 true 覆盖全局 false：d1 的 watcher 挂回（且 ③ 阶段没有多余摘除 ——
+      //    摘除计数仍只有 ② 的那一次）；未覆盖的 d2 跟随全局（false）不挂
+      setSCConfig([dir1({ watchFiles: true }), dir2], { autoSync: true, intervalMin: 1, watchFiles: false })
+      await sched.reload()
+      const rebooked = await waitReal(() => regCount(watcherId) >= 2, 5000)
+      const d1slot = sched.getSnapshot().slots.find((x) => x.id === 'd1')
+      check(
+        'SC14 per-dir watchFiles=true overrides global off (watcher re-registered)',
+        rebooked && watchStops.filter((x) => x === watcherId).length === 1 && d1slot && d1slot.state === 'scheduled',
+        JSON.stringify({ watchRegs, watchStops, slot: d1slot && { state: d1slot.state } })
+      )
+      check('SC14 uncovered dir follows global off (no watcher)', !watchRegs.includes(watcherId2), JSON.stringify(watchRegs))
+
+      // ④ 目录级 false（全局开）：watcher 再次摘除；手动 syncNow 不受影响
+      setSCConfig([dir1({ watchFiles: false }), dir2], { autoSync: true, intervalMin: 1 })
+      await sched.reload()
+      const offAgain = await waitReal(() => watchStops.filter((x) => x === watcherId).length >= 2, 5000)
+      check('SC14 per-dir watchFiles=false stops the watcher while global on', offAgain, JSON.stringify(watchStops))
+      const r4 = await sched.syncNow('d1')
+      check('SC14 manual syncNow still works with watching off', r4.ok === true && r4.summary && r4.summary.uploaded === 2, JSON.stringify(r4.ok ? r4.summary : r4.error))
+
+      // ⑤ 清除覆盖（跟随全局开）：watcher 挂回
+      setSCConfig([dir1(), dir2], { autoSync: true, intervalMin: 1 })
+      await sched.reload()
+      const onAgain = await waitReal(() => regCount(watcherId) >= 3, 5000)
+      check('SC14 clearing the override re-registers the watcher', onAgain, JSON.stringify({ watchRegs, watchStops }))
+    } finally {
+      sched.cleanup()
+      await fsp.rm(SC14_LOCAL, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(SC14_LOCAL2, { recursive: true, force: true }).catch(() => {})
+      await fsp.rm(path.join(ROOT, 'sc14'), { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
 afterAll(async () => {
   // SC 系列收尾（原 DS1 前 gap 的节外语句迁移至此）：摘假 ztools、清 SC_DB
   delete global.window.ztools

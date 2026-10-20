@@ -23,6 +23,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { ZTOOLS_PLUGINS_DIR_ID, type ZtoolsPluginsSyncDesc } from './types.mts'
 
 /**
@@ -187,4 +188,129 @@ export function pickUninstalledAsarRels(asarRels: Iterable<string>, installedEnt
     stale.add(s)
   }
   return stale
+}
+
+// ---------- 运行中插件预检（自身保护 + 本地写命中判定） ----------
+//
+// 运行中的插件实体文件被宿主进程占用（Windows 上 asar 映射 / 目录插件的工作文件
+// 均持有句柄），同步引擎对它们的覆盖 / 删除必然失败（移入回收站报 EBUSY / EPERM）。
+// 本节提供引擎「传输前预检门」的三个纯函数（不接触文件系统 / 宿主，判定输入全部
+// 注入，单元测试直接覆盖）：
+//   - selfPluginEntityRel      —— 识别「本插件自己」的实体（同步引擎就运行在它
+//     里面，既无法被停止（停止 = 杀死正在同步的自己），也绝不能被同步替换）；
+//   - pickRunningPluginWriteRels —— 把「本轮要写本地的 rel」匹配到运行中的插件
+//     实体（顶层 asar 精确命中；目录实体按前缀命中其内部全部文件）；
+//   - pluginDisplayInfoFor     —— 从注册表 / manifest 记录解析实体的展示名与
+//     图标（title 优先，回落 name / 实体文件名；logo 重建为可直接展示的
+//     file:// / data: URL），供「重新安装」询问弹窗展示。
+
+/**
+ * 识别当前运行的 preload 模块所属的插件实体（纯函数）：moduleFile 是引擎运行时
+ * 的 `__filename`（Electron 内为 asar 虚拟路径形态，如
+ * `<pluginsDir>/webdav-sync-1.1.0-abc.asar/src-ztools/preload/dist/services.js`），
+ * 取其相对 pluginsDir 的第一段即实体名（asar 文件名 / 目录插件目录名）。
+ * moduleFile 不在 pluginsDir 之内（开发项目实体在目录外 / 浏览器形态无
+ * `__filename`）返回 null —— 此时引擎不做自身排除，行为与本功能加入前一致。
+ * 前缀判定按大小写不敏感比较（Windows 路径大小写不敏感；宿主注入路径与
+ * 环境变量路径的大小写可能不一致），返回的实体名保留磁盘原样大小写 —— 与
+ * 扫描表的 rel key 同源（都来自磁盘枚举）。
+ * @param pluginsDir 插件实体目录绝对路径
+ * @param moduleFile 当前模块文件的绝对路径（null / undefined / 空串 = 不可得）
+ * @returns 实体名（pluginsDir 相对路径首段，'/' 分隔）；无法判定返回 null
+ */
+export function selfPluginEntityRel(pluginsDir: string, moduleFile: string | null | undefined): string | null {
+  if (!moduleFile) return null
+  const norm = (p: string): string => String(p).replace(/\\/g, '/').replace(/\/+$/, '')
+  const dir = norm(pluginsDir)
+  const file = String(moduleFile).replace(/\\/g, '/')
+  if (!dir || !file.toLowerCase().startsWith(dir.toLowerCase() + '/')) return null
+  const seg = file.slice(dir.length + 1).split('/')[0] || ''
+  if (!seg || seg.startsWith('.')) return null
+  return seg
+}
+
+/**
+ * 计算「本轮要写本地的 rel」命中了哪些运行中的插件实体（纯函数）：返回
+ * 实体绝对路径 → 实体相对路径（pluginsDir 相对、'/' 分隔）的映射 —— 键是
+ * 停止操作的入参（宿主 killPlugin 接受实体绝对路径），值用于展示名解析与
+ * 引擎日志。命中规则：rel 与实体相对路径相等（顶层 asar 被覆盖 / 删除）或
+ * rel 位于实体目录之下（目录插件内部文件被覆盖 / 删除）。运行中路径不在
+ * pluginsDir 之内（开发项目）不参与匹配 —— 引擎不同步目录外的实体。
+ * @param writeRels 本轮会写本地（覆盖下载 / 本地删除）的 rel 列表
+ * @param runningPaths 运行中插件实体的绝对路径列表（宿主 getRunningPlugins 原值）
+ * @param pluginsDir 插件实体目录绝对路径
+ * @returns 实体绝对路径 → 实体相对路径；无命中为空映射
+ */
+export function pickRunningPluginWriteRels(writeRels: Iterable<string>, runningPaths: Iterable<string>, pluginsDir: string): Map<string, string> {
+  const hits = new Map<string, string>()
+  const norm = (p: string): string => String(p).replace(/\\/g, '/').replace(/\/+$/, '')
+  const dir = norm(pluginsDir)
+  if (!dir) return hits
+  const running: Array<{ path: string; rel: string }> = []
+  for (const p of runningPaths || []) {
+    const s = String(p ?? '')
+    if (!s) continue
+    const file = s.replace(/\\/g, '/')
+    if (!file.toLowerCase().startsWith(dir.toLowerCase() + '/')) continue
+    const rel = file.slice(dir.length + 1)
+    if (!rel || rel.startsWith('.')) continue
+    running.push({ path: s, rel })
+  }
+  if (running.length === 0) return hits
+  for (const w of writeRels || []) {
+    const rel = String(w ?? '')
+    if (!rel) continue
+    for (const r of running) {
+      if (hits.has(r.path)) continue
+      if (rel === r.rel || rel.startsWith(r.rel + '/')) hits.set(r.path, r.rel)
+    }
+  }
+  return hits
+}
+
+/**
+ * 从注册表 / manifest 记录解析插件实体的展示信息（纯函数）：两类记录的实体定位
+ * 字段不同 —— 注册表 path 是绝对路径（与 pluginsDir 重定基后比对），manifest
+ * entity 是相对路径（直接比对）；title 优先于 name（展示名），命中多条取第一条
+ *（调用方保证记录顺序 = 注册表在前，宿主记录优先于 manifest 投影，与既有折叠
+ * 裁决同偏好）。logo 一并解析：data:/http(s)/file: 原样（渲染层 `<img>` 直接
+ * 可用），manifest 投影的相对路径形态按**本机** pluginsDir 重建为 file:// URL。
+ * 无任何记录命中返回 null（调用方回落实体文件名展示、不带图标）。
+ * @param records 注册表记录与 manifest 记录的混排数组（顺序即优先级）
+ * @param entityRel 实体相对 pluginsDir 的路径（'/' 分隔；目录实体为目录名）
+ * @param pluginsDir 插件实体目录绝对路径（注册表 path 的重定基基准、相对 logo 的重建基准）
+ * @returns 展示信息 { name, logo? }；无命中返回 null
+ */
+export function pluginDisplayInfoFor(records: Iterable<any>, entityRel: string, pluginsDir: string): { name: string; logo?: string } | null {
+  const norm = (p: string): string => String(p).replace(/\\/g, '/').replace(/\/+$/, '')
+  const dir = norm(pluginsDir)
+  const target = norm(entityRel).toLowerCase()
+  if (!target) return null
+  for (const r of records || []) {
+    if (!r || typeof r.name !== 'string' || !r.name) continue
+    let hit = false
+    if (typeof r.entity === 'string' && r.entity) {
+      hit = norm(r.entity).toLowerCase() === target
+    } else if (typeof r.path === 'string' && r.path) {
+      const p = String(r.path).replace(/\\/g, '/')
+      hit = dir !== '' && p.toLowerCase().startsWith(dir.toLowerCase() + '/') && norm(p.slice(dir.length + 1)).toLowerCase() === target
+    }
+    if (hit) {
+      const out: { name: string; logo?: string } = { name: (typeof r.title === 'string' && r.title.trim()) || r.name }
+      const s = typeof r.logo === 'string' ? r.logo.trim() : ''
+      if (s) {
+        if (/^(data:|https?:\/\/|file:\/\/)/i.test(s)) out.logo = s
+        else {
+          // manifest 投影的相对路径形态：按本机 pluginsDir 重建为 file:// URL
+          try {
+            out.logo = pathToFileURL(path.join(pluginsDir, ...s.replace(/\\/g, '/').split('/'))).href
+          } catch {
+            /* 畸形路径：不带图标（渲染层回落通用图标） */
+          }
+        }
+      }
+      return out
+    }
+  }
+  return null
 }

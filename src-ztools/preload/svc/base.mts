@@ -11,7 +11,7 @@
 import nodeFs from 'node:fs'
 import nodeTimers from 'node:timers'
 import * as storage from '../store.mts'
-import type { ConflictChoice, ConflictInfo, DavConfig, Prefs, SyncMode, SyncProgress } from '../types.mts'
+import type { ConflictChoice, ConflictInfo, DavConfig, Prefs, SyncMode, SyncProgress, PluginRunningPromptInfo } from '../types.mts'
 
 /**
  * 本地文件 IO 必须绕过 Electron 的 asar 补丁。ZTools 宿主（Electron）默认给 fs
@@ -103,6 +103,15 @@ export type EnginePrefs = Pick<
 export interface SyncHandlers {
   onProgress?: (p: SyncProgress) => void
   onConflict?: (info: ConflictInfo) => Promise<ConflictChoice> | ConflictChoice
+  /**
+   * 「运行中插件需要更新」询问（仅插件同步虚拟行触达）：引擎传输前预检发现
+   * 本轮要覆盖 / 删除的文件属于正在运行的插件时调用 —— 运行中插件的实体文件
+   * 被进程占用（Windows），覆盖 / 删除必然失败。实现返回 'uninstall'（卸载命中
+   * 插件、保留插件数据，并继续本轮同步 —— 云端若有新版本会随即下载并重新登记）
+   * 或 'skip'（本轮跳过相关文件）。缺省 / 抛错一律按 'skip' 处理 —— 与 onConflict
+   * 的 'defer' 同款安全侧语义。
+   */
+  onPluginRunning?: (info: PluginRunningPromptInfo) => Promise<'uninstall' | 'skip'> | 'uninstall' | 'skip'
   shouldAbort?: () => boolean
   /** 传输完成钩子（payload 形态由调用方解释；可选） */
   afterTransferOp?: (payload: any) => void

@@ -1,6 +1,6 @@
 {
   "name": "webdav-sync",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "基于 WebDAV 的多设备文件夹同步插件",
   "type": "module",
   "engines": {
@@ -10,6 +10,8 @@
     "dev": "vite",
     "typecheck": "tsc -p tsconfig.preload.json --noEmit && vue-tsc && tsc -p tsconfig.node.json",
     "build": "vite build && npm run build:preload",
+    "pack": "npm run build && node scripts/pack-zpx.mjs",
+    "pack:only": "node scripts/pack-zpx.mjs",
     "build:preload": "esbuild src-ztools/preload/services.mts --bundle --platform=node --format=cjs --target=node20 --sourcemap=linked --external:original-fs --outfile=src-ztools/preload/dist/services.js",
     "test:unit": "vitest run test/unit",
     "test:e2e": "vitest run test/shard",

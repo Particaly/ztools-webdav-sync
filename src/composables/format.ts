@@ -56,3 +56,16 @@ export const fmtSize = fmtBytes
 export function relBaseName(rel: string): string {
   return rel.split('/').pop() || rel
 }
+
+/**
+ * 本地目录根 + 远端 rel → 电脑上的完整路径：rel 恒为正斜杠的远端相对形态，
+ * 拼接时按本地根的盘符 / 反斜杠特征换用对应分隔符（Windows 根用 \，POSIX 根
+ * 用 /），根内残留的正斜杠（Windows 手输路径）一并归一。供冲突弹窗 / 待处理
+ * 中心的「在资源管理器中定位」入口换算本地文件路径；rel='.' 等目录级记录不
+ * 适用，由调用方自行拦截。
+ */
+export function joinLocalPath(localPath: string, rel: string): string {
+  const sep = /^[a-zA-Z]:[\\/]/.test(localPath) || localPath.includes('\\') ? '\\' : '/'
+  const root = localPath.replace(/[\\/]+$/, '').split('/').join(sep)
+  return root + sep + rel.split('/').join(sep)
+}

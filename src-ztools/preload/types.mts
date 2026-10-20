@@ -243,6 +243,14 @@ export interface SyncSummary {
 /** 插件偏好设置（渲染层 prefs 段） */
 export interface Prefs {
   autoSync: boolean
+  /**
+   * 监听文件变化（默认开）：本地文件变更时经 fs watcher 立即触发同步轮，不必等
+   * 下一个轮询时间点。关闭 = 只按 interval 定时对账（自动轮的另一个入口）。
+   * 目录级 overrides.watchFiles 可单独覆盖；与 autoSync 的关系是子集 —— watcher
+   * 是自动触发的执行通道之一，目录 autoSync 关闭时本项不参与判定（不挂 watcher）。
+   * 历史数据可能缺字段：调度器读取侧按「!== false 即开」防御（watchOf）。
+   */
+  watchFiles: boolean
   intervalMin: number
   conflictStrategy: 'ask' | 'local' | 'remote' | 'both'
   ignoreHidden: boolean
@@ -309,8 +317,8 @@ export interface Prefs {
   /**
    * 【实验：ZTools 插件同步】记录的目录级设置覆盖（「同步设置」弹窗写入；
    * null / 非对象 = 全部跟随全局）。可覆盖项与普通目录一致（autoSync /
-   * intervalMin / conflictStrategy / ignoreHidden / concurrency / ratePerSec /
-   * leaseLock / deepVerify / excludePatterns），excludePatterns 享有
+   * watchFiles / intervalMin / conflictStrategy / ignoreHidden / concurrency /
+   * ratePerSec / leaseLock / deepVerify / excludePatterns），excludePatterns 享有
    * PLUGIN_SYNC_DEFAULT_EXCLUDES 的三态默认（组装见 pluginSyncExcludePatterns）。
    * 虚拟行不持久化，本字段是该记录唯一可持久化的目录级状态 —— 渲染层
    * setDirOverrides / updateDir 对虚拟行路由到这里，调度器 loadConfig 合成
@@ -435,6 +443,7 @@ export interface DirPrefsOverridesInput {
  */
 export interface ZtoolsPluginSyncOverridesInput extends DirPrefsOverridesInput {
   autoSync?: unknown
+  watchFiles?: unknown
   intervalMin?: unknown
   ratePerSec?: unknown
 }
@@ -563,6 +572,36 @@ export interface RegistryReconcileResult {
   error?: string
 }
 
+/**
+ * 「运行中插件需要更新」询问的条目（引擎预检门的命中产出；渲染层弹窗展示与
+ * 卸载操作的数据源）。一个运行中的插件实体（顶层 asar 或目录）只产出一条。
+ */
+export interface PluginRunningPromptItem {
+  /** 插件展示名（注册表 / manifest 记录的 title，回落 name；无记录时为实体文件名） */
+  name: string
+  /**
+   * 插件图标（可直接用于 `<img src>`：file:// / data: / http(s): URL）。来自
+   * 注册表 / manifest 记录的 logo 字段（相对路径按本机插件目录重建为 file://）；
+   * 无记录或无图标时缺省 —— 渲染层回落通用插件图标。注意卸载前实体仍在，图标
+   * 文件此刻可读；加载失败由渲染层兜底。
+   */
+  logo?: string
+  /** 命中文件相对插件目录的路径（顶层 asar 文件或目录实体内的文件，'/' 分隔） */
+  rel: string
+  /** 运行中实体绝对路径（宿主 getRunningPlugins 的原值；卸载操作的入参） */
+  entityPath: string
+}
+
+/**
+ * 「运行中插件需要更新」询问载荷（引擎 → 调度器 → 渲染层弹窗）：
+ * 引擎在传输前预检发现「本轮要覆盖 / 删除的文件属于正在运行的插件」时组装；
+ * 用户选择 'uninstall'（卸载这些插件、保留数据并继续同步）或 'skip'（本轮跳过
+ * 相关文件）。
+ */
+export interface PluginRunningPromptInfo {
+  items: PluginRunningPromptItem[]
+}
+
 /** 冲突信息（渲染层弹窗展示用） */
 export interface ConflictInfo {
   dirId: string
@@ -680,6 +719,15 @@ export type SchedulerEvent =
   | { type: 'round-end'; dirId: string; summary: SyncSummary | null; error: string | null; cancelled: boolean }
   | { type: 'conflict'; conflictId: string; dirId: string; info: ConflictInfo }
   | { type: 'pending-conflicts'; dirId: string; items: Array<{ rel: string; createdAt: number; choice?: string; kind?: string; [k: string]: unknown }>; newlyNotified: boolean }
+  /**
+   * 「运行中插件需要更新」询问（手动轮且渲染层在线时转发，同 conflict 的通道
+   * 形态）：引擎传输前预检发现本轮要覆盖 / 删除的文件属于正在运行的插件 ——
+   * Windows 上运行中插件的 asar 被进程占用，覆盖 / 删除必然失败。渲染层弹窗
+   * 询问是否卸载这些插件（保留数据）；经 resolvePluginPrompt 应答
+   *（'uninstall' = 卸载并继续 / 'skip' = 本轮跳过），转发超时与渲染层离线均按
+   * 'skip' 结算。
+   */
+  | { type: 'plugin-running'; promptId: string; dirId: string; items: PluginRunningPromptItem[] }
   | { type: 'config-applied'; dirsCount: number }
   /**
    * 调度器自身异常。默认面向日志（渲染层只 console 记录，不弹提示）；
@@ -739,6 +787,13 @@ export interface SchedulerApi {
   reload(): Promise<{ applied: boolean; error?: string }>
   /** 应答转发来的冲突（kind=manual 且渲染层在线时的弹窗选择）；'defer' = 弹窗「稍后处理」 */
   resolveConflict(conflictId: string, choice: 'local' | 'remote' | 'both' | 'defer', applyToRemaining?: boolean): boolean
+  /**
+   * 应答转发来的「运行中插件需要更新」询问（plugin-running 事件的弹窗选择）：
+   * 'uninstall' = 卸载命中的插件（保留插件数据）并继续本轮同步 —— 云端若有
+   * 新版本会随即下载并重新登记；'skip' = 本轮跳过相关文件。
+   * @returns 是否确有等待中的该询问
+   */
+  resolvePluginPrompt(promptId: string, choice: 'uninstall' | 'skip'): boolean
   /**
    * 轮末展示摘要（纯函数）—— 熔断轮归因「服务器连续无响应」+ 最后失败摘要、
    * 相同错误消息折叠为一条、挂起冲突轮收尾「部分完成，有 N 个待处理冲突」。
@@ -1052,6 +1107,18 @@ export interface ZToolsInternalApi {
    * 调用失败静默吞掉 —— 通知是增强不是关键路径，绝不回滚已生效的登记
    */
   notifyPluginsChanged?(): Promise<unknown>
+  /**
+   * 查询运行中插件的实体绝对路径列表（含主窗口视图与分离窗口；internal:
+   * get-running-plugins 通道，需在宿主设置页授权）。可选 —— 旧宿主未注入时
+   * 为 undefined，运行中插件预检据此降级（不做预检，锁定文件按既有错误处理）。
+   */
+  getRunningPlugins?(): Promise<string[]>
+  /**
+   * 卸载插件（internal:delete-plugin 通道，需授权）：宿主侧先停止运行实例、
+   * 移除注册记录，再按 options 决定是否清除插件数据；实体文件为**直接删除**
+   *（不经回收站）。可选 —— 可选性同 getRunningPlugins。
+   */
+  deletePlugin?(pluginPath: string, options?: { deleteData?: boolean }): Promise<{ success: boolean; error?: string }>
 }
 
 /** ZTools 宿主 API（本插件用到的子集；preload 侧访问 window.ztools 的类型） */

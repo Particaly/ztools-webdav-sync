@@ -43,6 +43,23 @@ export interface InternalRegistryPort {
 }
 
 /**
+ * 插件运行时管理端口（运行中插件查询与卸载的通道）：宿主未注入对应方法时为
+ * null —— 运行中插件预检（引擎传输前询问用户是否卸载插件）据此整体降级为
+ * 「不做预检」，锁定文件按既有回收站失败路径处理。与注册表端口相同：端口只
+ * 承载「通道」，授权与否由宿主在每次调用时鉴权（internal:get-running-plugins /
+ * internal:delete-plugin 通道，申请流程见 ztools-registry.mts 的渐进式申请）。
+ */
+export interface InternalPluginManagePort {
+  /** 运行中插件的实体绝对路径列表（主窗口视图 + 分离窗口，去重）；未授权时 reject */
+  getRunning(): Promise<string[]>
+  /**
+   * 卸载一个插件（宿主侧先停止运行实例、移除注册记录，**保留插件数据**，实体
+   * 文件直接删除不经回收站）；返回宿主的执行结果。未授权时 reject。
+   */
+  uninstall(entityPath: string): Promise<{ success: boolean; error?: string }>
+}
+
+/**
  * 高级 API 权限申请端口（window.ztools 顶层能力，不走 internal 鉴权）：
  * 查询自身授权状态 + 提交授权申请。宿主支持「按通道授权 + 主动申请」体系时
  * 存在；旧宿主缺失时为 null —— 对账层退回「直接调用并按拒绝降级」的探测路径。
@@ -82,6 +99,13 @@ export interface HostPorts {
    * lifecycle 相同的「现取不缓存」语义：宿主注入 / 移除即时生效。
    */
   internal: InternalRegistryPort | null
+  /**
+   * 插件运行时管理通道（window.ztools.internal 的 getRunningPlugins /
+   * deletePlugin 端口化）：null = 旧宿主未注入这两个方法 —— 运行中插件预检
+   * 整体降级。与 config / lifecycle 相同的「现取不缓存」语义：宿主注入 /
+   * 移除即时生效。
+   */
+  plugins: InternalPluginManagePort | null
   /**
    * 高级 API 权限申请通道（查询自身状态 + 提交申请）：null = 旧宿主缺失这两个
    * 顶层方法 —— 对账层退回「直接调用并按拒绝降级」的探测路径。与 config /
@@ -193,6 +217,28 @@ function permissionsNow(): InternalPermissionPort | null {
 }
 
 /**
+ * 现取插件运行时管理通道（window.ztools.internal 的 getRunningPlugins /
+ * deletePlugin 端口化）：宿主未注入 / 任一方法缺失 / 访问异常返回 null ——
+ * 引擎的运行中插件预检据此整体降级。卸载固定携带 deleteData: false（保留插件
+ * 数据 —— 用户同意的是「替换 / 移除插件实体」，不含清空使用数据）。调用失败
+ * 原样透传（未授权的 reject 由调用方按降级处理），绝不静默吞掉 —— 「请求了
+ * 卸载但实际没执行」必须让调用方知道（预检门据此保留原任务）。
+ */
+function pluginsNow(): InternalPluginManagePort | null {
+  try {
+    const zt = ztOrNull()
+    const it: Partial<ZToolsInternalApi> | undefined = zt ? zt.internal : undefined
+    if (!it || typeof it.getRunningPlugins !== 'function' || typeof it.deletePlugin !== 'function') return null
+    return {
+      getRunning: () => it.getRunningPlugins!(),
+      uninstall: (entityPath: string) => it.deletePlugin!(entityPath, { deleteData: false }),
+    }
+  } catch (_) {
+    return null
+  }
+}
+
+/**
  * 构造绑定 window.ztools 的默认端口。现取不缓存：函数 / 属性在构造或调用时
  * 现读宿主对象，绝不持有旧引用 —— 「宿主注入晚于 preload 加载」与「注入被移除」
  * 两种时序下行为都正确（getHostPorts 未覆盖时每次调用本函数，动态性由此保证）。
@@ -232,6 +278,7 @@ export function defaultHostPorts(): HostPorts {
     config: configNow(),
     lifecycle: lifecycleNow(),
     internal: internalNow(),
+    plugins: pluginsNow(),
     permissions: permissionsNow(),
   }
 }

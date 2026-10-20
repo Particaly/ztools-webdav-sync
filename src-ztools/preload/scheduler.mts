@@ -39,7 +39,7 @@ import { getHostPorts } from './host.mts'
 import { ZTOOLS_PLUGINS_DIR_ID, describeZtoolsPluginsSync } from './ztools-plugins.mts'
 import { pluginSyncExcludePatterns, resolveDirPrefs } from './types.mts'
 import { applyNetLimits, netTraffic } from './svc/net.mts'
-import type { ConflictChoice, ConflictInfo, Prefs, RoundDisplay, SchedulerApi, SchedulerEvent, SchedulerSnapshot, SchedulerSlotView, SyncProgress, SyncSummary } from './types.mts'
+import type { ConflictChoice, ConflictInfo, Prefs, PluginRunningPromptInfo, RoundDisplay, SchedulerApi, SchedulerEvent, SchedulerSnapshot, SchedulerSlotView, SyncProgress, SyncSummary } from './types.mts'
 // 仅类型导入（编译期擦除，不构成对 services 的运行时依赖 / 循环 require）：
 // SchedulerEngine.syncDirectory 的签名与引擎侧 syncDirectory 完全同形
 import type { DirCfg, EngineCfg, EnginePrefs, SyncHandlers } from './services.mts'
@@ -504,6 +504,8 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
   const listeners = new Set<(ev: SchedulerEvent) => void>()
   /** 转发冲突的等待表：conflictId → (choice) => void（渲染层经 resolveConflict 应答） */
   const conflictResolvers = new Map<string, (choice: ConflictChoice) => void>()
+  /** 转发「运行中插件需要更新」询问的等待表：promptId → (choice) => void（渲染层经 resolvePluginPrompt 应答） */
+  const pluginPromptResolvers = new Map<string, (choice: 'uninstall' | 'skip') => void>()
   /** 轮末等待者：{ dirId, afterSeq, resolve }（手动入口等待轮完成 / rerun 轮完成） */
   const roundWaiters: RoundWaiter[] = []
   /** 已注册的 watcher：dirId → { watcherId, localPath }（仅 leader 注册） */
@@ -703,6 +705,18 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
     const o = (slot.dir && slot.dir.overrides) || {}
     if (o.autoSync != null) return o.autoSync !== false
     return !(config && config.prefs && config.prefs.autoSync === false)
+  }
+
+  /**
+   * 目录生效的「监听文件变化」开关（目录级覆盖优先，缺省跟随全局偏好）：
+   * 关闭 = 该目录不挂 watcher，本地变化不再即时触发轮，对账交给 interval
+   * 定时轮（dirEligible 仍要求 autoSync 开 —— watcher 是自动触发的执行通道，
+   * 自动同步整体关闭时本开关无意义，不参与判定）。手动 syncNow 不受影响。
+   */
+  function watchOf(slot: DirSlot): boolean {
+    const o = (slot.dir && slot.dir.overrides) || {}
+    if (o.watchFiles != null) return o.watchFiles !== false
+    return !(config && config.prefs && config.prefs.watchFiles === false)
   }
 
   /** 从配置对象计算目录生效间隔（ms）；目录级覆盖优先，intervalMin<=0 视为不排定时 */
@@ -2224,6 +2238,9 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         shouldAbort: () => slot.cancelRequested || !ownerRef.valid,
         // 预演轮不转发冲突（引擎侧不询问），回调仅为防御性兜底
         onConflict: !dryRun && kind === 'manual' && rendererOnline ? (info: ConflictInfo) => forwardConflict(slot, info) : () => 'defer',
+        // 运行中插件询问与冲突同通道形态：手动轮 + 渲染层在线才弹窗；
+        // 后台轮 / 预演 / 兜底路径按 skip 结算（本轮跳过相关文件，不报错）
+        onPluginRunning: !dryRun && kind === 'manual' && rendererOnline ? (info: any) => forwardPluginPrompt(slot, info) : () => 'skip',
         hints: {
           source: dryRun ? 'dry-run' : kind,
           dirtyPaths: dryRun ? undefined : dirty || undefined,
@@ -2431,6 +2448,34 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
   }
 
   /**
+   * 手动轮的「运行中插件需要更新」转发（与 forwardConflict 同通道形态）：本机
+   * 渲染层订阅在线时把询问交给渲染层弹窗，等待用户经 resolvePluginPrompt 应答
+   *（'uninstall' = 卸载命中插件（保留数据）并继续 / 'skip' = 本轮跳过）。同一时刻可能有多个询问
+   *（与冲突转发独立计数，各自等待），渲染层按队列逐个展示。TTL 兜底与冲突一致：
+   * 转发后渲染层消失时按 'skip' 结算 —— 引擎本轮跳过相关文件、两侧保持原样，
+   * 绝不挂死引擎与目录锁。定时器走 node:timers 真实通道，句柄经 makeTimer 登记。
+   */
+  function forwardPluginPrompt(slot: DirSlot, info: PluginRunningPromptInfo): Promise<'uninstall' | 'skip'> {
+    return new Promise((resolve) => {
+      const promptId = randomId()
+      const box: { entry: TimerEntry | null } = { entry: null }
+      let settled = false
+      const settle = (choice: 'uninstall' | 'skip') => {
+        if (settled) return
+        settled = true
+        if (box.entry) box.entry.dispose()
+        if (pluginPromptResolvers.get(promptId) === settle) pluginPromptResolvers.delete(promptId)
+        resolve(choice)
+      }
+      pluginPromptResolvers.set(promptId, settle)
+      const handle = nodeTimers.setTimeout(() => settle('skip'), CONFLICT_FORWARD_TTL_MS)
+      if (handle && typeof handle === 'object' && typeof handle.unref === 'function') handle.unref()
+      box.entry = makeTimer(() => nodeTimers.clearTimeout(handle as NodeJS.Timeout))
+      emit({ type: 'plugin-running', promptId, dirId: slot.id, items: info.items })
+    })
+  }
+
+  /**
    * 兜底本地跑（非 leader 手动 / 委托超时 / 领取者失联）：先核验（调用方已做），
    * 再取目录锁本地执行；冲突一律 defer。不占全局队列槽位（委托方直等结果），
    * 与 leader 轮的互斥由目录锁保证。返回结果，**不**做 settleRound（由调用方
@@ -2468,6 +2513,7 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         onProgress: progressAt,
         shouldAbort: () => slot.cancelRequested,
         onConflict: () => 'defer',
+        onPluginRunning: () => 'skip',
         hints: {
           source: dryRun ? 'dry-run' : 'manual',
           op: dryRun ? undefined : op || undefined,
@@ -2521,14 +2567,17 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
 
   /**
    * 重挂 watcher：仅 leader、服务器已配置、目录启用且生效自动同步开（目录级覆盖
-   * 可单独关掉某目录的自动同步 —— watcher 是自动触发，一并停挂）时注册；引擎侧
-   * 已有 1.5s 去抖，这里的事件只做「插队触发」。非 leader 实例不注册（自动触发
-   * 无执行权，避免多实例重复监听 / 重复请求）。
+   * 可单独关掉某目录的自动同步 —— watcher 是自动触发，一并停挂）、生效「监听
+   * 文件变化」开（全局偏好或目录级覆盖单独关掉某目录的即时触发 —— 摘除后本地
+   * 变化不再插队，对账交给 interval 定时轮）时注册；引擎侧已有 1.5s 去抖，这里的
+   * 事件只做「插队触发」。非 leader 实例不注册（自动触发无执行权，避免多实例
+   * 重复监听 / 重复请求）。配置变更（reload）后按新口径整体重算：关掉的目录摘除、
+   * 重新打开的目录挂回 —— 设置修改即时生效的落点。
    */
   function rebuildWatchers(): void {
     const wantIds = new Set<string>()
     if (leaderState === 'leader' && !destroyed && !suspended && serverConfigured()) {
-      for (const slot of slots.values()) if (dirEligible(slot)) wantIds.add(slot.id)
+      for (const slot of slots.values()) if (dirEligible(slot) && watchOf(slot)) wantIds.add(slot.id)
     }
     for (const dirId of Array.from(watcherRegs.keys())) if (!wantIds.has(dirId)) stopWatcherFor(dirId)
     if (!wantIds.size) return
@@ -2769,6 +2818,20 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
       return true
     },
 
+    /**
+     * 渲染层应答转发的「运行中插件需要更新」询问（forwardPluginPrompt 挂起的
+     * Promise 在此解锁）。'uninstall' = 卸载命中插件（保留数据）并继续本轮同步；'skip' = 本轮
+     * 跳过相关文件（与转发超时同语义）。
+     * @returns 是否确有等待中的该询问
+     */
+    resolvePluginPrompt(promptId, choice) {
+      const resolve = pluginPromptResolvers.get(promptId)
+      if (!resolve) return false
+      pluginPromptResolvers.delete(promptId)
+      resolve(choice === 'uninstall' ? 'uninstall' : 'skip')
+      return true
+    },
+
     /** 宿主 PluginOut（preload 侧钩子转发；双发 PluginOut 靠幂等） */
     handlePluginOut(isKill) {
       if (isKill) {
@@ -2815,6 +2878,15 @@ function createScheduler(opts: SchedulerOpts): SchedulerFacade {
         }
       }
       conflictResolvers.clear()
+      // 运行中插件询问同款兜底：全部按 skip 收场（本轮跳过相关文件，不挂死引擎）
+      for (const [, resolve] of Array.from(pluginPromptResolvers)) {
+        try {
+          resolve('skip')
+        } catch (_) {
+          /* 忽略 */
+        }
+      }
+      pluginPromptResolvers.clear()
       for (const w of roundWaiters.splice(0)) {
         try {
           w.resolve({ error: new Error('调度器已清理') })

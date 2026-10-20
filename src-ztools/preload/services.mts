@@ -24,11 +24,12 @@ import * as storage from './store.mts'
 import { createScheduler, sweepSchedulerTimers } from './scheduler.mts'
 import type { SchedulerFacade } from './scheduler.mts'
 import { getHostPorts, setHostPorts, HOST_TRASH_MISSING_MESSAGE } from './host.mts'
-import { describeZtoolsPluginsSync, pickUninstalledAsarRels } from './ztools-plugins.mts'
+import { describeZtoolsPluginsSync, pickRunningPluginWriteRels, pickUninstalledAsarRels, pluginDisplayInfoFor, selfPluginEntityRel } from './ztools-plugins.mts'
 import { getRegistryReconcileState, parseManifest, pickActiveAsarBases, reconcilePluginRegistry, REGISTRY_MANIFEST_NAME, ZTOOLS_REGISTRY_KEY } from './ztools-registry.mts'
 import type {
   DavCapabilities,
   DeleteBatch,
+  PluginRunningPromptItem,
   RegistryReconcileResult,
   SyncLogEntry,
   SyncLogOp,
@@ -402,7 +403,13 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
     const badName = checkWindowsRel(localRel || rel, dir && dir.localPath)
     if (badName) throw badFilenameError(rel, badName)
   }
-  const remote = joinRemote(dir.remotePath, rel)
+  // 远端请求名：rel 是 NFC 归一键，NFD 服务器名的实际访问名是 origName ——
+  // GET 必须用服务器原名（字面路径匹配的服务器对 NFC 键 404；macOS 曾靠文件系统
+  // 归一化查找掩盖，Windows/NTFS 不归一化即暴露）。本地落地名沿用既有口径：
+  // 带 localRel（冲突副本）落副本名，否则落服务器原名。
+  const remoteSegs = rel.split('/')
+  if (guards.origName) remoteSegs[remoteSegs.length - 1] = guards.origName
+  const remote = joinRemote(dir.remotePath, remoteSegs.join('/'))
   const segs = (localRel || rel).split('/')
   if (guards.origName && !localRel) segs[segs.length - 1] = guards.origName
   const abs = path.join(dir.localPath, ...segs)
@@ -463,7 +470,12 @@ async function downloadOne(cfg: EngineCfg, dir: DirCfg, rel: string, tmpDir: str
       try {
         await getHostPorts().trashItem(abs)
       } catch (e: any) {
-        const err: any = new Error(`「${rel}」未下载：电脑上的旧版本无法移入回收站，已保留现有文件，下次同步重试`)
+        // 插件同步目录：旧版本 asar 无法进回收站的最常见原因是「对应插件正在
+        // 运行」—— 文件被宿主进程占用。正常路径下传输前预检门已询问并停止插件，
+        // 此处是降级形态（预检通道不可得 / 停止未生效 / 询问后用户又打开了插件）
+        // 的兜底提示，指引一个用户可执行的动作。
+        const runningHint = dir && dir.id === ZTOOLS_PLUGINS_DIR_ID ? '（旧版本对应的插件可能正在运行，停止该插件后重试即可完成）' : ''
+        const err: any = new Error(`「${rel}」未下载：电脑上的旧版本无法移入回收站${runningHint}，已保留现有文件，下次同步重试`)
         err.detail = (e && e.message) || String(e)
         throw err
       }
@@ -595,7 +607,10 @@ async function deleteLocalOne(dir: DirCfg, rel: string, origName?: string): Prom
     if (msg === HOST_TRASH_MISSING_MESSAGE) {
       throw new Error(`无法删除电脑上的「${rel}」：当前 ZTools 版本不支持放入回收站，文件已保留`)
     }
-    const err: any = new Error(`无法删除「${rel}」：未能放入回收站，文件已保留`)
+    // 插件同步目录：最常见的失败原因是「对应插件正在运行」—— 传输前预检门
+    // 的降级形态（预检通道不可得 / 停止未生效 / 询问后用户又打开了插件）。
+    const runningHint = dir && dir.id === ZTOOLS_PLUGINS_DIR_ID ? '（该文件对应的插件可能正在运行，停止后下次同步自动完成）' : ''
+    const err: any = new Error(`无法删除「${rel}」：未能放入回收站，文件已保留${runningHint}`)
     err.detail = msg
     throw err
   }
@@ -1956,6 +1971,22 @@ function makeRoundContext(cfg: EngineCfg, dir: DirCfg, prefs: EnginePrefs, handl
     // 两侧都变了；被跳过子树内的合成远端按断言应与基线一致（rChanged=false，
     // 最多产生 upload），真出现冲突 = 远端实际状态与合成断言不符
     ctx.noteEtagSkipAnomaly(it.rel, '冲突判定')
+    // 优先级 0：插件注册表投影（ztools-plugins.registry.json）的冲突自动裁决，
+    // 不询问用户。manifest 是机器生成的可再生投影（每轮由本机注册表现算重建），
+    // 「保留哪份」对用户没有决策价值；且自动轮本就没有弹窗通道（恒 defer），
+    // 不自动裁决该文件会永久卡在冲突。裁决固定 remote（云端优先）：下载方轮末
+    // 对账必然把本机独有记录重新投影回去（canonical ∪ 盘上在途记录 → 重写上传，
+    // 见 ztools-registry.mts 步骤 7），1-2 轮两侧收敛为并集；反方向 local 会让
+    // 两侧都坚持自己的版本无限对传。remote 对 foreign version（盘上 manifest
+    // 格式比本机插件认识的新）也恰好唯一正确：下载后对账冻结维护，不降级覆盖。
+    // 刻意放在「应用到全部」与固定策略（conflictStrategy='local' 等）之前 ——
+    // 用户的整批选择 / 目录级策略面向用户文件，作用到本文件会重新引入对传风险；
+    // 落地失败时下方登记的挂起记录（choice='remote'）按优先级 2 原样沿用。
+    if (ctx.dir.id === ZTOOLS_PLUGINS_DIR_ID && it.rel === REGISTRY_MANIFEST_NAME) {
+      logNote(`注册表投影冲突已自动按云端版本处理，待轮末对账合并收敛：${it.rel}`)
+      ctx.registerPendingChoice(it, 'remote')
+      return 'remote'
+    }
     // 优先级 1：本轮内存的「应用到全部」—— 本轮用户的最新意图优先于历史挂起；
     // 沿用时同样逐文件登记挂起（applyToRemaining 只作用于本轮内存，持久化按文件记）
     if (ctx.roundConflictChoice) {
@@ -2327,6 +2358,9 @@ async function roundBody(ctx: RoundContext): Promise<any> {
   await preflightRoundLimits(ctx)
   await acquireRoundLock(ctx)
   if (ctx.roundYielded) return ctx.summary // 让出：零传输按成功返回（planned 为信息性计数）
+  // 运行中插件预检门（拿锁之后、写前查重之前）：与冲突询问同款语义 —— 用户思考
+  // 期间持租约锁（续租维持，他机让位）；放拿锁之前会在「本轮注定让出」时白停插件
+  await gateRunningPluginWrites(ctx)
   await applyBDedupeGate(ctx)
   await runTransferPool(ctx)
   await commitBatchUploads(ctx)
@@ -2457,6 +2491,14 @@ async function scanBothSides(ctx: RoundContext): Promise<void> {
   let staleAsar: Set<string> | null = null
   if (ctx.dir.id === ZTOOLS_PLUGINS_DIR_ID) {
     staleAsar = new Set()
+    // 自身保护（见「运行中插件预检」节）：本插件的实体正在运行且不可被停止，
+    // 同步对它的一切动作（覆盖下载 / 删除，含云端删了它触发的 delete-local）
+    // 都会失败或自毁 —— 扫描期即排除，本机文件、云端副本、基线条目均不动。
+    const selfRel = runningSelfEntityRel(ctx.dir.localPath)
+    if (selfRel) {
+      staleAsar.add(selfRel)
+      logNote(`插件同步：本插件自身（${selfRel}）正在运行，已排除同步 —— 自身的更新请走宿主安装 / 升级流程`)
+    }
     const userMatcher = ctx.excludeMatcher
     ctx.excludeMatcher = (rel: string) => staleAsar!.has(rel) || (!!userMatcher && userMatcher(rel))
   }
@@ -2658,6 +2700,49 @@ async function readActiveAsarBasenames(pluginsDir: string): Promise<Set<string>>
     /* manifest 缺失 / 损坏：按无投影处理 */
   }
   return pickActiveAsarBases(registryRecords, manifestRecords)
+}
+
+// ---------- 运行中插件预检（自保护 + 询问卸载 + 跳过） ----------
+//
+// 运行中的插件实体文件被宿主进程占用（Windows 上 asar 被映射加载、目录插件的
+// 工作文件持有句柄），同步对它们的覆盖 / 删除必然失败 —— 回收站移除报 EBUSY /
+// EPERM，文件原地保留，用户看到一串「未下载 / 无法删除」错误却无从下手；仅
+// 「停止插件」也未必释放句柄（宿主关闭视图后仍可能有残留持有者）。本节把处置
+// 前置为两道闸：
+//   1. 扫描层自身排除（scanBothSides）：本插件是同步引擎的宿主 —— 它的实体正在
+//      运行且**不可能被停止**（停止 = 杀死正在同步的自己），任何同步动作都既会
+//      失败也绝不该发生。一律排除：本机不上传、云端不下载、基线残留不参与规划
+//      （与未安装 asar 过滤同机制）。云端历史遗留的自身 asar 就地冻结，插件自身
+//      的升级走宿主安装流程，不归同步管。
+//   2. 传输前预检门（gateRunningPluginWrites）：本轮计划中「要写本地的任务」
+//     （覆盖下载 + 本地删除）命中其他运行中的插件时，经 handlers.onPluginRunning
+//     询问用户（手动轮 + 渲染层在线时弹窗；后台轮 / 超时按 skip）—— 'uninstall'
+//      走宿主卸载流程（停止实例 → 移除注册记录 → 直接删除实体文件，不经回收站，
+//      保留插件数据），磁盘核实后调整本轮任务并照常传输，云端的新版本随即下载、
+//      轮末对账重新登记 —— 卸载 → 同步 → 安装一次完成；'skip' 把命中实体的本地
+//      写任务从本轮摘除（文件原地保留，下轮再问）。预检通道不可得（旧宿主 /
+//      未授权 / 查询失败）时整体降级：不做预检直接传输，锁定文件按既有失败路径
+//      报错（错误文案已注明「对应插件可能正在运行」）。
+
+/**
+ * 当前 preload 模块文件的绝对路径（CJS 自由变量；浏览器 / ESM 测试形态不存在，
+ * `typeof` 探测安全）。esbuild CJS 产物中保持自由变量原样，运行时由 Node / Electron
+ * 解析为 asar 虚拟路径。
+ */
+declare const __filename: string | undefined
+
+/** 测试注入的模块文件覆盖（undefined = 未覆盖，读真实 `__filename`；单测专用） */
+let selfModuleFileOverride: { value: string | null } | null = null
+
+/**
+ * 识别「本插件自己」的实体 rel（详见 ztools-plugins.mts selfPluginEntityRel）。
+ * @param pluginsDir 插件实体目录绝对路径
+ * @returns 实体名（顶层 asar 文件名 / 目录插件目录名）；无法判定（开发项目 /
+ *          浏览器形态）返回 null —— 引擎不做自身排除
+ */
+function runningSelfEntityRel(pluginsDir: string): string | null {
+  const file = selfModuleFileOverride ? selfModuleFileOverride.value : typeof __filename === 'string' ? __filename : null
+  return selfPluginEntityRel(pluginsDir, file)
 }
 /** 阶段 3 / 3.2 / 3.3：扫描完整性闸门（I1）→ 探测残留清理 → etag 跳过子树合成与 scan-cache 收割。 */
 async function applyScanGates(ctx: RoundContext): Promise<void> {
@@ -3343,7 +3428,12 @@ async function planRoundPassTwo(ctx: RoundContext): Promise<void> {
       // 明细条目）+ 上传 —— 抽样对拍时与随后真实轮的计数逐项一致。
       const pc = ctx.store.getPending(it.rel)
       const prior = pc && !pc.kind && (pc.choice === 'local' || pc.choice === 'remote' || pc.choice === 'both') ? pc.choice : null
-      const plannedChoice = prior || (ctx.prefs.conflictStrategy !== 'ask' ? ctx.prefs.conflictStrategy : 'ask')
+      // 注册表投影冲突与真实轮优先级 0 同口径：恒预判为 remote 落地，
+      // 不看挂起 / 固定策略（预演计数才与随后真实轮逐项一致）
+      const plannedChoice =
+        ctx.dir.id === ZTOOLS_PLUGINS_DIR_ID && it.rel === REGISTRY_MANIFEST_NAME
+          ? 'remote'
+          : prior || (ctx.prefs.conflictStrategy !== 'ask' ? ctx.prefs.conflictStrategy : 'ask')
       ctx.recordSyncOp({ op: 'conflict', rel: it.rel, ...(plannedChoice !== 'ask' ? { choice: plannedChoice } : {}) })
       ctx.summary.conflicts++
       if (plannedChoice === 'local' && it.l) ctx.recordPlannedOp('upload', it.rel, it.l.size, { it })
@@ -3415,6 +3505,7 @@ async function planRoundPassTwo(ctx: RoundContext): Promise<void> {
           const dl = await downloadOne(ctx.cfg, ctx.dir, it.rel, ctx.tmpDir, conflictRel, {
             expectedLocal: (ctx.planByRel.get(conflictRel) && ctx.planByRel.get(conflictRel).l) || null,
             expectedRemoteSize: it.r.size,
+            origName: it.r.origName,
           }, ctx.localTol, { onBytes: meter.onBytes })
           const conflictAbs = path.join(ctx.dir.localPath, ...conflictRel.split('/'))
           const cst = await fsp.stat(conflictAbs)
@@ -3975,9 +4066,205 @@ async function applyBDedupeGate(ctx: RoundContext): Promise<void> {
   }
 
 }
+/**
+ * 读取插件展示名解析所需的记录（注册表 ∪ manifest，尽力而为）：
+ * 注册表（internal:db-get）在前 —— 宿主记录优先于 manifest 投影（与既有折叠
+ * 裁决同偏好）；未授权 / 旧宿主 / 读取失败只丢注册表来源，manifest 随目录同步、
+ * 无需权限，常态可读。仅用于运行中插件询问的展示名解析，绝不参与同步判定。
+ * @param pluginsDir 插件实体目录绝对路径（manifest 所在处）
+ * @returns 记录数组（可能为空 —— 展示名回落实体文件名）
+ */
+async function readPluginRecordsLoose(pluginsDir: string): Promise<any[]> {
+  const records: any[] = []
+  try {
+    const internal = getHostPorts().internal
+    if (internal) {
+      const got = await internal.dbGet(ZTOOLS_REGISTRY_KEY)
+      if (Array.isArray(got)) records.push(...got)
+    }
+  } catch {
+    /* 未授权 / 旧宿主：展示名退 manifest */
+  }
+  try {
+    const m = parseManifest(fs.readFileSync(path.join(pluginsDir, REGISTRY_MANIFEST_NAME), 'utf-8'))
+    if (m) records.push(...m.records)
+  } catch {
+    /* manifest 缺失 / 损坏：展示名回落实体文件名 */
+  }
+  return records
+}
+
+/**
+ * 阶段 6.9：运行中插件预检门（插件同步虚拟行专属；拿远端租约锁**之后**、写前
+ * 查重之前执行 —— 与冲突询问同款语义：用户思考期间持锁续租，他机让位；放锁前
+ * 会在「本轮注定让出」时白停用户的插件）。详见「运行中插件预检」节注释。
+ *
+ * 流程：收集本轮「要写本地」的任务（覆盖下载 + 本地删除；全新下载是新建文件、
+ * 不碰运行中插件占用的句柄，无需预检）→ 查询运行中插件实体（宿主 internal
+ * 通道）→ 命中判定（纯函数 pickRunningPluginWriteRels）→ 有命中时询问用户：
+ *   'uninstall' —— 逐一卸载命中插件（宿主流程：先停止运行实例、移除注册记录，
+ *            实体文件直接删除不经回收站，保留插件使用数据），等运行列表确认消失
+ *            后按磁盘核实调整本轮任务：实体已移除时覆盖下载转全新下载（基线同步
+ *            删除，下载失败也不会把云端副本当「本地已删」传播）、实体内的上传 /
+ *            改名 / 冲突任务摘出、delete-local / delete-remote 留任 —— 随后的
+ *            传输与轮末对账自动完成「同步新版本 → 重新登记」；实体仍存在（删除
+ *            被占用等）时任务原样保留，按既有失败路径安全失败、下轮重试；
+ *   'skip' —— 命中实体的本地写任务（覆盖下载 + 本地删除）摘出本轮（字节分母
+ *            同步扣减），文件原地保留下轮再问。用户显式跳过时轮末带一条 warning；
+ *            后台轮（无询问通道）静默跳过 —— 逐轮 warning 会在每次自动同步时刷屏。
+ * 预检通道不可得（旧宿主 / 未授权 / 查询失败）时整体降级：不做预检直接传输，
+ * 锁定文件按既有回收站失败路径报错（错误文案已注明「对应插件可能正在运行」）。
+ * 预演轮跳过（零副作用；预演也不该把「卸载插件」算进计划）。
+ * @param ctx 轮次上下文（只消费 dir / dryRun / tasks / planByRel /
+ *            transferBytesTotal / pushWarning / handlers / shouldAbort / store）
+ */
+async function gateRunningPluginWrites(ctx: RoundContext): Promise<void> {
+  if (!ctx.dir || ctx.dir.id !== ZTOOLS_PLUGINS_DIR_ID || ctx.dryRun || ctx.shouldAbort()) return
+  const writeRels: string[] = []
+  for (const t of ctx.tasks) {
+    if (t.kind === 'delete-local') writeRels.push(String(t.rel))
+    else if (t.kind === 'download') {
+      const it = ctx.planByRel.get(t.rel)
+      if (it && it.l) writeRels.push(String(t.rel))
+    }
+  }
+  if (writeRels.length === 0) return
+  const plugins = getHostPorts().plugins
+  if (!plugins) return
+  let running: string[] | null = null
+  try {
+    running = await plugins.getRunning()
+  } catch (e: any) {
+    logNote(`插件同步：运行中插件查询不可用（${(e && e.message) || e}），本轮跳过预检，锁定文件按既有失败路径处理`)
+    return
+  }
+  if (!Array.isArray(running) || running.length === 0) return
+  const hits = pickRunningPluginWriteRels(writeRels, running, ctx.dir.localPath)
+  if (hits.size === 0) return
+  // 自身防御性再滤：扫描层已排除自身实体，正常不会命中；宿主运行列表异常
+  // 多报（如把已停止的残留算作运行）时也绝不允许「停止自己」进入询问。
+  const selfRel = runningSelfEntityRel(ctx.dir.localPath)
+  if (selfRel) {
+    for (const [p, rel] of [...hits]) if (rel === selfRel) hits.delete(p)
+    if (hits.size === 0) return
+  }
+  // 展示信息解析（展示名 title 优先；图标来自记录的 logo，相对路径重建为本机
+  // file:// URL；无记录回落实体文件名、不带图标 —— 渲染层回落通用插件图标）
+  const records = await readPluginRecordsLoose(ctx.dir.localPath)
+  const items: PluginRunningPromptItem[] = []
+  for (const [entityPath, rel] of hits) {
+    const info = pluginDisplayInfoFor(records, rel, ctx.dir.localPath)
+    items.push({ name: (info && info.name) || rel, ...(info && info.logo ? { logo: info.logo } : {}), rel, entityPath })
+  }
+  // 询问（调度器只对手动轮 + 渲染层在线转发；后台轮 / 超时 / 抛错一律 skip）
+  const ask = ctx.handlers && ctx.handlers.onPluginRunning
+  let choice: 'uninstall' | 'skip' = 'skip'
+  let asked = false
+  if (typeof ask === 'function') {
+    asked = true
+    try {
+      choice = (await ask({ items })) === 'uninstall' ? 'uninstall' : 'skip'
+    } catch (e: any) {
+      logNote(`插件同步：运行中插件询问失败（${(e && e.message) || e}），按跳过处理`)
+    }
+  }
+  if (choice !== 'uninstall') {
+    // skip：命中实体的本地写任务整体摘出本轮（字节分母同步扣减，与写前查重的剔除同款）。
+    // 只摘本地写（覆盖下载 + 本地删除）—— 上传 / 冲突 / 改名在插件运行期间本就可行，
+    // 无需用户牺牲更新来陪跳。
+    const hitRels = new Set<string>()
+    for (const rel of writeRels) {
+      for (const entityRel of hits.values()) {
+        if (rel === entityRel || rel.startsWith(entityRel + '/')) {
+          hitRels.add(rel)
+          break
+        }
+      }
+    }
+    for (const rel of hitRels) {
+      const i = ctx.tasks.findIndex((t) => String(t.rel) === rel)
+      if (i < 0) continue
+      ctx.transferBytesTotal -= ctx.tasks[i].bytes || 0
+      ctx.tasks.splice(i, 1)
+    }
+    const names = items.map((x) => x.name)
+    if (asked) {
+      ctx.pushWarning(`已跳过 ${hitRels.size} 个属于运行中插件的文件（${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}）：下次同步会再次询问`)
+    } else {
+      logNote(`插件同步：${hitRels.size} 个属于运行中插件的文件本轮跳过（${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}）；手动同步时会询问是否卸载`)
+    }
+    return
+  }
+  // uninstall：走宿主卸载流程 —— 先停止运行实例、移除注册记录，实体文件**直接
+  // 删除（不经回收站）**，deleteData:false 保留插件使用数据；云端若有新版本，
+  // 本轮随后的传输与轮末对账会自动带入并重新登记（卸载 → 同步 → 安装一次完成）。
+  for (const p of hits.keys()) {
+    try {
+      const r = await plugins.uninstall(p)
+      if (!r || r.success !== true) logNote(`插件同步：卸载未生效（${(r && r.error) || '宿主返回失败'}）：${p}`)
+    } catch (e: any) {
+      logNote(`插件同步：卸载失败（${(e && e.message) || e}）：${p}`)
+    }
+  }
+  // 等运行列表确认消失（句柄释放的代理信号）+ 静置尾差。超时不阻断 —— 是否真的
+  // 移除以紧随其后的磁盘核实为准。
+  const targets = [...hits.keys()]
+  const deadline = Date.now() + 5000
+  for (;;) {
+    let stillThere = false
+    try {
+      const list = await plugins.getRunning()
+      stillThere = Array.isArray(list) && targets.some((p) => list.includes(p))
+    } catch {
+      break // 查询通道失效：不再等待，交磁盘核实裁决
+    }
+    if (!stillThere) break
+    if (Date.now() >= deadline) break
+    await sleep(250)
+  }
+  await sleep(300)
+  // 磁盘核实 + 任务适配。宿主卸载对「实体删除失败」只记日志（仍返回 success），
+  // 能否按「实体已移除」调整任务以磁盘为准：
+  //   已移除 —— 覆盖下载转全新下载（执行期守卫读计划项，置 it.l = null 即不再
+  //            期待旧文件；同步删基线，即使本轮下载失败，下轮也按全新文件重下，
+  //            绝不会把云端副本当「本地已删」传播删除）；实体内的上传 / 改名 /
+  //            冲突任务摘出（源文件已消失，下轮按删除传播自然收敛）；delete-local
+  //            留任（实体已不在，执行即达成目标状态）；delete-remote 留任（云端
+  //            清理语义不变）。
+  //   仍存在 —— 任务原样保留：原守卫与回收站路径安全失败（错误文案已注明插件
+  //            可能正在运行），下轮重试；残留文件此时已无进程持有，回收站通常
+  //            可直接成功。
+  for (const entityRel of new Set(hits.values())) {
+    const abs = path.join(ctx.dir.localPath, ...entityRel.split('/'))
+    if (await statOrNull(abs)) {
+      logNote(`插件同步：卸载后实体仍存在（删除可能被占用），本轮相关任务原样保留，下轮重试：${entityRel}`)
+      continue
+    }
+    for (const t of [...ctx.tasks]) {
+      const rel = String(t.rel)
+      if (!(rel === entityRel || rel.startsWith(entityRel + '/'))) continue
+      if (t.kind === 'download') {
+        const it = ctx.planByRel.get(rel)
+        if (it && it.l) {
+          it.l = null
+          await ctx.store.deleteEntry(rel).catch(() => {})
+        }
+        continue
+      }
+      if (t.kind === 'upload' || t.kind === 'rename-local' || t.kind === 'rename-remote' || t.kind === 'conflict') {
+        const i = ctx.tasks.indexOf(t)
+        if (i >= 0) {
+          ctx.transferBytesTotal -= t.bytes || 0
+          ctx.tasks.splice(i, 1)
+        }
+      }
+      // delete-local / delete-remote：留任
+    }
+  }
+}
+
 /** 阶段 7：并发池执行 + 瞬时失败当轮重试。 */
-async function runTransferPool(ctx: RoundContext): Promise<void> {
-  // 7. 并发池执行
+async function runTransferPool(ctx: RoundContext): Promise<void> {  // 7. 并发池执行
   // 传输开始事件（force 外发）：锁 / 查重闸门已过，UI 由此切入「正在同步文件」段，
   // 并拿到传输字节分母（此前阶段 bytesDone / bytesTotal 承载的是 verify 字节估算）
   ctx.onProgress(
@@ -4692,6 +4979,17 @@ const services = {
       uploadOne,
       downloadOne,
       deleteLocalOne,
+      /** 运行中插件预检门（插件同步虚拟行；单测注入 fake ctx 与宿主端口直检） */
+      gateRunningPluginWrites,
+      /** 自身实体识别直检（真实形态读运行时 `__filename`；测试经 setSelfModuleFileForTest 注入） */
+      runningSelfEntityRel,
+      /**
+       * 测试专用：注入 / 清除「当前模块文件」覆盖（null = 显式无模块文件；
+       * undefined = 恢复读真实 `__filename`）。
+       */
+      setSelfModuleFileForTest: (v?: string | null) => {
+        selfModuleFileOverride = v === undefined ? null : { value: v }
+      },
       fpMatch,
       cleanupOrphanTemps,
       isSyncTempName,

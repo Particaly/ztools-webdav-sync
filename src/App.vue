@@ -4,6 +4,7 @@ import MainView from './views/MainView.vue'
 import SettingsView from './views/SettingsView.vue'
 import SyncRecordsView from './views/SyncRecordsView.vue'
 import ConflictModal from './components/ConflictModal.vue'
+import RunningPluginModal from './components/RunningPluginModal.vue'
 import RootLostModal from './components/RootLostModal.vue'
 import PendingCenterModal from './components/PendingCenterModal.vue'
 import AppToasts from './components/ui/AppToasts.vue'
@@ -40,6 +41,7 @@ onMounted(async () => {
       <SettingsView v-else />
     </Transition>
     <ConflictModal />
+    <RunningPluginModal />
     <RootLostModal />
     <PendingCenterModal />
     <AppToasts />

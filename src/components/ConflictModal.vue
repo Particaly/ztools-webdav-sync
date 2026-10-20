@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { AppButton, AppModal } from './ui'
 import { useStore } from '../composables/store'
-import { fmtClock, fmtSize, relBaseName } from '../composables/format'
+import { fmtClock, fmtSize, relBaseName, joinLocalPath } from '../composables/format'
 
 const store = useStore()
 const info = computed(() => store.state.activeConflict)
@@ -39,15 +39,14 @@ function choose(choice: 'local' | 'remote' | 'both') {
 const dir = computed(() => store.state.dirs.find((d) => d.id === info.value?.dirId) ?? null)
 
 /**
- * 冲突文件在电脑上的完整路径：本地目录连接远端 rel（rel 恒为正斜杠的远端相对
- * 形态，拼接时按本地目录的盘符 / 反斜杠特征换用对应分隔符）。
+ * 冲突文件在电脑上的完整路径：本地目录连接远端 rel（拼接规则见 joinLocalPath）。
+ * 「打开此文件」与「在资源管理器中定位」两个入口共用。
  */
 const localFilePath = computed(() => {
   const d = dir.value
   const rel = info.value?.rel
   if (!d || !rel || rel === '.') return ''
-  const sep = /^[a-zA-Z]:[\\/]/.test(d.localPath) || d.localPath.includes('\\') ? '\\' : '/'
-  return d.localPath.replace(/[\\/]+$/, '') + sep + rel.split('/').join(sep)
+  return joinLocalPath(d.localPath, rel)
 })
 
 /** 稍后处理：以 defer 结算本轮冲突，登记进待处理中心（两侧文件保持原样） */
@@ -58,6 +57,11 @@ function defer() {
 /** 在电脑上打开冲突文件（shellOpenPath 对文件同样适用；路径缺失时静默） */
 function openLocalFile() {
   if (localFilePath.value) store.openLocalFolder(localFilePath.value)
+}
+
+/** 在访达 / 资源管理器中定位冲突文件（打开所在文件夹并选中；路径缺失时静默） */
+function revealLocalFile() {
+  if (localFilePath.value) store.revealLocalFile(localFilePath.value)
 }
 </script>
 
@@ -77,9 +81,12 @@ function openLocalFile() {
       <AppIcon name="warn" :size="16" class="text-warning-icon" />
     </template>
     <template #title-extra>
-      <div class="flex items-center gap-[6px] bg-fill-seg rounded-[5px] px-2 py-[4px] text-ink-2" :title="info?.rel">
-        <AppIcon name="file" :size="12" />
-        <span class="font-mono text-[11px] font-medium text-btn-text select-text">{{ fileName }}</span>
+      <div
+        class="flex items-center gap-[6px] bg-fill-seg rounded-[5px] px-2 py-[4px] text-ink-2 min-w-0 max-w-[160px]"
+        :title="info?.rel"
+      >
+        <AppIcon name="file" :size="12" class="shrink-0" />
+        <span class="font-mono text-[11px] font-medium text-btn-text select-text truncate">{{ fileName }}</span>
       </div>
     </template>
 
@@ -107,13 +114,19 @@ function openLocalFile() {
       </div>
       <div v-if="localFilePath" class="flex gap-[10px]">
         <span class="w-[62px] shrink-0" />
-        <span class="flex-1">
+        <span class="flex-1 flex items-center gap-[14px]">
           <button
             type="button"
             class="open-link"
-            :title="`${localFilePath}（在资源管理器 / 访达中定位并打开，看清内容再决定）`"
+            :title="`${localFilePath}（用系统默认程序打开，看清内容再决定）`"
             @click="openLocalFile"
-          >在电脑上打开此文件</button>
+          >打开此文件</button>
+          <button
+            type="button"
+            class="open-link"
+            :title="`${localFilePath}（在访达 / 资源管理器中打开所在文件夹并选中该文件）`"
+            @click="revealLocalFile"
+          >在资源管理器中定位</button>
         </span>
       </div>
       <div class="text-[11px] text-ink-4">选择「同时保留」时，云端文件将另存为 {{ conflictCopyName }}，本地文件保持不变</div>

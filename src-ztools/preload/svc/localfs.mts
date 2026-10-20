@@ -133,6 +133,38 @@ export async function scanDirSafe(localPath: string, ignoreHidden: boolean, excl
 }
 
 /**
+ * NFC 归一键的真实磁盘名解析（scanDirtyFast 专用）：脏路径集存的是 NFC 归一键，
+ * 而 NTFS 等不做归一化查找的文件系统上，磁盘条目可能保留 NFD / 其他归一形态的
+ * 原名（watcher 事件归一入集后，按归一键 lstat 打不开原名）。readdir 父目录、
+ * 把各条目名 NFC 归一后与键的末段比对，命中即返回真实磁盘路径与 stat。
+ * 仅在按键 lstat 失败时调用（文件确实已删除时多付一次 readdir，量级可接受）。
+ * @param root 同步根绝对路径
+ * @param rel NFC、'/' 分隔的脏路径键
+ * @returns {st, abs} 命中的 stat 与真实磁盘绝对路径；父目录不可读 / 无归一命中 / stat 失败返回 null
+ */
+async function resolveByNormalizedName(root: string, rel: string): Promise<{ st: any; abs: string } | null> {
+  const segs = rel.split('/')
+  const base = segs[segs.length - 1]
+  const dirAbs = path.join(root, ...segs.slice(0, -1))
+  let names: string[]
+  try {
+    names = await fsp.readdir(dirAbs)
+  } catch (_) {
+    return null // 父目录也没了 / 不可访问：按「已不存在」处理
+  }
+  for (const name of names) {
+    if (nfc(name) !== base) continue
+    const abs = path.join(dirAbs, name)
+    try {
+      return { st: await fsp.lstat(abs), abs }
+    } catch (_) {
+      return null // 瞬时 IO / 权限问题：与按键 lstat 失败同语义
+    }
+  }
+  return null
+}
+
+/**
  * 本地脏路径快速核对（watch 轮专用，替代 scanDirSafe 的全量 walk）。
  * 形态：以本机基线合成「上一轮一致时的本地表」，再逐条核对 watcher 上报的脏路径：
  *   - 不存在 / 符号链接（lstat 不跟链接，与 walk 的 isSymbolicLink 跳过语义对齐，
@@ -172,28 +204,34 @@ export async function scanDirtyFast(
     await maybeYield() // 数万基线条目的合成循环分片让出（与既有条目循环同规格）
     files.set(k, { abs: path.join(root, ...k.split('/')), size: m.lsize, mtimeMs: m.lmtimeMs })
   }
-  // 2. 核对脏路径：合成值只在该路径被上报时才被实测覆盖 / 清除
+  // 2. 核对脏路径：合成值只在该路径被上报时才被实测覆盖 / 清除。
+  //    按键 lstat 失败不等于「已不存在」—— NTFS 等不归一化查找的文件系统上，
+  //    磁盘原名（NFD 等）与 NFC 键字面不同，须经 readdir 归一解析真实磁盘名再核对；
+  //    解析不到才按「已不存在」处理（此处误判会把「本地改名形态差异」当删除向
+  //    云端传播，是数据安全语义，不是性能优化）。
   for (const p of dirtyPaths) {
     await maybeYield()
     const rel = nfc(String(p))
     // 排除链统一走 isExcludedRel（与全量扫描 / 远端扫描同规则）：被排除的名字本就不该在表里
     if (isExcludedRel(rel, { ignoreHidden, excludeMatcher })) continue
-    let st: any = null
+    let hit: { st: any; abs: string } | null = null
     try {
-      st = await fsp.lstat(path.join(root, ...rel.split('/')))
+      const abs = path.join(root, ...rel.split('/'))
+      hit = { st: await fsp.lstat(abs), abs }
     } catch (_) {
-      st = null // 不存在 / 不可访问（ENOENT 等）：按「已不存在」处理
+      hit = await resolveByNormalizedName(root, rel)
     }
-    if (st && st.isSymbolicLink()) st = null
-    if (!st) {
+    if (hit && hit.st && hit.st.isSymbolicLink()) hit = null
+    if (!hit) {
       files.delete(rel)
       // 目录删除只报目录名：清扫该前缀下全部子树键（Map 迭代中删除当前键是安全的）
       const prefix = rel + '/'
       for (const k of files.keys()) {
         if (k.startsWith(prefix)) files.delete(k)
       }
-    } else if (st.isFile()) {
-      files.set(rel, { abs: path.join(root, ...rel.split('/')), size: st.size, mtimeMs: st.mtimeMs })
+    } else if (hit.st.isFile()) {
+      // abs 用解析出的真实磁盘路径（归一形态不同的原名也能被后续上传 / 指纹读取打开）
+      files.set(rel, { abs: hit.abs, size: hit.st.size, mtimeMs: hit.st.mtimeMs })
     } else {
       // 目录（表里同名文件条目属「文件变目录」反常形态）与 fifo / socket 等
       // 非普通文件：walk 均不入表，这里同样不入

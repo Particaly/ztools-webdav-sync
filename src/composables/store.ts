@@ -32,6 +32,7 @@ import { ZTOOLS_PLUGINS_DIR_ID, resolveDirPrefs } from '../../src-ztools/preload
 import {
   state,
   conflictResolvers,
+  pluginPromptResolvers,
   cancelRequested,
   capStr,
   persist,
@@ -270,6 +271,34 @@ function queueSchedulerConflict(ev: Extract<SchedulerEvent, { type: 'conflict' }
   })
 }
 
+/**
+ * 调度器转发的「运行中插件需要更新」询问（kind=manual 且本机订阅在线）：进弹窗
+ * 队列，用户选择经 scheduler.resolvePluginPrompt 回传 —— 'uninstall' = 卸载命中
+ * 插件（保留插件数据）并继续本轮同步；'skip' = 本轮跳过相关文件（与转发超时同
+ * 语义）。
+ */
+function queueSchedulerPluginPrompt(ev: Extract<SchedulerEvent, { type: 'plugin-running' }>) {
+  const prompt = { promptId: ev.promptId, dirId: ev.dirId, items: ev.items }
+  state.pluginPromptQueue.push(prompt)
+  if (!state.activePluginPrompt) state.activePluginPrompt = state.pluginPromptQueue[0]
+  pluginPromptResolvers.set(ev.promptId, (choice) => {
+    const sched = window.services?.scheduler
+    if (!sched) return
+    sched.resolvePluginPrompt(ev.promptId, choice)
+  })
+}
+
+/** 用户在运行中插件弹窗做出选择（队列推进与冲突弹窗同款；无引擎在等时为 no-op） */
+export function resolvePluginPrompt(choice: 'uninstall' | 'skip') {
+  const cur = state.activePluginPrompt
+  if (!cur) return
+  const resolve = pluginPromptResolvers.get(cur.promptId)
+  pluginPromptResolvers.delete(cur.promptId)
+  state.pluginPromptQueue = state.pluginPromptQueue.filter((p) => p !== cur)
+  state.activePluginPrompt = state.pluginPromptQueue[0] ?? null
+  resolve?.(choice)
+}
+
 /** 调度器事件入口（单一 listener 分发） */
 function handleSchedulerEvent(ev: SchedulerEvent) {
   switch (ev.type) {
@@ -287,6 +316,9 @@ function handleSchedulerEvent(ev: SchedulerEvent) {
       break
     case 'conflict':
       queueSchedulerConflict(ev)
+      break
+    case 'plugin-running':
+      queueSchedulerPluginPrompt(ev)
       break
     case 'pending-conflicts':
       applyPendingConflicts(ev.dirId, ev.items)
@@ -600,14 +632,15 @@ function applyDemo(scene: string) {
     state.netSpeed = { upBps: Math.round(2.2 * 1024 * 1024), downBps: Math.round(312 * 1024) }
     state.dirSpeeds = { [dirs[0].id]: { upBps: Math.round(2.2 * 1024 * 1024), downBps: Math.round(312 * 1024) } }
   } else if (scene === 'conflict') {
+    // 长文件名样例：预览标题徽标截断 + 悬停完整名 + 「在资源管理器中定位」入口
     dirs[0].status = 'conflict'
-    dirs[0].conflictFile = 'README.md'
+    dirs[0].conflictFile = '2026年Q1产品发布会暨渠道联合推广活动执行方案（修订版V3-交稿用）.docx'
     dirs[0].conflictLocal = { size: 4300, mtimeMs: todayAt(10, 28) }
     dirs[0].conflictRemote = { size: 4710, mtimeMs: todayAt(10, 31) }
     // 与设计稿一致：冲突弹窗直接打开
     state.conflictQueue.push({
       dirId: dirs[0].id,
-      rel: 'README.md',
+      rel: 'Docs/提案与方案/2026年Q1产品发布会暨渠道联合推广活动执行方案（修订版V3-交稿用）.docx',
       local: { size: 4300, mtimeMs: todayAt(10, 28) },
       remote: { size: 4710, mtimeMs: todayAt(10, 31) },
     })
@@ -623,7 +656,7 @@ function applyDemo(scene: string) {
     // ② 无快照的逐文件删除兜底列表 + ③ 冲突三选一列表；状态栏角标与目录行
     // 提示条同源计数
     dirs[0].pendingConflicts = [
-      { rel: 'Spec/接口约定.md', createdAt: todayAt(10, 12), local: { size: 4300, mtimeMs: todayAt(10, 12) }, remote: { size: 4710, mtimeMs: todayAt(10, 13) } },
+      { rel: 'Spec/与外部合作方的数据交换接口约定协议-2026年修订版（含附录字段清单）.md', createdAt: todayAt(10, 12), local: { size: 4300, mtimeMs: todayAt(10, 12) }, remote: { size: 4710, mtimeMs: todayAt(10, 13) } },
       { rel: 'Notes/会议记录.md', createdAt: todayAt(10, 15), local: { size: 2100, mtimeMs: todayAt(10, 15) }, remote: { size: 2100, mtimeMs: todayAt(10, 16) }, choice: 'local' },
     ]
     dirs[0].deleteBatch = {
@@ -732,6 +765,33 @@ function openLocalFolder(localPath: string): void {
   toast.info('当前 ZTools 版本不支持在访达 / 资源管理器中打开文件夹')
 }
 
+/**
+ * 在访达 / 资源管理器中定位（并选中）一个本地文件。优先 shellShowItemInFolder
+ *（打开所在目录并选中该项）；该 API 缺失或调用失败（如文件已被移走）时降级为
+ * shellOpenPath 打开其所在目录（不选中，尽力而为）。与 openLocalFolder 同类的
+ * 纯渲染层 UI 交互：宿主两类能力都缺失时给一条提示，其余失败一律静默。
+ */
+function revealLocalFile(fullPath: string): void {
+  const z = window.ztools
+  try {
+    if (typeof z?.shellShowItemInFolder === 'function') {
+      z.shellShowItemInFolder(fullPath)
+      return
+    }
+  } catch (_) {
+    /* 定位失败（路径已不存在等）：降级为打开所在目录 */
+  }
+  const sep = fullPath.includes('\\') ? '\\' : '/'
+  const i = fullPath.lastIndexOf(sep)
+  if (i <= 0) return
+  try {
+    if (typeof z?.shellOpenPath === 'function') z.shellOpenPath(fullPath.slice(0, i))
+    else toast.info('当前 ZTools 版本不支持在访达 / 资源管理器中定位文件')
+  } catch (_) {
+    /* 打开失败：静默，用户可自行导航 */
+  }
+}
+
 export function useStore() {
   return {
     state,
@@ -749,6 +809,7 @@ export function useStore() {
     pauseAutoSync,
     resumeAutoSync,
     openLocalFolder,
+    revealLocalFile,
     dryRunDir,
     latestDryRunRecord,
     init,
@@ -776,6 +837,7 @@ export function useStore() {
     resolveConflict,
     deferConflict,
     openConflictFor,
+    resolvePluginPrompt,
     pendingConflictTotal,
     pendingCenterGroups,
     openPendingCenter,

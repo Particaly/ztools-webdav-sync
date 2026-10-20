@@ -610,9 +610,13 @@ function onCancelSync() {
     <!-- 待处理冲突面板 -->
     <PendingConflictsModal v-model:open="pendingOpenModal" :dir="dir" />
 
-    <!-- 选择性同步树（勾选面板）与预演结果（只读摘要）：「更多操作」菜单入口 -->
-    <SyncTreeModal v-if="treeOpen" :dir="dir" @close="treeOpen = false" />
-    <DryRunModal v-if="dryRunOpen" :dir="dir" @close="dryRunOpen = false" />
+    <!-- 选择性同步树（勾选面板）与预演结果（只读摘要）：「更多操作」菜单入口。
+         Teleport 到 body，遮罩覆盖整个插件窗口（与 DirFormModal 同因：行内
+         relative 容器会裁住 AppModal 的 absolute 遮罩，弹窗被局限在同步列表里） -->
+    <Teleport to="body">
+      <SyncTreeModal v-if="treeOpen" :dir="dir" @close="treeOpen = false" />
+      <DryRunModal v-if="dryRunOpen" :dir="dir" @close="dryRunOpen = false" />
+    </Teleport>
 
     <!-- 移除同步确认弹窗（两段式 armed 确认，替代原生 confirm）：Teleport 到 body，
          遮罩覆盖整个插件窗口（与 DirFormModal 同因：行内 relative 容器会裁住 AppModal 的 absolute 遮罩）；
